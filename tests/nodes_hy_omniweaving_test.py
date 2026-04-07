@@ -1,4 +1,6 @@
 import types
+import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -6,7 +8,8 @@ import torch
 if not torch.cuda.is_available():
     torch.cuda.current_device = lambda: "cpu"
 
-from custom_nodes.hy_omniweaving_comfyui import nodes
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import nodes
 
 
 class _ClipStub:
@@ -175,3 +178,33 @@ def test_convert_split_hy_omniweaving_attention_qkv_strict_mode_rejects_partial(
 
     with pytest.raises(ValueError, match="Partial HY-OmniWeaving"):
         nodes._convert_split_hy_omniweaving_attention_qkv(sd, strict_mode=True)
+
+
+def test_build_decoder_ddconfig_if_needed_returns_override_when_decoder_channels_differ():
+    sd = {
+        "decoder.conv_in.weight": torch.zeros((256, 4, 3, 3)),
+    }
+    ddconfig = {
+        "ch": 128,
+        "ch_mult": [1, 2, 4],
+    }
+
+    out = nodes._build_decoder_ddconfig_if_needed(sd, ddconfig)
+
+    assert out is not None
+    assert out["ch"] == 64
+    assert ddconfig["ch"] == 128
+
+
+def test_build_decoder_ddconfig_if_needed_returns_none_when_decoder_channels_match():
+    sd = {
+        "decoder.conv_in.weight": torch.zeros((512, 4, 3, 3)),
+    }
+    ddconfig = {
+        "ch": 128,
+        "ch_mult": [1, 2, 4],
+    }
+
+    out = nodes._build_decoder_ddconfig_if_needed(sd, ddconfig)
+
+    assert out is None

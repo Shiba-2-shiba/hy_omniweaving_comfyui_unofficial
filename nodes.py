@@ -1,8 +1,10 @@
 import logging
+import math
 import node_helpers
 import torch
 import comfy.clip_vision
 import comfy.model_management
+import comfy.model_patcher
 import comfy.sd
 import comfy.utils
 import folder_paths
@@ -61,6 +63,114 @@ def _convert_split_hy_omniweaving_attention_qkv(sd: dict, strict_mode: bool = Tr
     return sd, converted, seen_partial
 
 
+def _build_decoder_ddconfig_if_needed(sd: dict, ddconfig: dict):
+    decoder_ch = sd["decoder.conv_in.weight"].shape[0] // ddconfig["ch_mult"][-1]
+    if decoder_ch != ddconfig["ch"]:
+        decoder_ddconfig = ddconfig.copy()
+        decoder_ddconfig["ch"] = decoder_ch
+        return decoder_ddconfig
+    return None
+
+
+class HYOmniWeavingVAE(comfy.sd.VAE):
+    def __init__(self, sd=None, device=None, config=None, dtype=None, metadata=None):
+        if config is not None or sd is None or "decoder.conv_in.weight" not in sd:
+            super().__init__(sd=sd, device=device, config=config, dtype=dtype, metadata=metadata)
+            return
+
+        if "decoder.up_blocks.0.resnets.0.norm1.weight" in sd.keys():
+            sd = comfy.sd.diffusers_convert.convert_vae_state_dict(sd)
+
+        if sd["decoder.conv_in.weight"].shape[1] == 64:
+            super().__init__(sd=sd, device=device, config=config, dtype=dtype, metadata=metadata)
+            return
+        if sd["decoder.conv_in.weight"].shape[1] == 32 and sd["decoder.conv_in.weight"].ndim == 5:
+            super().__init__(sd=sd, device=device, config=config, dtype=dtype, metadata=metadata)
+            return
+
+        if comfy.model_management.is_amd():
+            vae_kl_mem_ratio = 2.73
+        else:
+            vae_kl_mem_ratio = 1.0
+
+        self.memory_used_encode = lambda shape, dtype_: (1767 * shape[2] * shape[3]) * comfy.model_management.dtype_size(dtype_) * vae_kl_mem_ratio
+        self.memory_used_decode = lambda shape, dtype_: (2178 * shape[2] * shape[3] * 64) * comfy.model_management.dtype_size(dtype_) * vae_kl_mem_ratio
+        self.downscale_ratio = 8
+        self.upscale_ratio = 8
+        self.latent_channels = 4
+        self.latent_dim = 2
+        self.output_channels = 3
+        self.pad_channel_value = None
+        self.process_input = lambda image: image * 2.0 - 1.0
+        self.process_output = lambda image: image.add_(1.0).div_(2.0).clamp_(0.0, 1.0)
+        self.working_dtypes = [torch.bfloat16, torch.float32]
+        self.disable_offload = False
+        self.not_video = False
+        self.size = None
+        self.downscale_index_formula = None
+        self.upscale_index_formula = None
+        self.extra_1d_channel = None
+        self.crop_input = True
+        self.audio_sample_rate = 44100
+
+        ddconfig = {"double_z": True, "z_channels": 4, "resolution": 256, "in_channels": 3, "out_ch": 3, "ch": 128, "ch_mult": [1, 2, 4, 4], "num_res_blocks": 2, "attn_resolutions": [], "dropout": 0.0}
+
+        if "encoder.down.2.downsample.conv.weight" not in sd and "decoder.up.3.upsample.conv.weight" not in sd:
+            ddconfig["ch_mult"] = [1, 2, 4]
+            self.downscale_ratio = 4
+            self.upscale_ratio = 4
+
+        self.latent_channels = ddconfig["z_channels"] = sd["decoder.conv_in.weight"].shape[1]
+        if "decoder.post_quant_conv.weight" in sd:
+            sd = comfy.utils.state_dict_prefix_replace(sd, {"decoder.post_quant_conv.": "post_quant_conv.", "encoder.quant_conv.": "quant_conv."})
+
+        if "bn.running_mean" in sd:
+            ddconfig["batch_norm_latent"] = True
+            self.downscale_ratio *= 2
+            self.upscale_ratio *= 2
+            self.latent_channels *= 4
+            old_memory_used_decode = self.memory_used_decode
+            self.memory_used_decode = lambda shape, dtype_: old_memory_used_decode(shape, dtype_) * 4.0
+
+        decoder_ddconfig = _build_decoder_ddconfig_if_needed(sd, ddconfig)
+
+        if "post_quant_conv.weight" in sd:
+            self.first_stage_model = comfy.sd.AutoencoderKL(
+                ddconfig=ddconfig,
+                embed_dim=sd["post_quant_conv.weight"].shape[1],
+                **({"decoder_ddconfig": decoder_ddconfig} if decoder_ddconfig is not None else {}),
+            )
+        else:
+            self.first_stage_model = comfy.sd.AutoencodingEngine(
+                regularizer_config={"target": "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
+                encoder_config={"target": "comfy.ldm.modules.diffusionmodules.model.Encoder", "params": ddconfig},
+                decoder_config={"target": "comfy.ldm.modules.diffusionmodules.model.Decoder", "params": decoder_ddconfig if decoder_ddconfig is not None else ddconfig},
+            )
+
+        self.first_stage_model = self.first_stage_model.eval()
+        self.device = device if device is not None else comfy.model_management.vae_device()
+        offload_device = comfy.model_management.vae_offload_device()
+        if dtype is None:
+            dtype = comfy.model_management.vae_dtype(self.device, self.working_dtypes)
+        self.vae_dtype = dtype
+        self.first_stage_model.to(self.vae_dtype)
+        comfy.model_management.archive_model_dtypes(self.first_stage_model)
+        self.output_device = comfy.model_management.intermediate_device()
+        mp = comfy.model_patcher.CoreModelPatcher
+        if self.disable_offload:
+            mp = comfy.model_patcher.ModelPatcher
+        self.patcher = mp(self.first_stage_model, load_device=self.device, offload_device=offload_device)
+
+        m, u = self.first_stage_model.load_state_dict(sd, strict=False, assign=self.patcher.is_dynamic())
+        if len(m) > 0:
+            logging.warning("Missing VAE keys {}".format(m))
+        if len(u) > 0:
+            logging.debug("Leftover VAE keys {}".format(u))
+
+        logging.info("VAE load device: {}, offload device: {}, dtype: {}".format(self.device, offload_device, self.vae_dtype))
+        self.model_size()
+
+
 class HYOmniWeavingUNetLoader(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -101,6 +211,31 @@ class HYOmniWeavingUNetLoader(io.ComfyNode):
         if model is None:
             raise RuntimeError(f"Failed to load HY-OmniWeaving diffusion model: {unet_name}")
         return io.NodeOutput(model)
+
+
+class HYOmniWeavingVAELoader(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="HYOmniWeavingVAELoader",
+            display_name="HY OmniWeaving VAE Loader",
+            category="loaders",
+            description="Loads HY-OmniWeaving/HunyuanVideo VAE files using a decoder-aware config path compatible with the fork behavior.",
+            inputs=[
+                io.Combo.Input("vae_name", options=folder_paths.get_filename_list("vae")),
+            ],
+            outputs=[
+                io.Vae.Output(),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, vae_name) -> io.NodeOutput:
+        vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
+        sd, metadata = comfy.utils.load_torch_file(vae_path, return_metadata=True)
+        vae = HYOmniWeavingVAE(sd=sd, metadata=metadata)
+        vae.throw_exception_if_invalid()
+        return io.NodeOutput(vae)
 
 
 class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
@@ -435,6 +570,7 @@ class HYOmniWeavingExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
             HYOmniWeavingUNetLoader,
+            HYOmniWeavingVAELoader,
             TextEncodeHunyuanVideo15Omni,
             HunyuanClipVisionOutputConcat,
             HunyuanVideo15OmniConditioning,

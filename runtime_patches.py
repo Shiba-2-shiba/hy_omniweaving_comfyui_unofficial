@@ -274,6 +274,67 @@ def _patch_hunyuan_video_model():
     hv_model.HunyuanVideo._forward = patched_forward
     hv_model.HunyuanVideo._hy_omniweaving_runtime_patched = True
 
+
+def _patch_autoencoder_legacy():
+    import math
+    import comfy
+    import comfy.ldm.models.autoencoder as autoencoder
+
+    if getattr(autoencoder.AutoencodingEngineLegacy.__init__, "_hy_omniweaving_patched", False):
+        return
+
+    original_init = autoencoder.AutoencodingEngineLegacy.__init__
+    if "decoder_ddconfig" in original_init.__code__.co_varnames:
+        return
+
+    def patched_init(self, embed_dim: int, **kwargs):
+        self.max_batch_size = kwargs.pop("max_batch_size", None)
+        ddconfig = kwargs.pop("ddconfig")
+        decoder_ddconfig = kwargs.pop("decoder_ddconfig", ddconfig)
+        autoencoder.AutoencodingEngine.__init__(
+            self,
+            encoder_config={
+                "target": "comfy.ldm.modules.diffusionmodules.model.Encoder",
+                "params": ddconfig,
+            },
+            decoder_config={
+                "target": "comfy.ldm.modules.diffusionmodules.model.Decoder",
+                "params": decoder_ddconfig,
+            },
+            **kwargs,
+        )
+
+        if ddconfig.get("conv3d", False):
+            conv_op = comfy.ops.disable_weight_init.Conv3d
+        else:
+            conv_op = comfy.ops.disable_weight_init.Conv2d
+
+        self.quant_conv = conv_op(
+            (1 + ddconfig["double_z"]) * ddconfig["z_channels"],
+            (1 + ddconfig["double_z"]) * embed_dim,
+            1,
+        )
+        self.post_quant_conv = conv_op(embed_dim, ddconfig["z_channels"], 1)
+        self.embed_dim = embed_dim
+
+        if ddconfig.get("batch_norm_latent", False):
+            self.bn_eps = 1e-4
+            self.bn_momentum = 0.1
+            self.ps = [2, 2]
+            self.bn = torch.nn.BatchNorm2d(
+                math.prod(self.ps) * ddconfig["z_channels"],
+                eps=self.bn_eps,
+                momentum=self.bn_momentum,
+                affine=False,
+                track_running_stats=True,
+            )
+            self.bn.eval()
+        else:
+            self.bn = None
+
+    patched_init._hy_omniweaving_patched = True
+    autoencoder.AutoencodingEngineLegacy.__init__ = patched_init
+
 def _core_has_minimum_deepstack_support() -> bool:
     import comfy.ldm.hunyuan_video.model as hv_model
     import comfy.model_base as model_base
@@ -292,6 +353,7 @@ def apply_runtime_patches():
     _patch_model_detection()
     _patch_model_base()
     _patch_hunyuan_video_model()
+    _patch_autoencoder_legacy()
     if _core_has_minimum_deepstack_support():
         return
     raise RuntimeError(
