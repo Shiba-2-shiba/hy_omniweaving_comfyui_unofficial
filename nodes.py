@@ -1,8 +1,11 @@
+import logging
 import node_helpers
 import torch
 import comfy.clip_vision
 import comfy.model_management
+import comfy.sd
 import comfy.utils
+import folder_paths
 from typing_extensions import override
 
 from comfy_api.latest import ComfyExtension, io
@@ -11,6 +14,93 @@ from comfy_api.latest import ComfyExtension, io
 def _clip_has_byt5_branch(clip) -> bool:
     cond_stage_model = getattr(clip, "cond_stage_model", None)
     return getattr(cond_stage_model, "byt5_small", None) is not None
+
+
+def _convert_split_hy_omniweaving_attention_qkv(sd: dict, strict_mode: bool = True):
+    converted = 0
+    seen_partial = []
+    block_indices = set()
+
+    for key in sd.keys():
+        if not key.startswith("double_blocks."):
+            continue
+        parts = key.split(".")
+        if len(parts) < 3:
+            continue
+        if parts[2] in ("img_attn_q", "img_attn_k", "img_attn_v", "txt_attn_q", "txt_attn_k", "txt_attn_v"):
+            try:
+                block_indices.add(int(parts[1]))
+            except ValueError:
+                pass
+
+    for idx in sorted(block_indices):
+        for attn_prefix in ("img_attn", "txt_attn"):
+            for end in ("weight", "bias"):
+                qkv_key = f"double_blocks.{idx}.{attn_prefix}.qkv.{end}"
+                if qkv_key in sd:
+                    continue
+
+                q_key = f"double_blocks.{idx}.{attn_prefix}_q.{end}"
+                k_key = f"double_blocks.{idx}.{attn_prefix}_k.{end}"
+                v_key = f"double_blocks.{idx}.{attn_prefix}_v.{end}"
+                present = [k for k in (q_key, k_key, v_key) if k in sd]
+
+                if len(present) == 0:
+                    continue
+
+                if len(present) != 3:
+                    seen_partial.append((idx, attn_prefix, end, tuple(present)))
+                    continue
+
+                sd[qkv_key] = torch.cat((sd.pop(q_key), sd.pop(k_key), sd.pop(v_key)), dim=0)
+                converted += 1
+
+    if strict_mode and len(seen_partial) > 0:
+        raise ValueError(f"Partial HY-OmniWeaving split attention tensors found: {seen_partial}")
+
+    return sd, converted, seen_partial
+
+
+class HYOmniWeavingUNetLoader(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="HYOmniWeavingUNetLoader",
+            display_name="HY OmniWeaving UNet Loader",
+            category="advanced/loaders",
+            description="Loads HY-OmniWeaving/HunyuanVideo 1.5 transformers and converts split q/k/v attention tensors into the qkv layout expected by stock ComfyUI.",
+            inputs=[
+                io.Combo.Input("unet_name", options=folder_paths.get_filename_list("diffusion_models")),
+                io.Combo.Input("weight_dtype", options=["default", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"], default="default"),
+                io.Boolean.Input("strict_mode", default=True, advanced=True),
+            ],
+            outputs=[
+                io.Model.Output(),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, unet_name, weight_dtype, strict_mode=True) -> io.NodeOutput:
+        model_options = {}
+        if weight_dtype == "fp8_e4m3fn":
+            model_options["dtype"] = torch.float8_e4m3fn
+        elif weight_dtype == "fp8_e4m3fn_fast":
+            model_options["dtype"] = torch.float8_e4m3fn
+            model_options["fp8_optimizations"] = True
+        elif weight_dtype == "fp8_e5m2":
+            model_options["dtype"] = torch.float8_e5m2
+
+        unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
+        sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
+        sd, converted, partial = _convert_split_hy_omniweaving_attention_qkv(sd, strict_mode=strict_mode)
+        if converted > 0:
+            logging.info(f"HYOmniWeavingUNetLoader converted {converted} split attention tensors to qkv format.")
+        if len(partial) > 0 and not strict_mode:
+            logging.warning(f"HYOmniWeavingUNetLoader encountered partial split attention tensors: {partial}")
+        model = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata)
+        if model is None:
+            raise RuntimeError(f"Failed to load HY-OmniWeaving diffusion model: {unet_name}")
+        return io.NodeOutput(model)
 
 
 class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
@@ -344,6 +434,7 @@ class HYOmniWeavingExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
+            HYOmniWeavingUNetLoader,
             TextEncodeHunyuanVideo15Omni,
             HunyuanClipVisionOutputConcat,
             HunyuanVideo15OmniConditioning,
