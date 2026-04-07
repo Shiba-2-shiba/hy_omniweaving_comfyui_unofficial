@@ -1,35 +1,25 @@
-# hy_omniweaving_comfyui_unofficial
+# hy-omniweaving-comfyui
 
-Unofficial ComfyUI custom node for running HY-OmniWeaving on top of stock ComfyUI.
+Custom-node extraction lane for HY-OmniWeaving support on top of ComfyUI.
 
-## Scope
+Current scope:
 
-- first-pass focus on `i2v`
+- `i2v` first
 - HY-OmniWeaving-oriented text encoding
-- ByT5 / visual-input parity guards
+- ByT5/visual-input parity guards
 - optional `think` prompt expansion
 - `deepstack` / `setclip` option plumbing
 - Omni-style conditioning with Lanczos + center-crop image preparation
 
-## Current limitations
+Current non-goals:
 
-- full task parity beyond `i2v` is not done yet
-- full resolution-bucket parity is not done yet
-- some lower-level parity still relies on runtime patching into ComfyUI internals
+- full task parity beyond `i2v`
+- full resolution-bucket parity
+- UI/workflow backward compatibility
 
-## Install
+Current status:
 
-Clone this repository into your ComfyUI `custom_nodes` directory:
-
-```bash
-cd ComfyUI/custom_nodes
-git clone https://github.com/Shiba-2-shiba/hy_omniweaving_comfyui_unofficial.git
-```
-
-Then restart ComfyUI.
-
-## Important note
-
-This package currently applies runtime patches at import time in order to supply
-HY-OmniWeaving-specific parity hooks that stock ComfyUI does not expose
-directly. The long-term goal is to reduce these patch points further.
+- This package is the new refactor target for HY-OmniWeaving-specific logic.
+- Some lower-level parity support still lives in the current ComfyUI core checkout while the extraction is in progress.
+- Future work should continue here rather than adding more Omni-specific behavior to generic ComfyUI Hunyuan modules.
+- `runtime_patches.py` is the extraction hook for eventually moving the remaining core edits behind custom-node-owned monkey patches.
