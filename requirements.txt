@@ -1,0 +1,2 @@
+# No extra Python dependencies beyond a recent ComfyUI checkout and the
+# underlying HY-OmniWeaving/HunyuanVideo model dependencies.
