@@ -18,6 +18,77 @@ def _clip_has_byt5_branch(clip) -> bool:
     return getattr(cond_stage_model, "byt5_small", None) is not None
 
 
+def _text_encoder_options():
+    return folder_paths.get_filename_list("text_encoders")
+
+
+def _preferred_text_encoder_name(*preferred_names: str, contains: str | None = None) -> str | None:
+    options = _text_encoder_options()
+    if len(options) == 0:
+        return None
+    option_set = set(options)
+    for name in preferred_names:
+        if name in option_set:
+            return name
+    if contains is not None:
+        lowered = contains.lower()
+        for option in options:
+            if lowered in option.lower():
+                return option
+    return options[0]
+
+
+def _unwrap_text_encoder_state_dict(sd):
+    if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
+        return sd["state_dict"]
+    return sd
+
+
+def _normalize_hy_omniweaving_text_encoder_state_dict(sd: dict) -> dict:
+    sd = _unwrap_text_encoder_state_dict(sd)
+    if not isinstance(sd, dict):
+        raise TypeError("Expected a text encoder state_dict mapping.")
+
+    normalized = {k: v for k, v in sd.items() if k != "__metadata__"}
+    if "model.language_model.layers.0.self_attn.k_proj.weight" in normalized:
+        normalized = comfy.utils.state_dict_prefix_replace(
+            normalized,
+            {
+                "model.language_model.": "model.",
+                "model.visual.": "visual.",
+                "final_layer_norm.": "model.norm.",
+            },
+        )
+    return normalized
+
+
+def _load_hy_omniweaving_dual_text_encoder(qwen_text_encoder: str, byt5_text_encoder: str, device: str = "default"):
+    qwen_path = folder_paths.get_full_path_or_raise("text_encoders", qwen_text_encoder)
+    byt5_path = folder_paths.get_full_path_or_raise("text_encoders", byt5_text_encoder)
+
+    qwen_sd = _normalize_hy_omniweaving_text_encoder_state_dict(
+        comfy.utils.load_torch_file(qwen_path, safe_load=True)
+    )
+    byt5_sd = comfy.utils.load_torch_file(byt5_path, safe_load=True)
+
+    model_options = {}
+    if device == "cpu":
+        model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")
+
+    clip = comfy.sd.load_text_encoder_state_dicts(
+        state_dicts=[qwen_sd, byt5_sd],
+        embedding_directory=folder_paths.get_folder_paths("embeddings"),
+        clip_type=comfy.sd.CLIPType.HUNYUAN_VIDEO_15,
+        model_options=model_options,
+    )
+    logging.info(
+        "HYOmniWeavingTextEncoderLoader loaded dual text encoders: qwen=%s byt5=%s",
+        qwen_text_encoder,
+        byt5_text_encoder,
+    )
+    return clip
+
+
 def _convert_split_hy_omniweaving_attention_qkv(sd: dict, strict_mode: bool = True):
     converted = 0
     seen_partial = []
@@ -169,6 +240,39 @@ class HYOmniWeavingVAE(comfy.sd.VAE):
 
         logging.info("VAE load device: {}, offload device: {}, dtype: {}".format(self.device, offload_device, self.vae_dtype))
         self.model_size()
+
+
+class HYOmniWeavingTextEncoderLoader(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        text_encoder_options = _text_encoder_options()
+        return io.Schema(
+            node_id="HYOmniWeavingTextEncoderLoader",
+            display_name="HY OmniWeaving Text Encoder Loader",
+            category="advanced/loaders",
+            description="Loads the OmniWeaving fine-tuned Qwen2.5-VL checkpoint together with the ByT5 checkpoint as a HunyuanVideo 1.5 dual text encoder.",
+            inputs=[
+                io.Combo.Input(
+                    "qwen_text_encoder",
+                    options=text_encoder_options,
+                    default=_preferred_text_encoder_name("qwen_2.5_vl_7b_finetuned_model.safetensors", "qwen_2.5_vl_7b.safetensors"),
+                ),
+                io.Combo.Input(
+                    "byt5_text_encoder",
+                    options=text_encoder_options,
+                    default=_preferred_text_encoder_name(contains="byt5"),
+                ),
+                io.Combo.Input("device", options=["default", "cpu"], default="default", advanced=True),
+            ],
+            outputs=[
+                io.Clip.Output(),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, qwen_text_encoder, byt5_text_encoder, device="default") -> io.NodeOutput:
+        clip = _load_hy_omniweaving_dual_text_encoder(qwen_text_encoder, byt5_text_encoder, device=device)
+        return io.NodeOutput(clip)
 
 
 class HYOmniWeavingUNetLoader(io.ComfyNode):
@@ -569,6 +673,7 @@ class HYOmniWeavingExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
+            HYOmniWeavingTextEncoderLoader,
             HYOmniWeavingUNetLoader,
             HYOmniWeavingVAELoader,
             TextEncodeHunyuanVideo15Omni,

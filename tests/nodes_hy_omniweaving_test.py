@@ -8,6 +8,146 @@ import torch
 if not torch.cuda.is_available():
     torch.cuda.current_device = lambda: "cpu"
 
+
+def _install_test_stubs():
+    if "node_helpers" not in sys.modules:
+        node_helpers = types.ModuleType("node_helpers")
+        node_helpers.conditioning_set_values = lambda conditioning, values: (conditioning, values)
+        sys.modules["node_helpers"] = node_helpers
+
+    if "folder_paths" not in sys.modules:
+        folder_paths = types.ModuleType("folder_paths")
+        folder_paths.get_filename_list = lambda kind: [
+            "qwen_2.5_vl_7b.safetensors",
+            "qwen_2.5_vl_7b_finetuned_model.safetensors",
+            "byt5_small.safetensors",
+        ]
+        folder_paths.get_full_path_or_raise = lambda kind, name: f"C:/models/{kind}/{name}"
+        folder_paths.get_folder_paths = lambda kind: [f"C:/models/{kind}"]
+        sys.modules["folder_paths"] = folder_paths
+
+    if "comfy" not in sys.modules:
+        comfy = types.ModuleType("comfy")
+        sys.modules["comfy"] = comfy
+
+        clip_vision = types.ModuleType("comfy.clip_vision")
+        clip_vision.Output = type("Output", (), {})
+        sys.modules["comfy.clip_vision"] = clip_vision
+        comfy.clip_vision = clip_vision
+
+        model_management = types.ModuleType("comfy.model_management")
+        model_management.is_amd = lambda: False
+        model_management.dtype_size = lambda dtype: 1
+        model_management.vae_device = lambda: "cpu"
+        model_management.vae_offload_device = lambda: "cpu"
+        model_management.vae_dtype = lambda device, dtypes: torch.float32
+        model_management.intermediate_device = lambda: "cpu"
+        model_management.archive_model_dtypes = lambda model: None
+        sys.modules["comfy.model_management"] = model_management
+        comfy.model_management = model_management
+
+        model_patcher = types.ModuleType("comfy.model_patcher")
+
+        class _Patcher:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def is_dynamic(self):
+                return False
+
+        model_patcher.CoreModelPatcher = _Patcher
+        model_patcher.ModelPatcher = _Patcher
+        sys.modules["comfy.model_patcher"] = model_patcher
+        comfy.model_patcher = model_patcher
+
+        utils = types.ModuleType("comfy.utils")
+
+        def _state_dict_prefix_replace(sd, replacements):
+            out = {}
+            for key, value in sd.items():
+                new_key = key
+                for old, new in replacements.items():
+                    if key.startswith(old):
+                        new_key = new + key[len(old):]
+                        break
+                out[new_key] = value
+            return out
+
+        utils.state_dict_prefix_replace = _state_dict_prefix_replace
+        utils.common_upscale = lambda tensor, width, height, method, crop: tensor
+        utils.load_torch_file = lambda path, safe_load=True, return_metadata=False: {} if not return_metadata else ({}, {})
+        sys.modules["comfy.utils"] = utils
+        comfy.utils = utils
+
+        sd = types.ModuleType("comfy.sd")
+
+        class _VAE:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def throw_exception_if_invalid(self):
+                return None
+
+        class _ClipType:
+            HUNYUAN_VIDEO_15 = "HUNYUAN_VIDEO_15"
+
+        sd.VAE = _VAE
+        sd.CLIPType = _ClipType
+        sd.load_clip = lambda *args, **kwargs: None
+        sd.load_text_encoder_state_dicts = lambda state_dicts, embedding_directory=None, clip_type=None, model_options=None, disable_dynamic=False: object()
+        sd.load_diffusion_model_state_dict = lambda *args, **kwargs: object()
+        sd.AutoencoderKL = type("AutoencoderKL", (), {})
+        sd.AutoencodingEngine = type("AutoencodingEngine", (), {})
+        sys.modules["comfy.sd"] = sd
+        comfy.sd = sd
+
+    if "comfy_api.latest" not in sys.modules:
+        comfy_api = types.ModuleType("comfy_api")
+        latest = types.ModuleType("comfy_api.latest")
+
+        class _NodeBase:
+            pass
+
+        class _Schema:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+
+        class _InputFactory:
+            @staticmethod
+            def Input(*args, **kwargs):
+                return {"args": args, "kwargs": kwargs}
+
+        class _OutputFactory:
+            @staticmethod
+            def Output(*args, **kwargs):
+                return {"args": args, "kwargs": kwargs}
+
+        io = types.SimpleNamespace(
+            ComfyNode=_NodeBase,
+            NodeOutput=lambda *args: args,
+            Schema=_Schema,
+            Combo=_InputFactory,
+            Boolean=_InputFactory,
+            Int=_InputFactory,
+            String=_InputFactory,
+            Clip=types.SimpleNamespace(Input=_InputFactory.Input, Output=_OutputFactory.Output),
+            Conditioning=types.SimpleNamespace(Input=_InputFactory.Input, Output=_OutputFactory.Output),
+            ClipVisionOutput=types.SimpleNamespace(Input=_InputFactory.Input, Output=_OutputFactory.Output),
+            Vae=types.SimpleNamespace(Input=_InputFactory.Input, Output=_OutputFactory.Output),
+            Model=types.SimpleNamespace(Output=_OutputFactory.Output),
+            Image=types.SimpleNamespace(Input=_InputFactory.Input),
+            Latent=types.SimpleNamespace(Output=_OutputFactory.Output),
+        )
+
+        latest.ComfyExtension = type("ComfyExtension", (), {})
+        latest.io = io
+        sys.modules["comfy_api"] = comfy_api
+        sys.modules["comfy_api.latest"] = latest
+
+
+_install_test_stubs()
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import nodes
 
@@ -208,3 +348,92 @@ def test_build_decoder_ddconfig_if_needed_returns_none_when_decoder_channels_mat
     out = nodes._build_decoder_ddconfig_if_needed(sd, ddconfig)
 
     assert out is None
+
+
+def test_normalize_hy_omniweaving_text_encoder_state_dict_rewrites_reference_prefixes():
+    sd = {
+        "__metadata__": {"format": "pt"},
+        "model.language_model.layers.0.self_attn.k_proj.weight": torch.tensor([1.0]),
+        "model.visual.blocks.0.attn.qkv.weight": torch.tensor([2.0]),
+        "final_layer_norm.weight": torch.tensor([3.0]),
+    }
+
+    normalized = nodes._normalize_hy_omniweaving_text_encoder_state_dict(sd)
+
+    assert "__metadata__" not in normalized
+    assert "model.layers.0.self_attn.k_proj.weight" in normalized
+    assert "visual.blocks.0.attn.qkv.weight" in normalized
+    assert "model.norm.weight" in normalized
+
+
+def test_load_hy_omniweaving_dual_text_encoder_normalizes_qwen_and_keeps_byt5(monkeypatch):
+    loaded = {}
+
+    def fake_get_full_path_or_raise(kind, name):
+        return f"C:/models/{kind}/{name}"
+
+    def fake_get_folder_paths(kind):
+        return [f"C:/models/{kind}"]
+
+    def fake_load_torch_file(path, safe_load=True):
+        if path.endswith("qwen_2.5_vl_7b_finetuned_model.safetensors"):
+            return {
+                "model.language_model.layers.0.self_attn.k_proj.weight": torch.tensor([1.0]),
+                "final_layer_norm.weight": torch.tensor([2.0]),
+            }
+        if path.endswith("byt5_small.safetensors"):
+            return {
+                "encoder.block.0.layer.0.SelfAttention.o.weight": torch.tensor([3.0]),
+            }
+        raise AssertionError(path)
+
+    def fake_load_text_encoder_state_dicts(state_dicts, embedding_directory=None, clip_type=None, model_options=None, disable_dynamic=False):
+        loaded["state_dicts"] = state_dicts
+        loaded["embedding_directory"] = embedding_directory
+        loaded["clip_type"] = clip_type
+        loaded["model_options"] = model_options
+        return "dual-clip"
+
+    monkeypatch.setattr(nodes.folder_paths, "get_full_path_or_raise", fake_get_full_path_or_raise)
+    monkeypatch.setattr(nodes.folder_paths, "get_folder_paths", fake_get_folder_paths)
+    monkeypatch.setattr(nodes.comfy.utils, "load_torch_file", fake_load_torch_file)
+    monkeypatch.setattr(nodes.comfy.sd, "load_text_encoder_state_dicts", fake_load_text_encoder_state_dicts)
+
+    clip = nodes._load_hy_omniweaving_dual_text_encoder(
+        qwen_text_encoder="qwen_2.5_vl_7b_finetuned_model.safetensors",
+        byt5_text_encoder="byt5_small.safetensors",
+        device="cpu",
+    )
+
+    assert clip == "dual-clip"
+    assert loaded["embedding_directory"] == ["C:/models/embeddings"]
+    assert loaded["clip_type"] == nodes.comfy.sd.CLIPType.HUNYUAN_VIDEO_15
+    assert loaded["model_options"]["load_device"] == torch.device("cpu")
+    assert loaded["model_options"]["offload_device"] == torch.device("cpu")
+    assert "model.layers.0.self_attn.k_proj.weight" in loaded["state_dicts"][0]
+    assert "model.norm.weight" in loaded["state_dicts"][0]
+    assert "encoder.block.0.layer.0.SelfAttention.o.weight" in loaded["state_dicts"][1]
+
+
+def test_hy_omniweaving_text_encoder_loader_outputs_dual_clip(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "_load_hy_omniweaving_dual_text_encoder",
+        lambda qwen_text_encoder, byt5_text_encoder, device="default": {
+            "qwen": qwen_text_encoder,
+            "byt5": byt5_text_encoder,
+            "device": device,
+        },
+    )
+
+    out = nodes.HYOmniWeavingTextEncoderLoader.execute(
+        qwen_text_encoder="qwen_2.5_vl_7b_finetuned_model.safetensors",
+        byt5_text_encoder="byt5_small.safetensors",
+        device="default",
+    )
+
+    assert out[0] == {
+        "qwen": "qwen_2.5_vl_7b_finetuned_model.safetensors",
+        "byt5": "byt5_small.safetensors",
+        "device": "default",
+    }
