@@ -1,6 +1,8 @@
+import json
 import logging
 import math
 import node_helpers
+import os
 import torch
 import comfy.clip_vision
 import comfy.model_management
@@ -143,9 +145,61 @@ def _build_decoder_ddconfig_if_needed(sd: dict, ddconfig: dict):
     return None
 
 
+def _is_omniweaving_vae_state_dict(sd: dict) -> bool:
+    return "decoder.conv_in.conv.weight" in sd and "encoder.conv_in.conv.weight" in sd
+
+
+def _load_omniweaving_vae_config():
+    config_path = os.path.join(os.path.dirname(__file__), "configs", "omniweaving_vae_config.json")
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _instantiate_omniweaving_vae_model(config: dict):
+    try:
+        from .omniweaving_vae import OmniWeavingAutoencoderKLConv3D
+    except ImportError:
+        from omniweaving_vae import OmniWeavingAutoencoderKLConv3D
+
+    return OmniWeavingAutoencoderKLConv3D(
+        in_channels=config["in_channels"],
+        out_channels=config["out_channels"],
+        latent_channels=config["latent_channels"],
+        block_out_channels=config["block_out_channels"],
+        layers_per_block=config["layers_per_block"],
+        ffactor_spatial=config["ffactor_spatial"],
+        ffactor_temporal=config["ffactor_temporal"],
+        sample_size=config["sample_size"],
+        sample_tsize=config["sample_tsize"],
+        scaling_factor=config.get("scaling_factor"),
+        shift_factor=config.get("shift_factor"),
+        downsample_match_channel=config.get("downsample_match_channel", True),
+        upsample_match_channel=config.get("upsample_match_channel", True),
+    )
+
+
+def _filter_known_optional_vae_missing_keys(missing_keys):
+    optional_suffixes = {
+        "encoder.mid.block_1.temb_proj.weight",
+        "encoder.mid.block_1.temb_proj.bias",
+        "encoder.mid.block_2.temb_proj.weight",
+        "encoder.mid.block_2.temb_proj.bias",
+        "decoder.mid.block_1.temb_proj.weight",
+        "decoder.mid.block_1.temb_proj.bias",
+        "decoder.mid.block_2.temb_proj.weight",
+        "decoder.mid.block_2.temb_proj.bias",
+    }
+    filtered = [key for key in missing_keys if key not in optional_suffixes]
+    ignored = [key for key in missing_keys if key in optional_suffixes]
+    return filtered, ignored
+
+
 class HYOmniWeavingVAE(comfy.sd.VAE):
     def __init__(self, sd=None, device=None, config=None, dtype=None, metadata=None):
         if config is not None or sd is None or "decoder.conv_in.weight" not in sd:
+            if config is None and sd is not None and _is_omniweaving_vae_state_dict(sd):
+                self._init_omniweaving_vae(sd=sd, device=device, dtype=dtype)
+                return
             super().__init__(sd=sd, device=device, config=config, dtype=dtype, metadata=metadata)
             return
 
@@ -233,12 +287,73 @@ class HYOmniWeavingVAE(comfy.sd.VAE):
         self.patcher = mp(self.first_stage_model, load_device=self.device, offload_device=offload_device)
 
         m, u = self.first_stage_model.load_state_dict(sd, strict=False, assign=self.patcher.is_dynamic())
+        m, ignored_missing = _filter_known_optional_vae_missing_keys(m)
+        if len(ignored_missing) > 0:
+            logging.info("Ignoring known optional HY-OmniWeaving VAE keys %s", ignored_missing)
         if len(m) > 0:
             logging.warning("Missing VAE keys {}".format(m))
         if len(u) > 0:
             logging.debug("Leftover VAE keys {}".format(u))
 
         logging.info("VAE load device: {}, offload device: {}, dtype: {}".format(self.device, offload_device, self.vae_dtype))
+        self.model_size()
+
+    def _init_omniweaving_vae(self, sd: dict, device=None, dtype=None):
+        config = _load_omniweaving_vae_config()
+        ffactor_spatial = config["ffactor_spatial"]
+        ffactor_temporal = config["ffactor_temporal"]
+
+        self.memory_used_encode = lambda shape, dtype_: (2800 * shape[-2] * shape[-1]) * comfy.model_management.dtype_size(dtype_)
+        self.memory_used_decode = lambda shape, dtype_: (
+            2800 * shape[-3] * shape[-2] * shape[-1] * ffactor_spatial * ffactor_spatial
+        ) * comfy.model_management.dtype_size(dtype_)
+        self.downscale_ratio = (lambda a: max(0, math.floor((a + ffactor_temporal - 1) / ffactor_temporal)), ffactor_spatial, ffactor_spatial)
+        self.downscale_index_formula = (ffactor_temporal, ffactor_spatial, ffactor_spatial)
+        self.upscale_ratio = (lambda a: max(0, a * ffactor_temporal - (ffactor_temporal - 1)), ffactor_spatial, ffactor_spatial)
+        self.upscale_index_formula = (ffactor_temporal, ffactor_spatial, ffactor_spatial)
+        self.latent_channels = config["latent_channels"]
+        self.latent_dim = 3
+        self.output_channels = config["out_channels"]
+        self.pad_channel_value = None
+        self.process_input = lambda image: image * 2.0 - 1.0
+        self.process_output = lambda image: image.add_(1.0).div_(2.0).clamp_(0.0, 1.0)
+        self.working_dtypes = [torch.float16, torch.bfloat16, torch.float32]
+        self.disable_offload = False
+        self.not_video = False
+        self.size = None
+        self.extra_1d_channel = None
+        self.crop_input = True
+        self.audio_sample_rate = 44100
+
+        self.first_stage_model = _instantiate_omniweaving_vae_model(config).eval()
+        self.device = device if device is not None else comfy.model_management.vae_device()
+        offload_device = comfy.model_management.vae_offload_device()
+        if dtype is None:
+            dtype = comfy.model_management.vae_dtype(self.device, self.working_dtypes)
+        self.vae_dtype = dtype
+        self.first_stage_model.to(self.vae_dtype)
+        comfy.model_management.archive_model_dtypes(self.first_stage_model)
+        self.output_device = comfy.model_management.intermediate_device()
+        mp = comfy.model_patcher.CoreModelPatcher
+        if self.disable_offload:
+            mp = comfy.model_patcher.ModelPatcher
+        self.patcher = mp(self.first_stage_model, load_device=self.device, offload_device=offload_device)
+
+        m, u = self.first_stage_model.load_state_dict(sd, strict=False, assign=self.patcher.is_dynamic())
+        m, ignored_missing = _filter_known_optional_vae_missing_keys(m)
+        if len(ignored_missing) > 0:
+            logging.info("Ignoring known optional HY-OmniWeaving VAE keys %s", ignored_missing)
+        if len(m) > 0:
+            logging.warning("Missing VAE keys {}".format(m))
+        if len(u) > 0:
+            logging.debug("Leftover VAE keys {}".format(u))
+
+        logging.info(
+            "HY-OmniWeaving VAE load device: %s, offload device: %s, dtype: %s",
+            self.device,
+            offload_device,
+            self.vae_dtype,
+        )
         self.model_size()
 
 

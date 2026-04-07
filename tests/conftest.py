@@ -104,6 +104,9 @@ def _install_global_test_stubs():
             def throw_exception_if_invalid(self):
                 return None
 
+            def model_size(self):
+                return None
+
         class _ClipType:
             HUNYUAN_VIDEO_15 = "HUNYUAN_VIDEO_15"
 

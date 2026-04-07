@@ -88,6 +88,9 @@ def _install_test_stubs():
             def throw_exception_if_invalid(self):
                 return None
 
+            def model_size(self):
+                return None
+
         class _ClipType:
             HUNYUAN_VIDEO_15 = "HUNYUAN_VIDEO_15"
 
@@ -348,6 +351,69 @@ def test_build_decoder_ddconfig_if_needed_returns_none_when_decoder_channels_mat
     out = nodes._build_decoder_ddconfig_if_needed(sd, ddconfig)
 
     assert out is None
+
+
+def test_filter_known_optional_vae_missing_keys_removes_hunyuan_temb_proj_noise():
+    missing = [
+        "encoder.mid.block_1.temb_proj.weight",
+        "decoder.mid.block_2.temb_proj.bias",
+        "quant_conv.weight",
+    ]
+
+    filtered, ignored = nodes._filter_known_optional_vae_missing_keys(missing)
+
+    assert filtered == ["quant_conv.weight"]
+    assert ignored == [
+        "encoder.mid.block_1.temb_proj.weight",
+        "decoder.mid.block_2.temb_proj.bias",
+    ]
+
+
+def test_is_omniweaving_vae_state_dict_detects_causal_conv_layout():
+    assert nodes._is_omniweaving_vae_state_dict(
+        {
+            "encoder.conv_in.conv.weight": torch.tensor([1.0]),
+            "decoder.conv_in.conv.weight": torch.tensor([2.0]),
+        }
+    )
+    assert not nodes._is_omniweaving_vae_state_dict(
+        {
+            "encoder.conv_in.weight": torch.tensor([1.0]),
+            "decoder.conv_in.weight": torch.tensor([2.0]),
+        }
+    )
+
+
+def test_load_omniweaving_vae_config_matches_reference_shape():
+    config = nodes._load_omniweaving_vae_config()
+
+    assert config["_class_name"] == "AutoencoderKLConv3D"
+    assert config["latent_channels"] == 32
+    assert config["ffactor_spatial"] == 16
+    assert config["ffactor_temporal"] == 4
+
+
+def test_hy_omniweaving_vae_uses_custom_omniweaving_loader_for_causal_conv_state_dict(monkeypatch):
+    called = {}
+
+    def fake_init(self, sd=None, device=None, dtype=None):
+        called["sd"] = sd
+        called["device"] = device
+        called["dtype"] = dtype
+
+    monkeypatch.setattr(nodes.HYOmniWeavingVAE, "_init_omniweaving_vae", fake_init)
+
+    nodes.HYOmniWeavingVAE(
+        sd={
+            "encoder.conv_in.conv.weight": torch.zeros((128, 3, 3, 3, 3)),
+            "decoder.conv_in.conv.weight": torch.zeros((1024, 32, 3, 3, 3)),
+        },
+        device="cpu",
+        dtype=torch.float16,
+    )
+
+    assert called["device"] == "cpu"
+    assert called["dtype"] == torch.float16
 
 
 def test_normalize_hy_omniweaving_text_encoder_state_dict_rewrites_reference_prefixes():

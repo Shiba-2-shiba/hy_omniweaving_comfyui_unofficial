@@ -5,6 +5,7 @@ Custom-node extraction lane for HY-OmniWeaving support on top of ComfyUI.
 Current scope:
 
 - dedicated dual text-encoder loader for OmniWeaving's fine-tuned Qwen2.5-VL plus ByT5
+- dedicated VAE loader path for OmniWeaving-style `AutoencoderKLConv3D` checkpoints
 - `i2v` first
 - HY-OmniWeaving-oriented text encoding
 - ByT5/visual-input parity guards
@@ -25,3 +26,4 @@ Current status:
 - Future work should continue here rather than adding more Omni-specific behavior to generic ComfyUI Hunyuan modules.
 - `runtime_patches.py` is the extraction hook for eventually moving the remaining core edits behind custom-node-owned monkey patches.
 - `HY OmniWeaving Text Encoder Loader` now mirrors the intended HunyuanVideo 1.5 dual-loader flow: load the OmniWeaving fine-tuned Qwen checkpoint together with the ByT5 checkpoint as one CLIP output.
+- `HY OmniWeaving VAE Loader` now detects OmniWeaving-style `decoder.conv_in.conv.weight` checkpoints and instantiates a local `AutoencoderKLConv3D`-equivalent model from tracked config instead of relying on generic Comfy VAE fallback paths.

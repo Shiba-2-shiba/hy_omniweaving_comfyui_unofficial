@@ -1,0 +1,23 @@
+{
+  "_class_name": "AutoencoderKLConv3D",
+  "_diffusers_version": "0.35.0",
+  "block_out_channels": [
+    128,
+    256,
+    512,
+    1024,
+    1024
+  ],
+  "downsample_match_channel": true,
+  "ffactor_spatial": 16,
+  "ffactor_temporal": 4,
+  "in_channels": 3,
+  "latent_channels": 32,
+  "layers_per_block": 2,
+  "out_channels": 3,
+  "sample_size": 256,
+  "sample_tsize": 64,
+  "scaling_factor": 1.03682,
+  "shift_factor": null,
+  "upsample_match_channel": true
+}
