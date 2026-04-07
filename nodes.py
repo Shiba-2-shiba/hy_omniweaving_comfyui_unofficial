@@ -458,6 +458,15 @@ class HYOmniWeavingVAELoader(io.ComfyNode):
 
 
 class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
+    TASK_SYSTEM_PROMPTS = {
+        "t2v": "You are a helpful assistant. Describe the video by detailing the following aspects:\n1. The main content and theme of the video.\n2. The color, shape, size, texture, quantity, text, and spatial relationships of the objects.\n3. Actions, events, behaviors temporal relationships, physical movement changes of the objects.\n4. background environment, light, style and atmosphere.\n5. camera angles, movements, and transitions used in the video.",
+        "i2v": "You are a helpful assistant. Given a text instruction and an input image, you need to explain how the user's text instruction should alter the image to introduce motion and evolution over time. Generate a video using this image as the first frame that meets the user's requirements, ensuring the specified elements evolve or move in a way that fulfills the text description while maintaining consistency.",
+        "reference2v": "You are a helpful assistant. Given a text instruction and one or more input images, you need to explain how to extract and combine key information from the input images to construct a new image as the video's first frame, and then how the user's text instruction should alter the image to introduce motion and evolution over time. Generate a video that meets the user's requirements, ensuring the specified elements evolve or move in a way that fulfills the text description while maintaining consistency.",
+        "interpolation": "You are a helpful assistant. Given a text instruction, an image as the first frame of the video, and another image as the last frame of the video, you need to analyze the visual trajectory required to transition from the start to the end. Determine how the elements in the first frame must evolve, move, or transform to align with the last frame based on the text instruction. Generate a video that seamlessly connects these two frames, ensuring the motion and evolution between them fulfill the text description while maintaining temporal consistency",
+        "editing": "You are a helpful assistant. Given a text instruction and an input video, you need to analyze the visual content and temporal dynamics of the input video, and then explain how the user's text instruction should modify the video's visual style, objects, or scene composition. Generate an edited video that meets the user's requirements, ensuring the specified modifications are applied consistently across frames while preserving the original motion flow and coherence.",
+        "tiv2v": "You are a helpful assistant. Given a text instruction, a reference image and an input video, you need to analyze the visual content and temporal dynamics of the input video, alongside the scene or subject characteristics of the reference image. Explain how the user's text instruction directs the application of the reference image's visual attributes onto the input video. Generate an edited video that meets the user's requirements, ensuring the specified modifications are applied consistently across frames while preserving the original motion flow and coherence.",
+    }
+
     @classmethod
     def define_schema(cls):
         return io.Schema(
@@ -472,7 +481,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
                 io.Boolean.Input("use_visual_inputs", default=True, advanced=True),
                 io.Int.Input("max_visual_inputs", default=8, min=1, max=64, advanced=True),
                 io.Boolean.Input("think", default=False, advanced=True),
-                io.Int.Input("think_max_new_tokens", default=384, min=1, max=4096, advanced=True),
+                io.Int.Input("think_max_new_tokens", default=1000, min=1, max=4096, advanced=True),
                 io.String.Input("deepstack_layers", default="8,16,24", advanced=True),
                 io.Boolean.Input("setclip", default=True, advanced=True),
                 io.ClipVisionOutput.Input("clip_vision_output", optional=True),
@@ -484,28 +493,36 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
 
     @staticmethod
     def _task_system_prompt(task: str) -> str:
-        prompts = {
-            "t2v": "Describe a high-quality target video from the user's request with concrete scene details, motion, camera behavior, and style.",
-            "i2v": "Describe a target video that should stay consistent with the provided reference image while following the user's request.",
-            "interpolation": "Describe a target video that smoothly transitions between the provided keyframe images while following the user's request.",
-            "reference2v": "Describe a target video that composes the provided reference subjects into a coherent scene following the user's request.",
-            "editing": "Describe an edited output video that follows the user's instruction while preserving relevant source video content.",
-            "tiv2v": "Describe an edited output video using both the provided source video and reference image guidance according to the user's instruction.",
-        }
-        return prompts.get(task, prompts["t2v"])
+        return TextEncodeHunyuanVideo15Omni.TASK_SYSTEM_PROMPTS.get(task, TextEncodeHunyuanVideo15Omni.TASK_SYSTEM_PROMPTS["t2v"])
 
     @classmethod
-    def _build_template(cls, task: str, image_count: int) -> str:
+    def _build_template(cls, task: str, image_count: int, add_generation_prompt: bool = False) -> str:
         system_prompt = cls._task_system_prompt(task)
         visual_tokens = "<|vision_start|><|image_pad|><|vision_end|>\n" * image_count
-        return (
+        template = (
             "<|im_start|>system\n"
             f"{system_prompt}"
             "<|im_end|>\n"
             "<|im_start|>user\n"
             f"{visual_tokens}" + "{}<|im_end|>\n"
-            "<|im_start|>assistant\n"
         )
+        if add_generation_prompt:
+            template += "<|im_start|>assistant\n"
+        return template
+
+    @classmethod
+    def _build_think_template(cls, task: str, image_count: int) -> str:
+        return cls._build_template(task, image_count, add_generation_prompt=True)
+
+    @staticmethod
+    def _tokenize_with_template(clip, text, template, image_embeds):
+        try:
+            return clip.tokenize(text, llama_template=template, images=image_embeds)
+        except TypeError:
+            embeds = None
+            if len(image_embeds) > 0:
+                embeds = torch.stack(image_embeds, dim=0)
+            return clip.tokenize(text, llama_template=template, image_embeds=embeds, image_interleave=1)
 
     @staticmethod
     def _extract_image_embeds(clip_vision_output, max_visual_inputs: int):
@@ -556,13 +573,8 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             expand_postfix = " Please generate a more detailed description based on the short description."
 
         think_prompt = f"{expand_prefix}{prompt}{expand_postfix}"
-        try:
-            tokens = clip.tokenize(think_prompt, images=image_embeds)
-        except TypeError:
-            embeds = None
-            if len(image_embeds) > 0:
-                embeds = torch.stack(image_embeds, dim=0)
-            tokens = clip.tokenize(think_prompt, image_embeds=embeds, image_interleave=1)
+        think_template = cls._build_think_template(task, len(image_embeds))
+        tokens = cls._tokenize_with_template(clip, think_prompt, think_template, image_embeds)
 
         generated = clip.generate(tokens, do_sample=False, max_length=max_new_tokens)
         generated_text = clip.decode(generated).strip()
@@ -608,15 +620,8 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         image_embeds = cls._extract_image_embeds(clip_vision_output, max_visual_inputs) if use_visual_inputs else []
         if think:
             prompt = cls._rewrite_prompt_with_think(clip, prompt, task, image_embeds, think_max_new_tokens)
-        template = cls._build_template(task, len(image_embeds))
-
-        try:
-            tokens = clip.tokenize(prompt, llama_template=template, images=image_embeds)
-        except TypeError:
-            embeds = None
-            if len(image_embeds) > 0:
-                embeds = torch.stack(image_embeds, dim=0)
-            tokens = clip.tokenize(prompt, llama_template=template, image_embeds=embeds, image_interleave=1)
+        template = cls._build_template(task, len(image_embeds), add_generation_prompt=True)
+        tokens = cls._tokenize_with_template(clip, prompt, template, image_embeds)
         deepstack = cls._parse_deepstack_layers(deepstack_layers)
         return io.NodeOutput(cls._encode_with_parity_options(clip, tokens, deepstack, setclip))
 

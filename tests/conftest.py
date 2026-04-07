@@ -10,6 +10,11 @@ def _install_global_test_stubs():
         node_helpers.conditioning_set_values = lambda conditioning, values: (conditioning, values)
         sys.modules["node_helpers"] = node_helpers
 
+    if "einops" not in sys.modules:
+        einops = types.ModuleType("einops")
+        einops.rearrange = lambda x, *args, **kwargs: x
+        sys.modules["einops"] = einops
+
     if "folder_paths" not in sys.modules:
         folder_paths = types.ModuleType("folder_paths")
         folder_paths.get_filename_list = lambda kind: [
@@ -73,6 +78,17 @@ def _install_global_test_stubs():
         model_patcher.ModelPatcher = _Patcher
         sys.modules["comfy.model_patcher"] = model_patcher
         comfy.model_patcher = model_patcher
+
+    if "comfy.ops" not in sys.modules:
+        comfy_ops = types.ModuleType("comfy.ops")
+
+        class _DisableWeightInit:
+            Conv3d = torch.nn.Conv3d
+            Conv2d = torch.nn.Conv2d
+
+        comfy_ops.disable_weight_init = _DisableWeightInit()
+        sys.modules["comfy.ops"] = comfy_ops
+        comfy.ops = comfy_ops
 
     if "comfy.utils" not in sys.modules:
         utils = types.ModuleType("comfy.utils")
@@ -191,6 +207,30 @@ def _install_global_test_stubs():
         ldm.__path__ = []
         sys.modules["comfy.ldm"] = ldm
         comfy.ldm = ldm
+
+    if "comfy.ldm.modules" not in sys.modules:
+        modules_pkg = types.ModuleType("comfy.ldm.modules")
+        modules_pkg.__path__ = []
+        sys.modules["comfy.ldm.modules"] = modules_pkg
+
+    if "comfy.ldm.modules.distributions" not in sys.modules:
+        distributions_pkg = types.ModuleType("comfy.ldm.modules.distributions")
+        distributions_pkg.__path__ = []
+        sys.modules["comfy.ldm.modules.distributions"] = distributions_pkg
+
+    if "comfy.ldm.modules.distributions.distributions" not in sys.modules:
+        distributions = types.ModuleType("comfy.ldm.modules.distributions.distributions")
+
+        class DiagonalGaussianDistribution:
+            def __init__(self, h):
+                self.h = h
+
+            def mode(self):
+                channels = self.h.shape[1] // 2
+                return self.h[:, :channels]
+
+        distributions.DiagonalGaussianDistribution = DiagonalGaussianDistribution
+        sys.modules["comfy.ldm.modules.distributions.distributions"] = distributions
 
     if "comfy.ldm.hunyuan_video" not in sys.modules:
         hv_pkg = types.ModuleType("comfy.ldm.hunyuan_video")

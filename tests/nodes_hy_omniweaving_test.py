@@ -153,6 +153,7 @@ _install_test_stubs()
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import nodes
+import omniweaving_vae
 
 
 class _ClipStub:
@@ -256,11 +257,33 @@ def test_hy_omniweaving_text_encode_think_rewrites_prompt():
 
     assert len(clip.tokenize_calls) == 2
     assert "Please generate a more detailed description" in clip.tokenize_calls[0][0]
+    assert "Given a text instruction and an input image" in clip.tokenize_calls[0][1]["llama_template"]
     assert clip.last_generate["do_sample"] is False
     assert clip.last_generate["max_length"] == 111
     assert "Here is a more detailed description. expanded prompt" in clip.tokenize_calls[1][0]
     assert "Here is a more detailed description. expanded prompt" in clip.last_encoded["tokens"]
+    assert "Given a text instruction and an input image" in clip.tokenize_calls[1][1]["llama_template"]
     assert ("set", {"execution_device": "cpu", "deepstack": [8, 16, 24], "setclip": True}) in clip.clip_options
+
+
+def test_hy_omniweaving_text_encode_uses_reference_style_task_template():
+    clip = _ClipStub(has_byt5=True)
+
+    nodes.TextEncodeHunyuanVideo15Omni.execute(
+        clip=clip,
+        prompt="test",
+        task="reference2v",
+        use_visual_inputs=False,
+        max_visual_inputs=8,
+        think=False,
+        think_max_new_tokens=1000,
+        deepstack_layers="8,16,24",
+        setclip=True,
+        clip_vision_output=None,
+    )
+
+    assert "Given a text instruction and one or more input images" in clip.tokenize_calls[0][1]["llama_template"]
+    assert clip.tokenize_calls[0][1]["llama_template"].endswith("<|im_start|>assistant\n")
 
 
 def test_hy_omniweaving_conditioning_uses_lanczos_center(monkeypatch):
@@ -414,6 +437,44 @@ def test_hy_omniweaving_vae_uses_custom_omniweaving_loader_for_causal_conv_state
 
     assert called["device"] == "cpu"
     assert called["dtype"] == torch.float16
+
+
+def test_omniweaving_decoder_adds_latent_residual_before_mid_blocks(monkeypatch):
+    decoder = omniweaving_vae.Decoder(
+        z_channels=2,
+        out_channels=3,
+        block_out_channels=[4],
+        num_res_blocks=0,
+        ffactor_spatial=1,
+        ffactor_temporal=1,
+    )
+
+    class AddOne(torch.nn.Module):
+        def forward(self, x):
+            return x.repeat_interleave(2, dim=1) + 1
+
+    class Identity(torch.nn.Module):
+        def forward(self, x):
+            return x
+
+    class Stage(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.block = torch.nn.ModuleList([Identity()])
+
+    decoder.conv_in = AddOne()
+    decoder.mid.block_1 = Identity()
+    decoder.mid.attn_1 = Identity()
+    decoder.mid.block_2 = Identity()
+    decoder.norm_out = Identity()
+    decoder.conv_out = Identity()
+    decoder.up = torch.nn.ModuleList([Stage()])
+
+    z = torch.ones((1, 2, 1, 1, 1))
+    out = decoder(z)
+
+    expected = torch.full((1, 4, 1, 1, 1), torch.nn.functional.silu(torch.tensor(3.0)).item())
+    assert torch.equal(out, expected)
 
 
 def test_normalize_hy_omniweaving_text_encoder_state_dict_rewrites_reference_prefixes():

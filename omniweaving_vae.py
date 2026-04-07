@@ -263,7 +263,8 @@ class Decoder(nn.Module):
         self.conv_out = CausalConv3d(block_in, out_channels, kernel_size=3)
 
     def forward(self, z):
-        h = self.conv_in(z)
+        repeats = self.block_out_channels[0] // self.z_channels
+        h = self.conv_in(z) + z.repeat_interleave(repeats=repeats, dim=1)
         h = self.mid.block_1(h)
         h = self.mid.attn_1(h)
         h = self.mid.block_2(h)
