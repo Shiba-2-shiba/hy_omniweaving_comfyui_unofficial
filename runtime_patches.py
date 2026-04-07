@@ -134,6 +134,46 @@ def _patch_hunyuan_image_te():
     hunyuan_image.HunyuanImageTEModel._encode_deepstack = _encode_deepstack
 
 
+def _patch_qwen25_think_generation():
+    import comfy.text_encoders.llama as llama
+
+    if getattr(llama.Qwen25_7BVLI_Config, "stop_tokens", None) is None:
+        llama.Qwen25_7BVLI_Config.stop_tokens = [151643, 151645]
+
+    if getattr(llama.BaseGenerate.generate, "_hy_omniweaving_patched", False):
+        return
+
+    original_generate = llama.BaseGenerate.generate
+
+    def patched_generate(self, embeds=None, do_sample=True, max_length=256, temperature=1.0, top_k=50, top_p=0.9, min_p=0.0, repetition_penalty=1.0, seed=42, stop_tokens=None, initial_tokens=[], execution_dtype=None, min_tokens=0, presence_penalty=0.0):
+        if stop_tokens is None:
+            config = getattr(self, "model", None)
+            config = getattr(config, "config", None)
+            stop_tokens = getattr(config, "stop_tokens", None)
+            if stop_tokens is None:
+                stop_tokens = [151643, 151645]
+        return original_generate(
+            self,
+            embeds=embeds,
+            do_sample=do_sample,
+            max_length=max_length,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            min_p=min_p,
+            repetition_penalty=repetition_penalty,
+            seed=seed,
+            stop_tokens=stop_tokens,
+            initial_tokens=initial_tokens,
+            execution_dtype=execution_dtype,
+            min_tokens=min_tokens,
+            presence_penalty=presence_penalty,
+        )
+
+    patched_generate._hy_omniweaving_patched = True
+    llama.BaseGenerate.generate = patched_generate
+
+
 def _patch_model_detection():
     import comfy.model_detection as model_detection
 
@@ -350,6 +390,7 @@ def _core_has_minimum_deepstack_support() -> bool:
 
 def apply_runtime_patches():
     _patch_hunyuan_image_te()
+    _patch_qwen25_think_generation()
     _patch_model_detection()
     _patch_model_base()
     _patch_hunyuan_video_model()
