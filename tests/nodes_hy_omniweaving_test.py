@@ -310,6 +310,33 @@ def test_hy_omniweaving_i2v_prompt_matches_original_wording():
     assert "then explain how the user's text instruction should alter the image" in prompt
 
 
+def test_extract_image_embeds_warns_when_mm_projected_is_missing(caplog):
+    output = types.SimpleNamespace(
+        last_hidden_state=torch.zeros((1, 729, 1152)),
+        penultimate_hidden_states=torch.zeros((1, 729, 1152)),
+        image_embeds=torch.zeros((1, 1152)),
+        mm_projected=None,
+    )
+
+    with caplog.at_level("WARNING"):
+        embeds = nodes.TextEncodeHunyuanVideo15Omni._extract_image_embeds(output, 8)
+
+    assert embeds == []
+    assert "without mm_projected" in caplog.text
+    assert "last_hidden_state=(1, 729, 1152)" in caplog.text
+
+
+def test_extract_image_embeds_uses_mm_projected_when_present():
+    output = types.SimpleNamespace(
+        mm_projected=torch.zeros((2, 16, 4096)),
+    )
+
+    embeds = nodes.TextEncodeHunyuanVideo15Omni._extract_image_embeds(output, 1)
+
+    assert len(embeds) == 1
+    assert tuple(embeds[0].shape) == (16, 4096)
+
+
 def test_hy_omniweaving_text_encode_think_rewrites_prompt():
     clip = _ClipStub(has_byt5=True)
 

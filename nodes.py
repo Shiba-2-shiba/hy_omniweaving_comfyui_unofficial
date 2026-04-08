@@ -37,6 +37,30 @@ def _debug_log(message: str, *args):
         logging.info("[HY-OmniWeaving:debug] " + message, *args)
 
 
+def _shape_of(value):
+    if torch.is_tensor(value):
+        return tuple(value.shape)
+    return None
+
+
+def _clip_vision_shapes(clip_vision_output):
+    if clip_vision_output is None:
+        return {
+            "present": False,
+            "last_hidden_state": None,
+            "penultimate_hidden_states": None,
+            "image_embeds": None,
+            "mm_projected": None,
+        }
+    return {
+        "present": True,
+        "last_hidden_state": _shape_of(getattr(clip_vision_output, "last_hidden_state", None)),
+        "penultimate_hidden_states": _shape_of(getattr(clip_vision_output, "penultimate_hidden_states", None)),
+        "image_embeds": _shape_of(getattr(clip_vision_output, "image_embeds", None)),
+        "mm_projected": _shape_of(getattr(clip_vision_output, "mm_projected", None)),
+    }
+
+
 def _clip_has_byt5_branch(clip) -> bool:
     cond_stage_model = getattr(clip, "cond_stage_model", None)
     return getattr(cond_stage_model, "byt5_small", None) is not None
@@ -633,6 +657,14 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             return []
         mm_projected = getattr(clip_vision_output, "mm_projected", None)
         if mm_projected is None:
+            shapes = _clip_vision_shapes(clip_vision_output)
+            logging.warning(
+                "HYOmniWeavingTextEncode received clip_vision_output without mm_projected. "
+                "Text-side image embeds will be disabled. Shapes: last_hidden_state=%s penultimate_hidden_states=%s image_embeds=%s",
+                shapes["last_hidden_state"],
+                shapes["penultimate_hidden_states"],
+                shapes["image_embeds"],
+            )
             return []
         if mm_projected.ndim == 2:
             return [mm_projected]
@@ -721,9 +753,10 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         ensure_hy_omniweaving_text_encoder_support(clip)
         cls._require_full_text_path(clip)
         cls._require_visual_inputs(task, use_visual_inputs, clip_vision_output)
+        vision_shapes = _clip_vision_shapes(clip_vision_output)
         image_embeds = cls._extract_image_embeds(clip_vision_output, max_visual_inputs) if use_visual_inputs else []
         _debug_log(
-            "text encode task=%s prompt_mode=%s crop_start=%s image_embeds=%s think=%s deepstack=%s setclip=%s",
+            "text encode task=%s prompt_mode=%s crop_start=%s image_embeds=%s think=%s deepstack=%s setclip=%s clip_vision=%s",
             task,
             cls._task_prompt_mode(task),
             cls._task_crop_start(task),
@@ -731,6 +764,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             think,
             deepstack_layers,
             setclip,
+            vision_shapes,
         )
         if think:
             prompt = cls._rewrite_prompt_with_think(clip, prompt, task, image_embeds, think_max_new_tokens)
@@ -858,6 +892,17 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
     def execute(cls, positive, negative, vae, task, width, height, length, batch_size, reference_images=None, condition_video=None, clip_vision_output=None) -> io.NodeOutput:
         latent_length = cls._latent_length(length)
         latent = torch.zeros([batch_size, 32, latent_length, height // 16, width // 16], device=comfy.model_management.intermediate_device())
+        _debug_log(
+            "conditioning task=%s width=%s height=%s length=%s batch=%s reference_images=%s condition_video=%s clip_vision=%s",
+            task,
+            width,
+            height,
+            length,
+            batch_size,
+            _shape_of(reference_images),
+            _shape_of(condition_video),
+            _clip_vision_shapes(clip_vision_output),
+        )
 
         if task == "t2v":
             if clip_vision_output is not None:
