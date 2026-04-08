@@ -600,6 +600,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
                 io.String.Input("deepstack_layers", default="8,16,24", advanced=True),
                 io.Boolean.Input("setclip", default=True, advanced=True),
                 io.ClipVisionOutput.Input("clip_vision_output", optional=True),
+                io.Image.Input("reference_images", optional=True),
             ],
             outputs=[
                 io.Conditioning.Output(),
@@ -642,8 +643,10 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         return cls._build_template(task, image_count, add_generation_prompt=True)
 
     @staticmethod
-    def _tokenize_with_template(clip, text, template, image_embeds):
+    def _tokenize_with_template(clip, text, template, image_embeds, visual_images=None):
         try:
+            if visual_images is not None:
+                return clip.tokenize(text, llama_template=template, images=visual_images)
             return clip.tokenize(text, llama_template=template, images=image_embeds)
         except TypeError:
             embeds = None
@@ -672,6 +675,13 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         return [mm_projected[i] for i in range(count)]
 
     @staticmethod
+    def _extract_visual_images(reference_images, max_visual_inputs: int):
+        if reference_images is None:
+            return []
+        count = min(reference_images.shape[0], max_visual_inputs)
+        return [reference_images[i:i + 1, :, :, :3] for i in range(count)]
+
+    @staticmethod
     def _require_full_text_path(clip):
         if _clip_has_byt5_branch(clip):
             return
@@ -681,19 +691,21 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         )
 
     @staticmethod
-    def _require_visual_inputs(task: str, use_visual_inputs: bool, clip_vision_output):
+    def _require_visual_inputs(task: str, use_visual_inputs: bool, clip_vision_output, reference_images):
         if not use_visual_inputs:
             return
         if task not in ("i2v", "interpolation", "reference2v", "editing", "tiv2v"):
             return
+        if reference_images is not None and reference_images.shape[0] > 0:
+            return
         if clip_vision_output is not None:
             return
         raise ValueError(
-            f"Task '{task}' with use_visual_inputs=True requires clip_vision_output for HY-OmniWeaving parity."
+            f"Task '{task}' with use_visual_inputs=True requires reference_images or clip_vision_output for HY-OmniWeaving parity."
         )
 
     @classmethod
-    def _rewrite_prompt_with_think(cls, clip, prompt, task, image_embeds, max_new_tokens: int) -> str:
+    def _rewrite_prompt_with_think(cls, clip, prompt, task, image_embeds, visual_images, max_new_tokens: int) -> str:
         if task not in ("t2v", "i2v", "interpolation"):
             raise ValueError("Think mode is currently intended only for t2v, i2v, or interpolation tasks.")
 
@@ -708,8 +720,15 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             expand_postfix = " Please generate a more detailed description based on the short description."
 
         think_prompt = f"{expand_prefix}{prompt}{expand_postfix}"
-        think_template = cls._build_think_template(task, len(image_embeds))
-        tokens = cls._tokenize_with_template(clip, think_prompt, think_template, image_embeds)
+        think_visual_count = len(visual_images) if len(visual_images) > 0 else len(image_embeds)
+        think_template = cls._build_think_template(task, think_visual_count)
+        tokens = cls._tokenize_with_template(
+            clip,
+            think_prompt,
+            think_template,
+            image_embeds,
+            visual_images=visual_images if len(visual_images) > 0 else None,
+        )
 
         generated = clip.generate(tokens, do_sample=False, max_length=max_new_tokens)
         generated_text = clip.decode(generated).strip()
@@ -749,27 +768,45 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         return [[cond, pooled_dict]]
 
     @classmethod
-    def execute(cls, clip, prompt, task, use_visual_inputs, max_visual_inputs, think, think_max_new_tokens, deepstack_layers, setclip, clip_vision_output=None) -> io.NodeOutput:
+    def execute(cls, clip, prompt, task, use_visual_inputs, max_visual_inputs, think, think_max_new_tokens, deepstack_layers, setclip, reference_images=None, clip_vision_output=None) -> io.NodeOutput:
         ensure_hy_omniweaving_text_encoder_support(clip)
         cls._require_full_text_path(clip)
-        cls._require_visual_inputs(task, use_visual_inputs, clip_vision_output)
+        cls._require_visual_inputs(task, use_visual_inputs, clip_vision_output, reference_images)
         vision_shapes = _clip_vision_shapes(clip_vision_output)
-        image_embeds = cls._extract_image_embeds(clip_vision_output, max_visual_inputs) if use_visual_inputs else []
+        visual_images = cls._extract_visual_images(reference_images, max_visual_inputs) if use_visual_inputs else []
+        image_embeds = []
+        visual_source = "none"
+        if len(visual_images) > 0:
+            visual_source = "reference_images"
+        elif use_visual_inputs:
+            image_embeds = cls._extract_image_embeds(clip_vision_output, max_visual_inputs)
+            if len(image_embeds) > 0:
+                visual_source = "clip_vision_output.mm_projected"
+            elif task in ("i2v", "interpolation", "reference2v", "tiv2v"):
+                logging.warning(
+                    "HYOmniWeavingTextEncode has no usable text-side visual inputs for task '%s'. "
+                    "Connect HY OmniWeaving Image Prep output to reference_images for parity-sensitive runs.",
+                    task,
+                )
         _debug_log(
-            "text encode task=%s prompt_mode=%s crop_start=%s image_embeds=%s think=%s deepstack=%s setclip=%s clip_vision=%s",
+            "text encode task=%s prompt_mode=%s crop_start=%s image_embeds=%s visual_images=%s visual_source=%s think=%s deepstack=%s setclip=%s clip_vision=%s",
             task,
             cls._task_prompt_mode(task),
             cls._task_crop_start(task),
             len(image_embeds),
+            len(visual_images),
+            visual_source,
             think,
             deepstack_layers,
             setclip,
             vision_shapes,
         )
         if think:
-            prompt = cls._rewrite_prompt_with_think(clip, prompt, task, image_embeds, think_max_new_tokens)
+            prompt = cls._rewrite_prompt_with_think(clip, prompt, task, image_embeds, visual_images, think_max_new_tokens)
         template = cls._build_template(task, len(image_embeds), add_generation_prompt=True)
-        tokens = cls._tokenize_with_template(clip, prompt, template, image_embeds)
+        if len(visual_images) > 0:
+            template = cls._build_template(task, len(visual_images), add_generation_prompt=True)
+        tokens = cls._tokenize_with_template(clip, prompt, template, image_embeds, visual_images=visual_images if len(visual_images) > 0 else None)
         deepstack = cls._parse_deepstack_layers(deepstack_layers)
         return io.NodeOutput(cls._encode_with_parity_options(clip, tokens, deepstack, setclip))
 

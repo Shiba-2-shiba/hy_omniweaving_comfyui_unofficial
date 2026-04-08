@@ -337,6 +337,62 @@ def test_extract_image_embeds_uses_mm_projected_when_present():
     assert tuple(embeds[0].shape) == (16, 4096)
 
 
+def test_hy_omniweaving_text_encode_prefers_reference_images_for_i2v():
+    clip = _ClipStub(has_byt5=True)
+    reference_images = torch.zeros((1, 640, 640, 3))
+    clip_vision_output = types.SimpleNamespace(
+        last_hidden_state=torch.zeros((1, 729, 1152)),
+        penultimate_hidden_states=torch.zeros((1, 729, 1152)),
+        image_embeds=torch.zeros((1, 729, 1152)),
+        mm_projected=None,
+    )
+
+    nodes.TextEncodeHunyuanVideo15Omni.execute(
+        clip=clip,
+        prompt="A dancer starts moving",
+        task="i2v",
+        use_visual_inputs=True,
+        max_visual_inputs=8,
+        think=False,
+        think_max_new_tokens=128,
+        deepstack_layers="8,16,24",
+        setclip=True,
+        reference_images=reference_images,
+        clip_vision_output=clip_vision_output,
+    )
+
+    assert "images" in clip.tokenize_calls[0][1]
+    assert len(clip.tokenize_calls[0][1]["images"]) == 1
+    assert tuple(clip.tokenize_calls[0][1]["images"][0].shape) == (1, 640, 640, 3)
+
+
+def test_hy_omniweaving_text_encode_warns_when_i2v_has_no_usable_text_side_visual_input(caplog):
+    clip = _ClipStub(has_byt5=True)
+    clip_vision_output = types.SimpleNamespace(
+        last_hidden_state=torch.zeros((1, 729, 1152)),
+        penultimate_hidden_states=torch.zeros((1, 729, 1152)),
+        image_embeds=torch.zeros((1, 729, 1152)),
+        mm_projected=None,
+    )
+
+    with caplog.at_level("WARNING"):
+        nodes.TextEncodeHunyuanVideo15Omni.execute(
+            clip=clip,
+            prompt="A dancer starts moving",
+            task="i2v",
+            use_visual_inputs=True,
+            max_visual_inputs=8,
+            think=False,
+            think_max_new_tokens=128,
+            deepstack_layers="8,16,24",
+            setclip=True,
+            reference_images=None,
+            clip_vision_output=clip_vision_output,
+        )
+
+    assert "no usable text-side visual inputs" in caplog.text
+
+
 def test_hy_omniweaving_text_encode_think_rewrites_prompt():
     clip = _ClipStub(has_byt5=True)
 
