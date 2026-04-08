@@ -806,7 +806,7 @@ def test_ensure_hy_omniweaving_deepstack_support_attaches_mm_in():
     assert len(patcher.wrappers) == 1
     out = model.extra_conds(all_stack_text_states=torch.tensor([1.0]))
     assert out["base"] == 1
-    assert torch.equal(out["all_stack_text_states"], torch.tensor([1.0]))
+    assert torch.equal(out["all_stack_text_states"].cond, torch.tensor([1.0]))
 
 
 def test_ensure_hy_omniweaving_deepstack_support_returns_false_without_mm_in_weights():
@@ -829,7 +829,7 @@ def test_ensure_hy_omniweaving_deepstack_support_returns_false_without_mm_in_wei
     assert attached is False
     assert diffusion_model.mm_in is None
     assert len(patcher.wrappers) == 1
-    assert torch.equal(model.extra_conds(all_stack_text_states=torch.tensor([2.0]))["all_stack_text_states"], torch.tensor([2.0]))
+    assert torch.equal(model.extra_conds(all_stack_text_states=torch.tensor([2.0]))["all_stack_text_states"].cond, torch.tensor([2.0]))
 
 
 def test_ensure_hy_omniweaving_text_encoder_support_patches_clip_instance():
@@ -896,3 +896,16 @@ def test_hy_omniweaving_diffusion_wrapper_injects_dit_patch():
     assert "patches_replace" in patched_options
     assert "dit" in patched_options["patches_replace"]
     assert ("double_block", 0) in patched_options["patches_replace"]["dit"]
+
+
+def test_cond_deepstack_preserves_layer_dim_when_processing_and_concat():
+    cond = runtime_patches._CONDDeepstackTextStates(torch.arange(3 * 1 * 5 * 2, dtype=torch.float32).reshape(3, 1, 5, 2))
+
+    processed = cond.process_cond(batch_size=2)
+
+    assert tuple(processed.cond.shape) == (3, 2, 5, 2)
+    assert torch.equal(processed.cond[:, 0], cond.cond[:, 0])
+    assert torch.equal(processed.cond[:, 1], cond.cond[:, 0])
+
+    combined = processed.concat([processed])
+    assert tuple(combined.shape) == (3, 4, 5, 2)

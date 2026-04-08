@@ -14,6 +14,7 @@ from __future__ import annotations
 import numbers
 import types
 import logging
+import math
 
 import torch
 from torch import nn
@@ -41,6 +42,44 @@ def _norm_of(value):
     return None
 
 
+class _CONDDeepstackTextStates:
+    def __init__(self, cond):
+        self.cond = cond
+
+    def _copy_with(self, cond):
+        return self.__class__(cond)
+
+    def process_cond(self, batch_size, **kwargs):
+        if self.cond.shape[1] == batch_size:
+            return self._copy_with(self.cond)
+        current = self.cond.shape[1]
+        if current > batch_size:
+            return self._copy_with(self.cond[:, :batch_size])
+        repeat_factor = math.ceil(batch_size / current)
+        repeated = self.cond.repeat(1, repeat_factor, 1, 1)[:, :batch_size]
+        return self._copy_with(repeated)
+
+    def can_concat(self, other):
+        if self.cond.dim() != other.cond.dim():
+            return False
+        if self.cond.device != other.cond.device:
+            logging.warning("WARNING: deepstack conds not on same device, skipping concat.")
+            return False
+        if self.cond.shape[0] != other.cond.shape[0]:
+            return False
+        if self.cond.shape[2:] != other.cond.shape[2:]:
+            return False
+        return True
+
+    def concat(self, others):
+        conds = [self.cond] + [x.cond for x in others]
+        return torch.cat(conds, dim=1)
+
+    def size(self):
+        hidden = self.cond.shape[-1] if self.cond.dim() > 0 else 1
+        return [self.cond.shape[1], hidden, math.prod(self.cond.shape) // max(1, hidden)]
+
+
 class _TextProjection(nn.Module):
     def __init__(self, in_channels, hidden_size, linear_cls=nn.Linear, dtype=None, device=None):
         super().__init__()
@@ -64,8 +103,6 @@ def extract_hy_omniweaving_mm_in_state_dict(sd: dict) -> dict:
 
 
 def _ensure_hy_omniweaving_extra_conds_support(model):
-    import comfy.conds
-
     if getattr(model, "_hy_omniweaving_extra_conds_patched", False):
         return False
 
@@ -75,7 +112,7 @@ def _ensure_hy_omniweaving_extra_conds_support(model):
         out = original_extra_conds(**kwargs)
         all_stack_text_states = kwargs.get("all_stack_text_states", None)
         if all_stack_text_states is not None:
-            out["all_stack_text_states"] = comfy.conds.CONDRegular(all_stack_text_states)
+            out["all_stack_text_states"] = _CONDDeepstackTextStates(all_stack_text_states)
         return out
 
     model.extra_conds = types.MethodType(patched_extra_conds, model)
