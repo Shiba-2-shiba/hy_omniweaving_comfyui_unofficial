@@ -19,6 +19,8 @@ import math
 import torch
 from torch import nn
 
+_HY_OMNIWEAVING_RUNTIME_PATCHES_READY = False
+
 
 def _debug_enabled() -> bool:
     import os
@@ -473,5 +475,14 @@ def _patch_autoencoder_legacy():
     autoencoder.AutoencodingEngineLegacy.__init__ = patched_init
 
 def apply_runtime_patches():
+    return ensure_runtime_patches()
+
+
+def ensure_runtime_patches():
+    global _HY_OMNIWEAVING_RUNTIME_PATCHES_READY
+    if _HY_OMNIWEAVING_RUNTIME_PATCHES_READY:
+        return False
     _patch_qwen25_think_generation()
     _patch_autoencoder_legacy()
+    _HY_OMNIWEAVING_RUNTIME_PATCHES_READY = True
+    return True

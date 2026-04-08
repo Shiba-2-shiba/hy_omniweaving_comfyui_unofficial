@@ -16,12 +16,14 @@ from comfy_api.latest import ComfyExtension, io
 
 try:
     from .runtime_patches import (
+        ensure_runtime_patches,
         ensure_hy_omniweaving_deepstack_support,
         ensure_hy_omniweaving_text_encoder_support,
         extract_hy_omniweaving_mm_in_state_dict,
     )
 except ImportError:
     from runtime_patches import (
+        ensure_runtime_patches,
         ensure_hy_omniweaving_deepstack_support,
         ensure_hy_omniweaving_text_encoder_support,
         extract_hy_omniweaving_mm_in_state_dict,
@@ -117,6 +119,7 @@ def _normalize_hy_omniweaving_text_encoder_state_dict(sd: dict) -> dict:
 
 
 def _load_hy_omniweaving_dual_text_encoder(qwen_text_encoder: str, byt5_text_encoder: str, device: str = "default"):
+    ensure_runtime_patches()
     qwen_path = folder_paths.get_full_path_or_raise("text_encoders", qwen_text_encoder)
     byt5_path = folder_paths.get_full_path_or_raise("text_encoders", byt5_text_encoder)
 
@@ -256,6 +259,61 @@ def _filter_known_optional_vae_missing_keys(missing_keys):
 
 def _prepare_omniweaving_images(images: torch.Tensor, width: int, height: int):
     return comfy.utils.common_upscale(images.movedim(-1, 1), width, height, "lanczos", "center").movedim(1, -1)
+
+
+def _ensure_video_latent_dims(latent: torch.Tensor) -> torch.Tensor:
+    if not torch.is_tensor(latent):
+        raise TypeError("Expected VAE latent tensor output.")
+    if latent.ndim == 4:
+        return latent.unsqueeze(2)
+    if latent.ndim != 5:
+        raise ValueError(f"Expected 4D or 5D latent tensor, got shape {tuple(latent.shape)}")
+    return latent
+
+
+def _unwrap_decoded_image_tensor(decoded) -> torch.Tensor:
+    if isinstance(decoded, dict):
+        decoded = decoded.get("samples", decoded.get("sample"))
+    elif isinstance(decoded, (list, tuple)):
+        decoded = decoded[0]
+
+    if not torch.is_tensor(decoded):
+        raise TypeError("Expected decoded image tensor output from VAE.")
+
+    if decoded.ndim == 5:
+        if decoded.shape[-1] in (1, 3, 4):
+            decoded = decoded[:, 0]
+        elif decoded.shape[1] in (1, 3, 4):
+            decoded = decoded[:, :, 0].movedim(1, -1)
+        else:
+            raise ValueError(f"Unsupported decoded video tensor shape {tuple(decoded.shape)}")
+    elif decoded.ndim == 4:
+        if decoded.shape[-1] in (1, 3, 4):
+            pass
+        elif decoded.shape[1] in (1, 3, 4):
+            decoded = decoded.movedim(1, -1)
+        else:
+            raise ValueError(f"Unsupported decoded image tensor shape {tuple(decoded.shape)}")
+    else:
+        raise ValueError(f"Unsupported decoded tensor rank {decoded.ndim}")
+
+    return decoded[:, :, :, :3].contiguous()
+
+
+def _derive_i2v_semantic_conditioning(vae, reference_images: torch.Tensor, width: int, height: int, latent_length: int):
+    prepared = _prepare_omniweaving_images(reference_images[:1], width, height)[:, :, :, :3]
+    first_latent = _ensure_video_latent_dims(vae.encode(prepared))
+    semantic_images = _unwrap_decoded_image_tensor(vae.decode(first_latent[:, :, :1]))
+    semantic_images = semantic_images.to(device=prepared.device, dtype=prepared.dtype)
+    semantic_latent = _ensure_video_latent_dims(vae.encode(semantic_images))
+
+    cond_latent = torch.zeros(
+        (first_latent.shape[0], first_latent.shape[1], latent_length, first_latent.shape[-2], first_latent.shape[-1]),
+        dtype=semantic_latent.dtype,
+        device=semantic_latent.device,
+    )
+    cond_latent[:, :, 0:1] = semantic_latent[:, :, :1]
+    return cond_latent, semantic_images
 
 
 class HYOmniWeavingVAE(comfy.sd.VAE):
@@ -549,6 +607,7 @@ class HYOmniWeavingVAELoader(io.ComfyNode):
 
     @classmethod
     def execute(cls, vae_name) -> io.NodeOutput:
+        ensure_runtime_patches()
         vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
         sd, metadata = comfy.utils.load_torch_file(vae_path, return_metadata=True)
         _debug_log(
@@ -789,6 +848,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, prompt, task, use_visual_inputs, max_visual_inputs, think, think_max_new_tokens, deepstack_layers, setclip, reference_images=None, clip_vision_output=None) -> io.NodeOutput:
+        ensure_runtime_patches()
         ensure_hy_omniweaving_text_encoder_support(clip)
         cls._require_full_text_path(clip)
         cls._require_visual_inputs(task, use_visual_inputs, clip_vision_output, reference_images)
@@ -893,6 +953,31 @@ class HYOmniWeavingImagePrep(io.ComfyNode):
         return io.NodeOutput(prepared)
 
 
+class HYOmniWeavingI2VSemanticImages(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="HYOmniWeavingI2VSemanticImages",
+            display_name="HY OmniWeaving I2V Semantic Images",
+            category="conditioning/video_models",
+            description="Derive OmniWeaving-style i2v semantic images through the VAE roundtrip so the same semantic frame can feed text-side multimodal input and CLIP-Vision encoding.",
+            inputs=[
+                io.Vae.Input("vae"),
+                io.Image.Input("reference_images"),
+                io.Int.Input("width", default=848, min=16, max=8192, step=16),
+                io.Int.Input("height", default=480, min=16, max=8192, step=16),
+            ],
+            outputs=[
+                io.Image.Output(display_name="semantic_images"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, vae, reference_images, width, height) -> io.NodeOutput:
+        semantic_images = _derive_i2v_semantic_conditioning(vae, reference_images, width, height, latent_length=1)[1]
+        return io.NodeOutput(semantic_images)
+
+
 class HunyuanVideo15OmniConditioning(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -973,8 +1058,7 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
         if task == "i2v":
             if reference_images is None or reference_images.shape[0] < 1:
                 raise ValueError("Task i2v requires at least one reference image.")
-            encoded = cls._encode_single_image(vae, reference_images, width, height)
-            cls._assign_frame(cond_latent, encoded, 0)
+            cond_latent = _derive_i2v_semantic_conditioning(vae, reference_images, width, height, latent_length)[0]
             omni_mask[0] = 1.0
         elif task == "interpolation":
             if reference_images is None or reference_images.shape[0] < 2:
@@ -1038,6 +1122,7 @@ class HYOmniWeavingExtension(ComfyExtension):
             HYOmniWeavingVAELoader,
             TextEncodeHunyuanVideo15Omni,
             HYOmniWeavingImagePrep,
+            HYOmniWeavingI2VSemanticImages,
             HunyuanClipVisionOutputConcat,
             HunyuanVideo15OmniConditioning,
         ]

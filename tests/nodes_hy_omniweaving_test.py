@@ -490,15 +490,53 @@ def test_hy_omniweaving_image_prep_uses_lanczos_center(monkeypatch):
     }
 
 
+def test_hy_omniweaving_i2v_semantic_images_roundtrip_reference_frame(monkeypatch):
+    class _VAE:
+        def __init__(self):
+            self.encode_inputs = []
+            self.decode_inputs = []
+
+        def encode(self, image):
+            self.encode_inputs.append(image.clone())
+            return torch.full((1, 32, 1, 2, 2), float(len(self.encode_inputs)), dtype=image.dtype)
+
+        def decode(self, latent):
+            self.decode_inputs.append(latent.clone())
+            return torch.full((1, 8, 8, 3), 0.75, dtype=latent.dtype)
+
+    monkeypatch.setattr(nodes.comfy.utils, "common_upscale", lambda tensor, width, height, method, crop: tensor)
+
+    semantic_images, = nodes.HYOmniWeavingI2VSemanticImages.execute(
+        vae=_VAE(),
+        reference_images=torch.zeros((1, 8, 8, 3)),
+        width=832,
+        height=480,
+    )
+
+    assert tuple(semantic_images.shape) == (1, 8, 8, 3)
+    assert torch.equal(semantic_images, torch.full((1, 8, 8, 3), 0.75))
+
+
 def test_hy_omniweaving_conditioning_i2v_sets_stock_comfy_mask_polarity():
     class _VAE:
+        def __init__(self):
+            self.encode_inputs = []
+            self.decode_inputs = []
+
         def encode(self, image):
-            return torch.ones((1, 32, 1, 2, 2), dtype=image.dtype)
+            self.encode_inputs.append(image.clone())
+            return torch.full((1, 32, 1, 2, 2), float(len(self.encode_inputs)), dtype=image.dtype)
+
+        def decode(self, latent):
+            self.decode_inputs.append(latent.clone())
+            return torch.full((1, 8, 8, 3), 0.5, dtype=latent.dtype)
+
+    vae = _VAE()
 
     positive, negative, latent = nodes.HunyuanVideo15OmniConditioning.execute(
         positive="pos",
         negative="neg",
-        vae=_VAE(),
+        vae=vae,
         task="i2v",
         width=32,
         height=32,
@@ -514,11 +552,26 @@ def test_hy_omniweaving_conditioning_i2v_sets_stock_comfy_mask_polarity():
     assert tuple(latent["samples"].shape) == (1, 32, 2, 2, 2)
     assert tuple(pos_values["concat_latent_image"].shape) == (1, 32, 2, 2, 2)
     assert tuple(pos_values["concat_mask"].shape) == (1, 1, 2, 2, 2)
-    assert torch.equal(pos_values["concat_latent_image"][:, :, 0], torch.ones((1, 32, 2, 2)))
+    assert torch.equal(pos_values["concat_latent_image"][:, :, 0], torch.full((1, 32, 2, 2), 2.0))
     assert torch.equal(pos_values["concat_latent_image"][:, :, 1], torch.zeros((1, 32, 2, 2)))
     assert torch.equal(pos_values["concat_mask"][:, :, 0], torch.zeros((1, 1, 2, 2)))
     assert torch.equal(pos_values["concat_mask"][:, :, 1], torch.ones((1, 1, 2, 2)))
     assert torch.equal(neg_values["concat_mask"], pos_values["concat_mask"])
+    assert len(vae.encode_inputs) == 2
+    assert len(vae.decode_inputs) == 1
+
+
+def test_ensure_runtime_patches_is_idempotent(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(runtime_patches, "_patch_qwen25_think_generation", lambda: calls.append("think"))
+    monkeypatch.setattr(runtime_patches, "_patch_autoencoder_legacy", lambda: calls.append("vae"))
+    if hasattr(runtime_patches, "_HY_OMNIWEAVING_RUNTIME_PATCHES_READY"):
+        monkeypatch.setattr(runtime_patches, "_HY_OMNIWEAVING_RUNTIME_PATCHES_READY", False)
+
+    assert runtime_patches.ensure_runtime_patches() is True
+    assert runtime_patches.ensure_runtime_patches() is False
+    assert calls == ["think", "vae"]
 
 
 def test_convert_split_hy_omniweaving_attention_qkv_weight_and_bias():
