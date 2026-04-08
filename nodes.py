@@ -43,6 +43,12 @@ def _shape_of(value):
     return None
 
 
+def _norm_of(value):
+    if torch.is_tensor(value):
+        return float(value.float().norm().item())
+    return None
+
+
 def _clip_vision_shapes(clip_vision_output):
     if clip_vision_output is None:
         return {
@@ -482,7 +488,14 @@ class HYOmniWeavingUNetLoader(io.ComfyNode):
         sd, converted, partial = _convert_split_hy_omniweaving_attention_qkv(sd, strict_mode=strict_mode)
         mm_in_sd = extract_hy_omniweaving_mm_in_state_dict(sd)
         if len(mm_in_sd) > 0:
-            _debug_log("unet loader detected mm_in tensors count=%s before ComfyUI load", len(mm_in_sd))
+            _debug_log(
+                "unet loader detected mm_in tensors count=%s source_linear1_shape=%s source_linear1_norm=%.6f source_linear2_shape=%s source_linear2_norm=%.6f",
+                len(mm_in_sd),
+                _shape_of(mm_in_sd.get("linear_1.weight")),
+                _norm_of(mm_in_sd.get("linear_1.weight")) or -1.0,
+                _shape_of(mm_in_sd.get("linear_2.weight")),
+                _norm_of(mm_in_sd.get("linear_2.weight")) or -1.0,
+            )
         if converted > 0:
             logging.info(f"HYOmniWeavingUNetLoader converted {converted} split attention tensors to qkv format.")
         if len(partial) > 0 and not strict_mode:
@@ -765,6 +778,13 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         if len(encoded) > 2:
             pooled_dict.update(encoded[2])
         clip.add_hooks_to_dict(pooled_dict)
+        _debug_log(
+            "text encode output cond_shape=%s pooled_keys=%s all_stack_text_states_shape=%s attention_mask_shape=%s",
+            _shape_of(cond),
+            sorted(pooled_dict.keys()),
+            _shape_of(pooled_dict.get("all_stack_text_states")),
+            _shape_of(pooled_dict.get("attention_mask")),
+        )
         return [[cond, pooled_dict]]
 
     @classmethod

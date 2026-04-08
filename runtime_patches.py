@@ -19,6 +19,28 @@ import torch
 from torch import nn
 
 
+def _debug_enabled() -> bool:
+    import os
+    return os.getenv("HY_OMNIWEAVING_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_log(message: str, *args):
+    if _debug_enabled():
+        logging.info("[HY-OmniWeaving:debug] " + message, *args)
+
+
+def _shape_of(value):
+    if torch.is_tensor(value):
+        return tuple(value.shape)
+    return None
+
+
+def _norm_of(value):
+    if torch.is_tensor(value):
+        return float(value.float().norm().item())
+    return None
+
+
 class _TextProjection(nn.Module):
     def __init__(self, in_channels, hidden_size, linear_cls=nn.Linear, dtype=None, device=None):
         super().__init__()
@@ -109,6 +131,13 @@ def ensure_hy_omniweaving_deepstack_support(model_patcher, sd: dict | None = Non
     freeze_main = getattr(diffusion_model, "freeze_main", True)
     diffusion_model.mm_in = module
     diffusion_model.freeze_main = freeze_main
+    _debug_log(
+        "mm_in source_vs_attach source_linear1_norm=%.6f source_linear2_norm=%.6f attached_linear1_norm=%.6f attached_linear2_norm=%.6f",
+        _norm_of(linear_1_weight) or -1.0,
+        _norm_of(linear_2_weight) or -1.0,
+        _norm_of(module.linear_1.weight) or -1.0,
+        _norm_of(module.linear_2.weight) or -1.0,
+    )
     return True
 
 
@@ -152,6 +181,18 @@ def _hy_omniweaving_diffusion_model_wrapper(executor, *args, **kwargs):
         transformer_options = transformer_options.copy()
         patches_replace["dit"] = dit_patches
         transformer_options["patches_replace"] = patches_replace
+
+        if not getattr(diffusion_model, "_hy_omniweaving_wrapper_logged", False):
+            _debug_log(
+                "diffusion wrapper fired all_stack_text_states_shape=%s all_stack_text_states_norm=%.6f projected_shape=%s projected_norm=%.6f patched_double_blocks=%s freeze_main=%s",
+                _shape_of(all_stack_text_states),
+                _norm_of(all_stack_text_states) or -1.0,
+                _shape_of(projected),
+                _norm_of(projected) or -1.0,
+                min(len(projected), len(diffusion_model.double_blocks)),
+                freeze_main,
+            )
+            diffusion_model._hy_omniweaving_wrapper_logged = True
 
         args = list(args)
         if len(args) > 0 and isinstance(args[-1], dict):
