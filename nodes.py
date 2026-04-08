@@ -14,6 +14,11 @@ from typing_extensions import override
 
 from comfy_api.latest import ComfyExtension, io
 
+try:
+    from .runtime_patches import ensure_hy_omniweaving_deepstack_support, ensure_hy_omniweaving_text_encoder_support
+except ImportError:
+    from runtime_patches import ensure_hy_omniweaving_deepstack_support, ensure_hy_omniweaving_text_encoder_support
+
 
 def _clip_has_byt5_branch(clip) -> bool:
     cond_stage_model = getattr(clip, "cond_stage_model", None)
@@ -83,6 +88,7 @@ def _load_hy_omniweaving_dual_text_encoder(qwen_text_encoder: str, byt5_text_enc
         clip_type=comfy.sd.CLIPType.HUNYUAN_VIDEO_15,
         model_options=model_options,
     )
+    ensure_hy_omniweaving_text_encoder_support(clip)
     logging.info(
         "HYOmniWeavingTextEncoderLoader loaded dual text encoders: qwen=%s byt5=%s",
         qwen_text_encoder,
@@ -192,6 +198,10 @@ def _filter_known_optional_vae_missing_keys(missing_keys):
     filtered = [key for key in missing_keys if key not in optional_suffixes]
     ignored = [key for key in missing_keys if key in optional_suffixes]
     return filtered, ignored
+
+
+def _prepare_omniweaving_images(images: torch.Tensor, width: int, height: int):
+    return comfy.utils.common_upscale(images.movedim(-1, 1), width, height, "lanczos", "center").movedim(1, -1)
 
 
 class HYOmniWeavingVAE(comfy.sd.VAE):
@@ -429,6 +439,8 @@ class HYOmniWeavingUNetLoader(io.ComfyNode):
         model = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata)
         if model is None:
             raise RuntimeError(f"Failed to load HY-OmniWeaving diffusion model: {unet_name}")
+        if ensure_hy_omniweaving_deepstack_support(model, sd):
+            logging.info("HYOmniWeavingUNetLoader attached mm_in for deepstack support without model-detection patching.")
         return io.NodeOutput(model)
 
 
@@ -458,13 +470,37 @@ class HYOmniWeavingVAELoader(io.ComfyNode):
 
 
 class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
-    TASK_SYSTEM_PROMPTS = {
-        "t2v": "You are a helpful assistant. Describe the video by detailing the following aspects:\n1. The main content and theme of the video.\n2. The color, shape, size, texture, quantity, text, and spatial relationships of the objects.\n3. Actions, events, behaviors temporal relationships, physical movement changes of the objects.\n4. background environment, light, style and atmosphere.\n5. camera angles, movements, and transitions used in the video.",
-        "i2v": "You are a helpful assistant. Given a text instruction and an input image, you need to explain how the user's text instruction should alter the image to introduce motion and evolution over time. Generate a video using this image as the first frame that meets the user's requirements, ensuring the specified elements evolve or move in a way that fulfills the text description while maintaining consistency.",
-        "reference2v": "You are a helpful assistant. Given a text instruction and one or more input images, you need to explain how to extract and combine key information from the input images to construct a new image as the video's first frame, and then how the user's text instruction should alter the image to introduce motion and evolution over time. Generate a video that meets the user's requirements, ensuring the specified elements evolve or move in a way that fulfills the text description while maintaining consistency.",
-        "interpolation": "You are a helpful assistant. Given a text instruction, an image as the first frame of the video, and another image as the last frame of the video, you need to analyze the visual trajectory required to transition from the start to the end. Determine how the elements in the first frame must evolve, move, or transform to align with the last frame based on the text instruction. Generate a video that seamlessly connects these two frames, ensuring the motion and evolution between them fulfill the text description while maintaining temporal consistency",
-        "editing": "You are a helpful assistant. Given a text instruction and an input video, you need to analyze the visual content and temporal dynamics of the input video, and then explain how the user's text instruction should modify the video's visual style, objects, or scene composition. Generate an edited video that meets the user's requirements, ensuring the specified modifications are applied consistently across frames while preserving the original motion flow and coherence.",
-        "tiv2v": "You are a helpful assistant. Given a text instruction, a reference image and an input video, you need to analyze the visual content and temporal dynamics of the input video, alongside the scene or subject characteristics of the reference image. Explain how the user's text instruction directs the application of the reference image's visual attributes onto the input video. Generate an edited video that meets the user's requirements, ensuring the specified modifications are applied consistently across frames while preserving the original motion flow and coherence.",
+    TASK_SPECS = {
+        "t2v": {
+            "prompt_mode": 1,
+            "crop_start": 108,
+            "system_prompt": "You are a helpful assistant. Describe the video by detailing the following aspects:\n1. The main content and theme of the video.\n2. The color, shape, size, texture, quantity, text, and spatial relationships of the objects.\n3. Actions, events, behaviors temporal relationships, physical movement changes of the objects.\n4. background environment, light, style and atmosphere.\n5. camera angles, movements, and transitions used in the video.",
+        },
+        "i2v": {
+            "prompt_mode": 2,
+            "crop_start": 92,
+            "system_prompt": "You are a helpful assistant. Describe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter the image to introduce motion and evolution over time. Generate a video using this image as the first frame that meets the user's requirements, ensuring the specified elements evolve or move in a way that fulfills the text description while maintaining consistency.",
+        },
+        "reference2v": {
+            "prompt_mode": 3,
+            "crop_start": 102,
+            "system_prompt": "You are a helpful assistant. Given a text instruction and one or more input images, you need to explain how to extract and combine key information from the input images to construct a new image as the video's first frame, and then how the user's text instruction should alter the image to introduce motion and evolution over time. Generate a video that meets the user's requirements, ensuring the specified elements evolve or move in a way that fulfills the text description while maintaining consistency.",
+        },
+        "interpolation": {
+            "prompt_mode": 4,
+            "crop_start": 109,
+            "system_prompt": "You are a helpful assistant. Given a text instruction, an image as the first frame of the video, and another image as the last frame of the video, you need to analyze the visual trajectory required to transition from the start to the end. Determine how the elements in the first frame must evolve, move, or transform to align with the last frame based on the text instruction. Generate a video that seamlessly connects these two frames, ensuring the motion and evolution between them fulfill the text description while maintaining temporal consistency",
+        },
+        "editing": {
+            "prompt_mode": 5,
+            "crop_start": 90,
+            "system_prompt": "You are a helpful assistant. Given a text instruction and an input video, you need to analyze the visual content and temporal dynamics of the input video, and then explain how the user's text instruction should modify the video's visual style, objects, or scene composition. Generate an edited video that meets the user's requirements, ensuring the specified modifications are applied consistently across frames while preserving the original motion flow and coherence.",
+        },
+        "tiv2v": {
+            "prompt_mode": 6,
+            "crop_start": 104,
+            "system_prompt": "You are a helpful assistant. Given a text instruction, a reference image and an input video, you need to analyze the visual content and temporal dynamics of the input video, alongside the scene or subject characteristics of the reference image. Explain how the user's text instruction directs the application of the reference image's visual attributes onto the input video. Generate an edited video that meets the user's requirements, ensuring the specified modifications are applied consistently across frames while preserving the original motion flow and coherence.",
+        },
     }
 
     @classmethod
@@ -492,8 +528,20 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         )
 
     @staticmethod
+    def _task_spec(task: str) -> dict:
+        return TextEncodeHunyuanVideo15Omni.TASK_SPECS.get(task, TextEncodeHunyuanVideo15Omni.TASK_SPECS["t2v"])
+
+    @staticmethod
     def _task_system_prompt(task: str) -> str:
-        return TextEncodeHunyuanVideo15Omni.TASK_SYSTEM_PROMPTS.get(task, TextEncodeHunyuanVideo15Omni.TASK_SYSTEM_PROMPTS["t2v"])
+        return TextEncodeHunyuanVideo15Omni._task_spec(task)["system_prompt"]
+
+    @staticmethod
+    def _task_prompt_mode(task: str) -> int:
+        return TextEncodeHunyuanVideo15Omni._task_spec(task)["prompt_mode"]
+
+    @staticmethod
+    def _task_crop_start(task: str) -> int:
+        return TextEncodeHunyuanVideo15Omni._task_spec(task)["crop_start"]
 
     @classmethod
     def _build_template(cls, task: str, image_count: int, add_generation_prompt: bool = False) -> str:
@@ -615,6 +663,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, prompt, task, use_visual_inputs, max_visual_inputs, think, think_max_new_tokens, deepstack_layers, setclip, clip_vision_output=None) -> io.NodeOutput:
+        ensure_hy_omniweaving_text_encoder_support(clip)
         cls._require_full_text_path(clip)
         cls._require_visual_inputs(task, use_visual_inputs, clip_vision_output)
         image_embeds = cls._extract_image_embeds(clip_vision_output, max_visual_inputs) if use_visual_inputs else []
@@ -664,6 +713,30 @@ class HunyuanClipVisionOutputConcat(io.ComfyNode):
         return io.NodeOutput(merged)
 
 
+class HYOmniWeavingImagePrep(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="HYOmniWeavingImagePrep",
+            display_name="HY OmniWeaving Image Prep",
+            category="conditioning/video_models",
+            description="Prepare reference images for OmniWeaving-aligned i2v/reference workflows using the original-style Lanczos resize and center crop before VAE and CLIP-Vision encoding.",
+            inputs=[
+                io.Image.Input("reference_images"),
+                io.Int.Input("width", default=848, min=16, max=8192, step=16),
+                io.Int.Input("height", default=480, min=16, max=8192, step=16),
+            ],
+            outputs=[
+                io.Image.Output(display_name="prepared_images"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, reference_images, width, height) -> io.NodeOutput:
+        prepared = _prepare_omniweaving_images(reference_images, width, height)
+        return io.NodeOutput(prepared)
+
+
 class HunyuanVideo15OmniConditioning(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -698,7 +771,7 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
 
     @staticmethod
     def _upscale_frames(frames: torch.Tensor, width: int, height: int):
-        return comfy.utils.common_upscale(frames.movedim(-1, 1), width, height, "lanczos", "center").movedim(1, -1)
+        return _prepare_omniweaving_images(frames, width, height)
 
     @classmethod
     def _encode_single_image(cls, vae, image: torch.Tensor, width: int, height: int):
@@ -797,6 +870,7 @@ class HYOmniWeavingExtension(ComfyExtension):
             HYOmniWeavingUNetLoader,
             HYOmniWeavingVAELoader,
             TextEncodeHunyuanVideo15Omni,
+            HYOmniWeavingImagePrep,
             HunyuanClipVisionOutputConcat,
             HunyuanVideo15OmniConditioning,
         ]

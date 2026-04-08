@@ -106,6 +106,7 @@ def _install_global_test_stubs():
 
         utils.state_dict_prefix_replace = _state_dict_prefix_replace
         utils.common_upscale = lambda tensor, width, height, method, crop: tensor
+        utils.resize_to_batch_size = lambda tensor, batch_size: tensor if tensor.shape[0] == batch_size else tensor.expand(batch_size, *tensor.shape[1:])
         utils.load_torch_file = lambda path, safe_load=True, return_metadata=False: {} if not return_metadata else ({}, {})
         sys.modules["comfy.utils"] = utils
         comfy.utils = utils
@@ -185,6 +186,12 @@ def _install_global_test_stubs():
         conds.CONDRegular = lambda value: value
         sys.modules["comfy.conds"] = conds
         comfy.conds = conds
+
+    if "comfy.patcher_extension" not in sys.modules:
+        patcher_extension = types.ModuleType("comfy.patcher_extension")
+        patcher_extension.WrappersMP = types.SimpleNamespace(DIFFUSION_MODEL="diffusion_model")
+        sys.modules["comfy.patcher_extension"] = patcher_extension
+        comfy.patcher_extension = patcher_extension
 
     if "comfy.model_base" not in sys.modules:
         model_base = types.ModuleType("comfy.model_base")
@@ -309,7 +316,7 @@ def _install_global_test_stubs():
             ClipVisionOutput=types.SimpleNamespace(Input=_InputFactory.Input, Output=_OutputFactory.Output),
             Vae=types.SimpleNamespace(Input=_InputFactory.Input, Output=_OutputFactory.Output),
             Model=types.SimpleNamespace(Output=_OutputFactory.Output),
-            Image=types.SimpleNamespace(Input=_InputFactory.Input),
+            Image=types.SimpleNamespace(Input=_InputFactory.Input, Output=_OutputFactory.Output),
             Latent=types.SimpleNamespace(Output=_OutputFactory.Output),
         )
 
