@@ -15,9 +15,26 @@ from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io
 
 try:
-    from .runtime_patches import ensure_hy_omniweaving_deepstack_support, ensure_hy_omniweaving_text_encoder_support
+    from .runtime_patches import (
+        ensure_hy_omniweaving_deepstack_support,
+        ensure_hy_omniweaving_text_encoder_support,
+        extract_hy_omniweaving_mm_in_state_dict,
+    )
 except ImportError:
-    from runtime_patches import ensure_hy_omniweaving_deepstack_support, ensure_hy_omniweaving_text_encoder_support
+    from runtime_patches import (
+        ensure_hy_omniweaving_deepstack_support,
+        ensure_hy_omniweaving_text_encoder_support,
+        extract_hy_omniweaving_mm_in_state_dict,
+    )
+
+
+def _debug_enabled() -> bool:
+    return os.getenv("HY_OMNIWEAVING_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_log(message: str, *args):
+    if _debug_enabled():
+        logging.info("[HY-OmniWeaving:debug] " + message, *args)
 
 
 def _clip_has_byt5_branch(clip) -> bool:
@@ -89,6 +106,13 @@ def _load_hy_omniweaving_dual_text_encoder(qwen_text_encoder: str, byt5_text_enc
         model_options=model_options,
     )
     ensure_hy_omniweaving_text_encoder_support(clip)
+    _debug_log(
+        "text encoder prepared qwen_keys=%s byt5_keys=%s byt5_branch=%s patched=%s",
+        len(qwen_sd),
+        len(byt5_sd) if isinstance(byt5_sd, dict) else "n/a",
+        _clip_has_byt5_branch(clip),
+        hasattr(getattr(clip, "cond_stage_model", None), "_hy_omniweaving_text_encoder_patched"),
+    )
     logging.info(
         "HYOmniWeavingTextEncoderLoader loaded dual text encoders: qwen=%s byt5=%s",
         qwen_text_encoder,
@@ -432,6 +456,9 @@ class HYOmniWeavingUNetLoader(io.ComfyNode):
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
         sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
         sd, converted, partial = _convert_split_hy_omniweaving_attention_qkv(sd, strict_mode=strict_mode)
+        mm_in_sd = extract_hy_omniweaving_mm_in_state_dict(sd)
+        if len(mm_in_sd) > 0:
+            _debug_log("unet loader detected mm_in tensors count=%s before ComfyUI load", len(mm_in_sd))
         if converted > 0:
             logging.info(f"HYOmniWeavingUNetLoader converted {converted} split attention tensors to qkv format.")
         if len(partial) > 0 and not strict_mode:
@@ -439,8 +466,31 @@ class HYOmniWeavingUNetLoader(io.ComfyNode):
         model = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata)
         if model is None:
             raise RuntimeError(f"Failed to load HY-OmniWeaving diffusion model: {unet_name}")
-        if ensure_hy_omniweaving_deepstack_support(model, sd):
+        attached = ensure_hy_omniweaving_deepstack_support(model, mm_in_sd=mm_in_sd)
+        if attached:
             logging.info("HYOmniWeavingUNetLoader attached mm_in for deepstack support without model-detection patching.")
+            diffusion_model = getattr(getattr(model, "model", None), "diffusion_model", None)
+            mm_in = getattr(diffusion_model, "mm_in", None)
+            if mm_in is not None:
+                linear_1 = getattr(mm_in, "linear_1", None)
+                linear_2 = getattr(mm_in, "linear_2", None)
+                _debug_log(
+                    "mm_in attached class=%s linear1_shape=%s linear1_dtype=%s linear1_norm=%.6f linear2_norm=%.6f",
+                    type(mm_in).__name__,
+                    tuple(linear_1.weight.shape) if linear_1 is not None else None,
+                    getattr(linear_1.weight, "dtype", None) if linear_1 is not None else None,
+                    float(linear_1.weight.float().norm().item()) if linear_1 is not None else -1.0,
+                    float(linear_2.weight.float().norm().item()) if linear_2 is not None else -1.0,
+                )
+        elif len(mm_in_sd) > 0:
+            logging.warning("HYOmniWeavingUNetLoader found mm_in weights but failed to attach them after model load.")
+        _debug_log(
+            "unet loader converted_qkv=%s partial_qkv=%s mm_in_attached=%s wrapper_added=%s",
+            converted,
+            len(partial),
+            attached,
+            getattr(model, "_hy_omniweaving_diffusion_wrapper_added", False),
+        )
         return io.NodeOutput(model)
 
 
@@ -464,6 +514,11 @@ class HYOmniWeavingVAELoader(io.ComfyNode):
     def execute(cls, vae_name) -> io.NodeOutput:
         vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
         sd, metadata = comfy.utils.load_torch_file(vae_path, return_metadata=True)
+        _debug_log(
+            "vae loader omni_layout=%s decoder_conv_in_shape=%s",
+            _is_omniweaving_vae_state_dict(sd),
+            tuple(sd["decoder.conv_in.conv.weight"].shape) if "decoder.conv_in.conv.weight" in sd else tuple(sd["decoder.conv_in.weight"].shape) if "decoder.conv_in.weight" in sd else None,
+        )
         vae = HYOmniWeavingVAE(sd=sd, metadata=metadata)
         vae.throw_exception_if_invalid()
         return io.NodeOutput(vae)
@@ -667,6 +722,16 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         cls._require_full_text_path(clip)
         cls._require_visual_inputs(task, use_visual_inputs, clip_vision_output)
         image_embeds = cls._extract_image_embeds(clip_vision_output, max_visual_inputs) if use_visual_inputs else []
+        _debug_log(
+            "text encode task=%s prompt_mode=%s crop_start=%s image_embeds=%s think=%s deepstack=%s setclip=%s",
+            task,
+            cls._task_prompt_mode(task),
+            cls._task_crop_start(task),
+            len(image_embeds),
+            think,
+            deepstack_layers,
+            setclip,
+        )
         if think:
             prompt = cls._rewrite_prompt_with_think(clip, prompt, task, image_embeds, think_max_new_tokens)
         template = cls._build_template(task, len(image_embeds), add_generation_prompt=True)

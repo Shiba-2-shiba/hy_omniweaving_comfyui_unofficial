@@ -17,6 +17,7 @@ Recommended workflow boundary:
 
 - keep **sampling / scheduler / CFG / steps / model loading / VRAM management** on stock ComfyUI nodes
 - keep only **OmniWeaving-specific text semantics, image preparation, task conditioning, and compatibility hooks** in this package
+- set `HY_OMNIWEAVING_DEBUG=1` temporarily when you need extra loader/attach diagnostics for text encoder / UNet / VAE status checks
 
 Current non-goals:
 

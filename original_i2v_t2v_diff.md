@@ -172,3 +172,15 @@ The main remaining problems are not sampler/scheduler-related; they are:
 - reducing the amount of **runtime monkey patching**
 
 So the next refactor should focus on **conditioning-path correctness**, not on rebuilding original inference internals that ComfyUI already does well.
+
+## Debugging note
+
+Do not suppress `mm_in.*` unexpected-key signals prematurely just to make logs quieter.
+
+At the current stage, those warnings are still useful evidence when checking whether:
+
+- stock ComfyUI ignored OmniWeaving-only weights during core load
+- the custom loader successfully re-attached those weights afterward
+- quality regressions correlate with failed or mismatched deepstack attachment
+
+Use `HY_OMNIWEAVING_DEBUG=1` to surface the post-load attach state instead of hiding the original warning.

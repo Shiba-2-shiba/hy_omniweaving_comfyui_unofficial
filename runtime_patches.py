@@ -13,17 +13,18 @@ Current state:
 from __future__ import annotations
 import numbers
 import types
+import logging
 
 import torch
 from torch import nn
 
 
 class _TextProjection(nn.Module):
-    def __init__(self, in_channels, hidden_size, dtype=None, device=None):
+    def __init__(self, in_channels, hidden_size, linear_cls=nn.Linear, dtype=None, device=None):
         super().__init__()
-        self.linear_1 = nn.Linear(in_channels, hidden_size, bias=True, device=device, dtype=dtype)
+        self.linear_1 = linear_cls(in_channels, hidden_size, bias=True, device=device, dtype=dtype)
         self.act_1 = nn.SiLU()
-        self.linear_2 = nn.Linear(hidden_size, hidden_size, bias=True, device=device, dtype=dtype)
+        self.linear_2 = linear_cls(hidden_size, hidden_size, bias=True, device=device, dtype=dtype)
 
     def forward(self, caption):
         hidden_states = self.linear_1(caption)
@@ -32,7 +33,7 @@ class _TextProjection(nn.Module):
         return hidden_states
 
 
-def _extract_mm_in_state_dict(sd: dict) -> dict:
+def extract_hy_omniweaving_mm_in_state_dict(sd: dict) -> dict:
     return {
         key[len("mm_in."):]: value
         for key, value in sd.items()
@@ -57,11 +58,13 @@ def _ensure_hy_omniweaving_extra_conds_support(model):
 
     model.extra_conds = types.MethodType(patched_extra_conds, model)
     model._hy_omniweaving_extra_conds_patched = True
+    logging.info("HY-OmniWeaving attached instance-local extra_conds support.")
     return True
 
 
-def ensure_hy_omniweaving_deepstack_support(model_patcher, sd: dict):
-    mm_in_sd = _extract_mm_in_state_dict(sd)
+def ensure_hy_omniweaving_deepstack_support(model_patcher, sd: dict | None = None, mm_in_sd: dict | None = None):
+    if mm_in_sd is None:
+        mm_in_sd = extract_hy_omniweaving_mm_in_state_dict(sd or {})
     model = getattr(model_patcher, "model", None)
     if model is None:
         return False
@@ -83,9 +86,17 @@ def ensure_hy_omniweaving_deepstack_support(model_patcher, sd: dict):
     if linear_1_weight is None or linear_2_weight is None:
         raise ValueError("HY-OmniWeaving mm_in weights are incomplete.")
 
+    linear_cls = nn.Linear
+    time_in = getattr(diffusion_model, "time_in", None)
+    if time_in is not None:
+        in_layer = getattr(time_in, "in_layer", None)
+        if in_layer is not None:
+            linear_cls = type(in_layer)
+
     module = _TextProjection(
         in_channels=linear_1_weight.shape[1],
         hidden_size=linear_1_weight.shape[0],
+        linear_cls=linear_cls,
         dtype=linear_1_weight.dtype,
         device=linear_1_weight.device,
     )
@@ -164,6 +175,7 @@ def _ensure_hy_omniweaving_diffusion_wrapper(model_patcher):
         _hy_omniweaving_diffusion_model_wrapper,
     )
     model_patcher._hy_omniweaving_diffusion_wrapper_added = True
+    logging.info("HY-OmniWeaving attached instance-local diffusion wrapper for deepstack.")
     return True
 
 
@@ -280,6 +292,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
     cond_stage_model.reset_clip_options = types.MethodType(patched_reset, cond_stage_model)
     cond_stage_model._encode_deepstack = types.MethodType(_encode_deepstack, cond_stage_model)
     cond_stage_model._hy_omniweaving_text_encoder_patched = True
+    logging.info("HY-OmniWeaving attached instance-local text-encoder support for deepstack/setclip.")
     return True
 
 
