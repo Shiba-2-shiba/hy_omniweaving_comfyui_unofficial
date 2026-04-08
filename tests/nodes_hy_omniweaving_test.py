@@ -218,7 +218,7 @@ class _ClipStub:
         }
         return self.generated
 
-    def decode(self, token_ids):
+    def decode(self, token_ids, **kwargs):
         assert token_ids == self.generated
         return "expanded prompt"
 
@@ -422,6 +422,51 @@ def test_hy_omniweaving_text_encode_think_rewrites_prompt():
     assert "Here is a more detailed description. expanded prompt" in clip.last_encoded["tokens"]
     assert "Describe the key features of the input image" in clip.tokenize_calls[1][1]["llama_template"]
     assert ("set", {"execution_device": "cpu", "deepstack": [8, 16, 24], "setclip": True}) in clip.clip_options
+
+
+def test_hy_omniweaving_text_encode_think_resizes_visual_inputs_for_ar_prompt():
+    clip = _ClipStub(has_byt5=True)
+    semantic_images = torch.zeros((1, 1024, 512, 3))
+
+    nodes.TextEncodeHunyuanVideo15Omni.execute(
+        clip=clip,
+        prompt="A dancer starts moving",
+        task="i2v",
+        use_visual_inputs=True,
+        max_visual_inputs=8,
+        think=True,
+        think_max_new_tokens=128,
+        deepstack_layers="8,16,24",
+        setclip=True,
+        reference_images=None,
+        semantic_images=semantic_images,
+        clip_vision_output=None,
+    )
+
+    think_images = clip.tokenize_calls[0][1]["images"]
+    assert len(think_images) == 1
+    assert tuple(think_images[0].shape[-3:-1]) == (560, 280)
+
+
+def test_decode_generated_text_prefers_prompt_tail_when_available():
+    clip = _ClipStub(has_byt5=True)
+    generated = torch.tensor([[101, 102, 201, 202]])
+    tokens = {"attention_mask": torch.tensor([[1, 1, 0, 0]])}
+
+    seen = {}
+
+    def decode(token_ids, **kwargs):
+        seen["token_ids"] = token_ids
+        seen["kwargs"] = kwargs
+        return "tail only"
+
+    clip.decode = decode
+
+    out = nodes.TextEncodeHunyuanVideo15Omni._decode_generated_text(clip, generated, tokens)
+
+    assert out == "tail only"
+    assert torch.equal(seen["token_ids"], torch.tensor([201, 202]))
+    assert seen["kwargs"] == {"skip_special_tokens": True}
 
 
 def test_hy_omniweaving_text_encode_uses_reference_style_task_template():

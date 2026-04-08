@@ -4,6 +4,7 @@ import math
 import node_helpers
 import os
 import torch
+import torch.nn.functional as F
 import comfy.clip_vision
 import comfy.model_management
 import comfy.model_patcher
@@ -781,8 +782,12 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
 
     @classmethod
     def _rewrite_prompt_with_think(cls, clip, prompt, task, image_embeds, visual_images, max_new_tokens: int) -> str:
+        if not isinstance(prompt, str):
+            raise ValueError("Think mode currently requires a single string prompt.")
         if task not in ("t2v", "i2v", "interpolation"):
             raise ValueError("Think mode is currently intended only for t2v, i2v, or interpolation tasks.")
+        if max_new_tokens <= 0:
+            return prompt
 
         if task == "i2v":
             expand_prefix = "Here is a concise description of the target video starting with the given image: "
@@ -795,18 +800,19 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             expand_postfix = " Please generate a more detailed description based on the short description."
 
         think_prompt = f"{expand_prefix}{prompt}{expand_postfix}"
-        think_visual_count = len(visual_images) if len(visual_images) > 0 else len(image_embeds)
+        think_visual_images = cls._prepare_think_visual_images(visual_images)
+        think_visual_count = len(think_visual_images) if len(think_visual_images) > 0 else len(image_embeds)
         think_template = cls._build_think_template(task, think_visual_count)
         tokens = cls._tokenize_with_template(
             clip,
             think_prompt,
             think_template,
             image_embeds,
-            visual_images=visual_images if len(visual_images) > 0 else None,
+            visual_images=think_visual_images if len(think_visual_images) > 0 else None,
         )
 
         generated = clip.generate(tokens, do_sample=False, max_length=max_new_tokens)
-        generated_text = clip.decode(generated).strip()
+        generated_text = cls._decode_generated_text(clip, generated, tokens)
         if len(generated_text) == 0:
             return prompt
         return f"{prompt} Here is a more detailed description. {generated_text}"
@@ -822,6 +828,48 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
                 continue
             values.append(int(item))
         return values
+
+    @staticmethod
+    def _resize_visual_for_think(image: torch.Tensor, max_side: int = 560):
+        if image.ndim != 4:
+            return image
+        _, height, width, channels = image.shape
+        if channels < 1 or max(height, width) <= max_side:
+            return image[:, :, :, :3]
+
+        scale = max_side / max(height, width)
+        resized_height = max(1, int(round(height * scale)))
+        resized_width = max(1, int(round(width * scale)))
+        resized = F.interpolate(
+            image[:, :, :, :3].movedim(-1, 1),
+            size=(resized_height, resized_width),
+            mode="bilinear",
+            align_corners=False,
+        ).movedim(1, -1)
+        return resized
+
+    @classmethod
+    def _prepare_think_visual_images(cls, visual_images):
+        return [cls._resize_visual_for_think(image) for image in visual_images]
+
+    @staticmethod
+    def _decode_generated_text(clip, generated, tokens) -> str:
+        prompt_length = None
+        attention_mask = tokens.get("attention_mask") if isinstance(tokens, dict) else None
+        if torch.is_tensor(attention_mask):
+            prompt_length = int(attention_mask[0].sum().item())
+
+        decode_input = generated
+        if prompt_length is not None:
+            if torch.is_tensor(generated) and generated.ndim >= 2 and generated.shape[-1] > prompt_length:
+                decode_input = generated[0, prompt_length:]
+            elif isinstance(generated, (list, tuple)) and len(generated) > prompt_length:
+                decode_input = generated[prompt_length:]
+
+        try:
+            return clip.decode(decode_input, skip_special_tokens=True).strip()
+        except TypeError:
+            return clip.decode(decode_input).strip()
 
     @staticmethod
     def _encode_with_parity_options(clip, tokens, deepstack_layers, setclip):
