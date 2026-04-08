@@ -13,6 +13,12 @@ Current scope:
 - `deepstack` / `setclip` option plumbing
 - Omni-style conditioning with Lanczos + center-crop image preparation
 
+Recommended workflow boundary:
+
+- keep **sampling / scheduler / CFG / steps / model loading / VRAM management** on stock ComfyUI nodes
+- keep only **OmniWeaving-specific text semantics, image preparation, task conditioning, and compatibility hooks** in this package
+- set `HY_OMNIWEAVING_DEBUG=1` temporarily when you need extra loader/attach diagnostics for text encoder / UNet / VAE status checks
+
 Current non-goals:
 
 - full task parity beyond `i2v`
@@ -27,3 +33,21 @@ Current status:
 - `runtime_patches.py` is the extraction hook for eventually moving the remaining core edits behind custom-node-owned monkey patches.
 - `HY OmniWeaving Text Encoder Loader` now mirrors the intended HunyuanVideo 1.5 dual-loader flow: load the OmniWeaving fine-tuned Qwen checkpoint together with the ByT5 checkpoint as one CLIP output.
 - `HY OmniWeaving VAE Loader` now detects OmniWeaving-style `decoder.conv_in.conv.weight` checkpoints and instantiates a local `AutoencoderKLConv3D`-equivalent model from tracked config instead of relying on generic Comfy VAE fallback paths.
+- `HY OmniWeaving Image Prep` is the blessed image preprocessing step for parity-sensitive `i2v` / `reference2v` style workflows: prepare the same reference images once, then feed them both into CLIP-Vision encoding and the Omni conditioning node.
+- `prompt_template_parity.md` tracks the current task-to-`prompt_mode` mapping and the original `crop_start` metadata we still want to preserve as refactoring continues.
+- Runtime-patch reduction has started: deepstack `mm_in` is now attached loader-side after model load, `all_stack_text_states` is injected by patching `extra_conds` per loaded model instance, text-encoder deepstack/setclip support is applied per loaded clip instance, and early-block deepstack injection is now attached through a per-model DIFFUSION_MODEL wrapper. We no longer need global model-detection/model-base/text-encoder/forward patches for those parts.
+
+Recommended blessed paths:
+
+- `i2v`
+  1. reference image
+  2. `HY OmniWeaving Image Prep`
+  3. stock ComfyUI CLIP-Vision encode
+  4. `HY OmniWeaving Text Encode`
+  5. `HY OmniWeaving Conditioning`
+  6. stock ComfyUI sampler / scheduler / CFG
+
+- `t2v`
+  1. `HY OmniWeaving Text Encode` with `task=t2v`
+  2. `HY OmniWeaving Conditioning` with `task=t2v`
+  3. stock ComfyUI sampler / scheduler / CFG

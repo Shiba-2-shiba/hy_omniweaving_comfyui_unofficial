@@ -14,6 +14,58 @@ from typing_extensions import override
 
 from comfy_api.latest import ComfyExtension, io
 
+try:
+    from .runtime_patches import (
+        ensure_hy_omniweaving_deepstack_support,
+        ensure_hy_omniweaving_text_encoder_support,
+        extract_hy_omniweaving_mm_in_state_dict,
+    )
+except ImportError:
+    from runtime_patches import (
+        ensure_hy_omniweaving_deepstack_support,
+        ensure_hy_omniweaving_text_encoder_support,
+        extract_hy_omniweaving_mm_in_state_dict,
+    )
+
+
+def _debug_enabled() -> bool:
+    return os.getenv("HY_OMNIWEAVING_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_log(message: str, *args):
+    if _debug_enabled():
+        logging.info("[HY-OmniWeaving:debug] " + message, *args)
+
+
+def _shape_of(value):
+    if torch.is_tensor(value):
+        return tuple(value.shape)
+    return None
+
+
+def _norm_of(value):
+    if torch.is_tensor(value):
+        return float(value.float().norm().item())
+    return None
+
+
+def _clip_vision_shapes(clip_vision_output):
+    if clip_vision_output is None:
+        return {
+            "present": False,
+            "last_hidden_state": None,
+            "penultimate_hidden_states": None,
+            "image_embeds": None,
+            "mm_projected": None,
+        }
+    return {
+        "present": True,
+        "last_hidden_state": _shape_of(getattr(clip_vision_output, "last_hidden_state", None)),
+        "penultimate_hidden_states": _shape_of(getattr(clip_vision_output, "penultimate_hidden_states", None)),
+        "image_embeds": _shape_of(getattr(clip_vision_output, "image_embeds", None)),
+        "mm_projected": _shape_of(getattr(clip_vision_output, "mm_projected", None)),
+    }
+
 
 def _clip_has_byt5_branch(clip) -> bool:
     cond_stage_model = getattr(clip, "cond_stage_model", None)
@@ -82,6 +134,14 @@ def _load_hy_omniweaving_dual_text_encoder(qwen_text_encoder: str, byt5_text_enc
         embedding_directory=folder_paths.get_folder_paths("embeddings"),
         clip_type=comfy.sd.CLIPType.HUNYUAN_VIDEO_15,
         model_options=model_options,
+    )
+    ensure_hy_omniweaving_text_encoder_support(clip)
+    _debug_log(
+        "text encoder prepared qwen_keys=%s byt5_keys=%s byt5_branch=%s patched=%s",
+        len(qwen_sd),
+        len(byt5_sd) if isinstance(byt5_sd, dict) else "n/a",
+        _clip_has_byt5_branch(clip),
+        hasattr(getattr(clip, "cond_stage_model", None), "_hy_omniweaving_text_encoder_patched"),
     )
     logging.info(
         "HYOmniWeavingTextEncoderLoader loaded dual text encoders: qwen=%s byt5=%s",
@@ -192,6 +252,10 @@ def _filter_known_optional_vae_missing_keys(missing_keys):
     filtered = [key for key in missing_keys if key not in optional_suffixes]
     ignored = [key for key in missing_keys if key in optional_suffixes]
     return filtered, ignored
+
+
+def _prepare_omniweaving_images(images: torch.Tensor, width: int, height: int):
+    return comfy.utils.common_upscale(images.movedim(-1, 1), width, height, "lanczos", "center").movedim(1, -1)
 
 
 class HYOmniWeavingVAE(comfy.sd.VAE):
@@ -422,6 +486,16 @@ class HYOmniWeavingUNetLoader(io.ComfyNode):
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
         sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
         sd, converted, partial = _convert_split_hy_omniweaving_attention_qkv(sd, strict_mode=strict_mode)
+        mm_in_sd = extract_hy_omniweaving_mm_in_state_dict(sd)
+        if len(mm_in_sd) > 0:
+            _debug_log(
+                "unet loader detected mm_in tensors count=%s source_linear1_shape=%s source_linear1_norm=%.6f source_linear2_shape=%s source_linear2_norm=%.6f",
+                len(mm_in_sd),
+                _shape_of(mm_in_sd.get("linear_1.weight")),
+                _norm_of(mm_in_sd.get("linear_1.weight")) or -1.0,
+                _shape_of(mm_in_sd.get("linear_2.weight")),
+                _norm_of(mm_in_sd.get("linear_2.weight")) or -1.0,
+            )
         if converted > 0:
             logging.info(f"HYOmniWeavingUNetLoader converted {converted} split attention tensors to qkv format.")
         if len(partial) > 0 and not strict_mode:
@@ -429,6 +503,31 @@ class HYOmniWeavingUNetLoader(io.ComfyNode):
         model = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata)
         if model is None:
             raise RuntimeError(f"Failed to load HY-OmniWeaving diffusion model: {unet_name}")
+        attached = ensure_hy_omniweaving_deepstack_support(model, mm_in_sd=mm_in_sd)
+        if attached:
+            logging.info("HYOmniWeavingUNetLoader attached mm_in for deepstack support without model-detection patching.")
+            diffusion_model = getattr(getattr(model, "model", None), "diffusion_model", None)
+            mm_in = getattr(diffusion_model, "mm_in", None)
+            if mm_in is not None:
+                linear_1 = getattr(mm_in, "linear_1", None)
+                linear_2 = getattr(mm_in, "linear_2", None)
+                _debug_log(
+                    "mm_in attached class=%s linear1_shape=%s linear1_dtype=%s linear1_norm=%.6f linear2_norm=%.6f",
+                    type(mm_in).__name__,
+                    tuple(linear_1.weight.shape) if linear_1 is not None else None,
+                    getattr(linear_1.weight, "dtype", None) if linear_1 is not None else None,
+                    float(linear_1.weight.float().norm().item()) if linear_1 is not None else -1.0,
+                    float(linear_2.weight.float().norm().item()) if linear_2 is not None else -1.0,
+                )
+        elif len(mm_in_sd) > 0:
+            logging.warning("HYOmniWeavingUNetLoader found mm_in weights but failed to attach them after model load.")
+        _debug_log(
+            "unet loader converted_qkv=%s partial_qkv=%s mm_in_attached=%s wrapper_added=%s",
+            converted,
+            len(partial),
+            attached,
+            getattr(model, "_hy_omniweaving_diffusion_wrapper_added", False),
+        )
         return io.NodeOutput(model)
 
 
@@ -452,19 +551,48 @@ class HYOmniWeavingVAELoader(io.ComfyNode):
     def execute(cls, vae_name) -> io.NodeOutput:
         vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
         sd, metadata = comfy.utils.load_torch_file(vae_path, return_metadata=True)
+        _debug_log(
+            "vae loader omni_layout=%s decoder_conv_in_shape=%s",
+            _is_omniweaving_vae_state_dict(sd),
+            tuple(sd["decoder.conv_in.conv.weight"].shape) if "decoder.conv_in.conv.weight" in sd else tuple(sd["decoder.conv_in.weight"].shape) if "decoder.conv_in.weight" in sd else None,
+        )
         vae = HYOmniWeavingVAE(sd=sd, metadata=metadata)
         vae.throw_exception_if_invalid()
         return io.NodeOutput(vae)
 
 
 class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
-    TASK_SYSTEM_PROMPTS = {
-        "t2v": "You are a helpful assistant. Describe the video by detailing the following aspects:\n1. The main content and theme of the video.\n2. The color, shape, size, texture, quantity, text, and spatial relationships of the objects.\n3. Actions, events, behaviors temporal relationships, physical movement changes of the objects.\n4. background environment, light, style and atmosphere.\n5. camera angles, movements, and transitions used in the video.",
-        "i2v": "You are a helpful assistant. Given a text instruction and an input image, you need to explain how the user's text instruction should alter the image to introduce motion and evolution over time. Generate a video using this image as the first frame that meets the user's requirements, ensuring the specified elements evolve or move in a way that fulfills the text description while maintaining consistency.",
-        "reference2v": "You are a helpful assistant. Given a text instruction and one or more input images, you need to explain how to extract and combine key information from the input images to construct a new image as the video's first frame, and then how the user's text instruction should alter the image to introduce motion and evolution over time. Generate a video that meets the user's requirements, ensuring the specified elements evolve or move in a way that fulfills the text description while maintaining consistency.",
-        "interpolation": "You are a helpful assistant. Given a text instruction, an image as the first frame of the video, and another image as the last frame of the video, you need to analyze the visual trajectory required to transition from the start to the end. Determine how the elements in the first frame must evolve, move, or transform to align with the last frame based on the text instruction. Generate a video that seamlessly connects these two frames, ensuring the motion and evolution between them fulfill the text description while maintaining temporal consistency",
-        "editing": "You are a helpful assistant. Given a text instruction and an input video, you need to analyze the visual content and temporal dynamics of the input video, and then explain how the user's text instruction should modify the video's visual style, objects, or scene composition. Generate an edited video that meets the user's requirements, ensuring the specified modifications are applied consistently across frames while preserving the original motion flow and coherence.",
-        "tiv2v": "You are a helpful assistant. Given a text instruction, a reference image and an input video, you need to analyze the visual content and temporal dynamics of the input video, alongside the scene or subject characteristics of the reference image. Explain how the user's text instruction directs the application of the reference image's visual attributes onto the input video. Generate an edited video that meets the user's requirements, ensuring the specified modifications are applied consistently across frames while preserving the original motion flow and coherence.",
+    TASK_SPECS = {
+        "t2v": {
+            "prompt_mode": 1,
+            "crop_start": 108,
+            "system_prompt": "You are a helpful assistant. Describe the video by detailing the following aspects:\n1. The main content and theme of the video.\n2. The color, shape, size, texture, quantity, text, and spatial relationships of the objects.\n3. Actions, events, behaviors temporal relationships, physical movement changes of the objects.\n4. background environment, light, style and atmosphere.\n5. camera angles, movements, and transitions used in the video.",
+        },
+        "i2v": {
+            "prompt_mode": 2,
+            "crop_start": 92,
+            "system_prompt": "You are a helpful assistant. Describe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter the image to introduce motion and evolution over time. Generate a video using this image as the first frame that meets the user's requirements, ensuring the specified elements evolve or move in a way that fulfills the text description while maintaining consistency.",
+        },
+        "reference2v": {
+            "prompt_mode": 3,
+            "crop_start": 102,
+            "system_prompt": "You are a helpful assistant. Given a text instruction and one or more input images, you need to explain how to extract and combine key information from the input images to construct a new image as the video's first frame, and then how the user's text instruction should alter the image to introduce motion and evolution over time. Generate a video that meets the user's requirements, ensuring the specified elements evolve or move in a way that fulfills the text description while maintaining consistency.",
+        },
+        "interpolation": {
+            "prompt_mode": 4,
+            "crop_start": 109,
+            "system_prompt": "You are a helpful assistant. Given a text instruction, an image as the first frame of the video, and another image as the last frame of the video, you need to analyze the visual trajectory required to transition from the start to the end. Determine how the elements in the first frame must evolve, move, or transform to align with the last frame based on the text instruction. Generate a video that seamlessly connects these two frames, ensuring the motion and evolution between them fulfill the text description while maintaining temporal consistency",
+        },
+        "editing": {
+            "prompt_mode": 5,
+            "crop_start": 90,
+            "system_prompt": "You are a helpful assistant. Given a text instruction and an input video, you need to analyze the visual content and temporal dynamics of the input video, and then explain how the user's text instruction should modify the video's visual style, objects, or scene composition. Generate an edited video that meets the user's requirements, ensuring the specified modifications are applied consistently across frames while preserving the original motion flow and coherence.",
+        },
+        "tiv2v": {
+            "prompt_mode": 6,
+            "crop_start": 104,
+            "system_prompt": "You are a helpful assistant. Given a text instruction, a reference image and an input video, you need to analyze the visual content and temporal dynamics of the input video, alongside the scene or subject characteristics of the reference image. Explain how the user's text instruction directs the application of the reference image's visual attributes onto the input video. Generate an edited video that meets the user's requirements, ensuring the specified modifications are applied consistently across frames while preserving the original motion flow and coherence.",
+        },
     }
 
     @classmethod
@@ -485,6 +613,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
                 io.String.Input("deepstack_layers", default="8,16,24", advanced=True),
                 io.Boolean.Input("setclip", default=True, advanced=True),
                 io.ClipVisionOutput.Input("clip_vision_output", optional=True),
+                io.Image.Input("reference_images", optional=True),
             ],
             outputs=[
                 io.Conditioning.Output(),
@@ -492,8 +621,20 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         )
 
     @staticmethod
+    def _task_spec(task: str) -> dict:
+        return TextEncodeHunyuanVideo15Omni.TASK_SPECS.get(task, TextEncodeHunyuanVideo15Omni.TASK_SPECS["t2v"])
+
+    @staticmethod
     def _task_system_prompt(task: str) -> str:
-        return TextEncodeHunyuanVideo15Omni.TASK_SYSTEM_PROMPTS.get(task, TextEncodeHunyuanVideo15Omni.TASK_SYSTEM_PROMPTS["t2v"])
+        return TextEncodeHunyuanVideo15Omni._task_spec(task)["system_prompt"]
+
+    @staticmethod
+    def _task_prompt_mode(task: str) -> int:
+        return TextEncodeHunyuanVideo15Omni._task_spec(task)["prompt_mode"]
+
+    @staticmethod
+    def _task_crop_start(task: str) -> int:
+        return TextEncodeHunyuanVideo15Omni._task_spec(task)["crop_start"]
 
     @classmethod
     def _build_template(cls, task: str, image_count: int, add_generation_prompt: bool = False) -> str:
@@ -515,8 +656,10 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         return cls._build_template(task, image_count, add_generation_prompt=True)
 
     @staticmethod
-    def _tokenize_with_template(clip, text, template, image_embeds):
+    def _tokenize_with_template(clip, text, template, image_embeds, visual_images=None):
         try:
+            if visual_images is not None:
+                return clip.tokenize(text, llama_template=template, images=visual_images)
             return clip.tokenize(text, llama_template=template, images=image_embeds)
         except TypeError:
             embeds = None
@@ -530,11 +673,26 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             return []
         mm_projected = getattr(clip_vision_output, "mm_projected", None)
         if mm_projected is None:
+            shapes = _clip_vision_shapes(clip_vision_output)
+            logging.warning(
+                "HYOmniWeavingTextEncode received clip_vision_output without mm_projected. "
+                "Text-side image embeds will be disabled. Shapes: last_hidden_state=%s penultimate_hidden_states=%s image_embeds=%s",
+                shapes["last_hidden_state"],
+                shapes["penultimate_hidden_states"],
+                shapes["image_embeds"],
+            )
             return []
         if mm_projected.ndim == 2:
             return [mm_projected]
         count = min(mm_projected.shape[0], max_visual_inputs)
         return [mm_projected[i] for i in range(count)]
+
+    @staticmethod
+    def _extract_visual_images(reference_images, max_visual_inputs: int):
+        if reference_images is None:
+            return []
+        count = min(reference_images.shape[0], max_visual_inputs)
+        return [reference_images[i:i + 1, :, :, :3] for i in range(count)]
 
     @staticmethod
     def _require_full_text_path(clip):
@@ -546,19 +704,21 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         )
 
     @staticmethod
-    def _require_visual_inputs(task: str, use_visual_inputs: bool, clip_vision_output):
+    def _require_visual_inputs(task: str, use_visual_inputs: bool, clip_vision_output, reference_images):
         if not use_visual_inputs:
             return
         if task not in ("i2v", "interpolation", "reference2v", "editing", "tiv2v"):
             return
+        if reference_images is not None and reference_images.shape[0] > 0:
+            return
         if clip_vision_output is not None:
             return
         raise ValueError(
-            f"Task '{task}' with use_visual_inputs=True requires clip_vision_output for HY-OmniWeaving parity."
+            f"Task '{task}' with use_visual_inputs=True requires reference_images or clip_vision_output for HY-OmniWeaving parity."
         )
 
     @classmethod
-    def _rewrite_prompt_with_think(cls, clip, prompt, task, image_embeds, max_new_tokens: int) -> str:
+    def _rewrite_prompt_with_think(cls, clip, prompt, task, image_embeds, visual_images, max_new_tokens: int) -> str:
         if task not in ("t2v", "i2v", "interpolation"):
             raise ValueError("Think mode is currently intended only for t2v, i2v, or interpolation tasks.")
 
@@ -573,8 +733,15 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             expand_postfix = " Please generate a more detailed description based on the short description."
 
         think_prompt = f"{expand_prefix}{prompt}{expand_postfix}"
-        think_template = cls._build_think_template(task, len(image_embeds))
-        tokens = cls._tokenize_with_template(clip, think_prompt, think_template, image_embeds)
+        think_visual_count = len(visual_images) if len(visual_images) > 0 else len(image_embeds)
+        think_template = cls._build_think_template(task, think_visual_count)
+        tokens = cls._tokenize_with_template(
+            clip,
+            think_prompt,
+            think_template,
+            image_embeds,
+            visual_images=visual_images if len(visual_images) > 0 else None,
+        )
 
         generated = clip.generate(tokens, do_sample=False, max_length=max_new_tokens)
         generated_text = clip.decode(generated).strip()
@@ -611,17 +778,55 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         if len(encoded) > 2:
             pooled_dict.update(encoded[2])
         clip.add_hooks_to_dict(pooled_dict)
+        _debug_log(
+            "text encode output cond_shape=%s pooled_keys=%s all_stack_text_states_shape=%s attention_mask_shape=%s",
+            _shape_of(cond),
+            sorted(pooled_dict.keys()),
+            _shape_of(pooled_dict.get("all_stack_text_states")),
+            _shape_of(pooled_dict.get("attention_mask")),
+        )
         return [[cond, pooled_dict]]
 
     @classmethod
-    def execute(cls, clip, prompt, task, use_visual_inputs, max_visual_inputs, think, think_max_new_tokens, deepstack_layers, setclip, clip_vision_output=None) -> io.NodeOutput:
+    def execute(cls, clip, prompt, task, use_visual_inputs, max_visual_inputs, think, think_max_new_tokens, deepstack_layers, setclip, reference_images=None, clip_vision_output=None) -> io.NodeOutput:
+        ensure_hy_omniweaving_text_encoder_support(clip)
         cls._require_full_text_path(clip)
-        cls._require_visual_inputs(task, use_visual_inputs, clip_vision_output)
-        image_embeds = cls._extract_image_embeds(clip_vision_output, max_visual_inputs) if use_visual_inputs else []
+        cls._require_visual_inputs(task, use_visual_inputs, clip_vision_output, reference_images)
+        vision_shapes = _clip_vision_shapes(clip_vision_output)
+        visual_images = cls._extract_visual_images(reference_images, max_visual_inputs) if use_visual_inputs else []
+        image_embeds = []
+        visual_source = "none"
+        if len(visual_images) > 0:
+            visual_source = "reference_images"
+        elif use_visual_inputs:
+            image_embeds = cls._extract_image_embeds(clip_vision_output, max_visual_inputs)
+            if len(image_embeds) > 0:
+                visual_source = "clip_vision_output.mm_projected"
+            elif task in ("i2v", "interpolation", "reference2v", "tiv2v"):
+                logging.warning(
+                    "HYOmniWeavingTextEncode has no usable text-side visual inputs for task '%s'. "
+                    "Connect HY OmniWeaving Image Prep output to reference_images for parity-sensitive runs.",
+                    task,
+                )
+        _debug_log(
+            "text encode task=%s prompt_mode=%s crop_start=%s image_embeds=%s visual_images=%s visual_source=%s think=%s deepstack=%s setclip=%s clip_vision=%s",
+            task,
+            cls._task_prompt_mode(task),
+            cls._task_crop_start(task),
+            len(image_embeds),
+            len(visual_images),
+            visual_source,
+            think,
+            deepstack_layers,
+            setclip,
+            vision_shapes,
+        )
         if think:
-            prompt = cls._rewrite_prompt_with_think(clip, prompt, task, image_embeds, think_max_new_tokens)
+            prompt = cls._rewrite_prompt_with_think(clip, prompt, task, image_embeds, visual_images, think_max_new_tokens)
         template = cls._build_template(task, len(image_embeds), add_generation_prompt=True)
-        tokens = cls._tokenize_with_template(clip, prompt, template, image_embeds)
+        if len(visual_images) > 0:
+            template = cls._build_template(task, len(visual_images), add_generation_prompt=True)
+        tokens = cls._tokenize_with_template(clip, prompt, template, image_embeds, visual_images=visual_images if len(visual_images) > 0 else None)
         deepstack = cls._parse_deepstack_layers(deepstack_layers)
         return io.NodeOutput(cls._encode_with_parity_options(clip, tokens, deepstack, setclip))
 
@@ -664,6 +869,30 @@ class HunyuanClipVisionOutputConcat(io.ComfyNode):
         return io.NodeOutput(merged)
 
 
+class HYOmniWeavingImagePrep(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="HYOmniWeavingImagePrep",
+            display_name="HY OmniWeaving Image Prep",
+            category="conditioning/video_models",
+            description="Prepare reference images for OmniWeaving-aligned i2v/reference workflows using the original-style Lanczos resize and center crop before VAE and CLIP-Vision encoding.",
+            inputs=[
+                io.Image.Input("reference_images"),
+                io.Int.Input("width", default=848, min=16, max=8192, step=16),
+                io.Int.Input("height", default=480, min=16, max=8192, step=16),
+            ],
+            outputs=[
+                io.Image.Output(display_name="prepared_images"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, reference_images, width, height) -> io.NodeOutput:
+        prepared = _prepare_omniweaving_images(reference_images, width, height)
+        return io.NodeOutput(prepared)
+
+
 class HunyuanVideo15OmniConditioning(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -698,7 +927,7 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
 
     @staticmethod
     def _upscale_frames(frames: torch.Tensor, width: int, height: int):
-        return comfy.utils.common_upscale(frames.movedim(-1, 1), width, height, "lanczos", "center").movedim(1, -1)
+        return _prepare_omniweaving_images(frames, width, height)
 
     @classmethod
     def _encode_single_image(cls, vae, image: torch.Tensor, width: int, height: int):
@@ -720,6 +949,17 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
     def execute(cls, positive, negative, vae, task, width, height, length, batch_size, reference_images=None, condition_video=None, clip_vision_output=None) -> io.NodeOutput:
         latent_length = cls._latent_length(length)
         latent = torch.zeros([batch_size, 32, latent_length, height // 16, width // 16], device=comfy.model_management.intermediate_device())
+        _debug_log(
+            "conditioning task=%s width=%s height=%s length=%s batch=%s reference_images=%s condition_video=%s clip_vision=%s",
+            task,
+            width,
+            height,
+            length,
+            batch_size,
+            _shape_of(reference_images),
+            _shape_of(condition_video),
+            _clip_vision_shapes(clip_vision_output),
+        )
 
         if task == "t2v":
             if clip_vision_output is not None:
@@ -797,6 +1037,7 @@ class HYOmniWeavingExtension(ComfyExtension):
             HYOmniWeavingUNetLoader,
             HYOmniWeavingVAELoader,
             TextEncodeHunyuanVideo15Omni,
+            HYOmniWeavingImagePrep,
             HunyuanClipVisionOutputConcat,
             HunyuanVideo15OmniConditioning,
         ]
