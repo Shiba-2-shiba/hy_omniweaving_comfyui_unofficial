@@ -37,6 +37,7 @@ Current status:
 - `HY OmniWeaving I2V Semantic Images` now reproduces the original i2v VAE roundtrip so parity-sensitive workflows can feed the same semantic first frame into CLIP-Vision and text-side multimodal input.
 - `prompt_template_parity.md` tracks the current task-to-`prompt_mode` mapping and the original `crop_start` metadata we still want to preserve as refactoring continues.
 - Runtime-patch reduction has started: deepstack `mm_in` is now attached loader-side after model load, `all_stack_text_states` is injected by patching `extra_conds` per loaded model instance, text-encoder deepstack/setclip support is applied per loaded clip instance, and early-block deepstack injection is now attached through a per-model DIFFUSION_MODEL wrapper. We no longer need global model-detection/model-base/text-encoder/forward patches for those parts.
+- Current DeepStacking assessment: the transport path is structurally wired and follows the original OmniWeaving injection shape, but the tested public checkpoints currently have `mm_in.linear_2.weight == 0` and `mm_in.linear_2.bias == 0`, so the connector output is numerically inactive even when attachment succeeds.
 - Remaining global compatibility patches are now applied lazily when the relevant loader/node path is used, not at package import time.
 
 Recommended blessed paths:

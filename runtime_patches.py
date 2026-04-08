@@ -44,6 +44,10 @@ def _norm_of(value):
     return None
 
 
+def _is_effectively_zero(value):
+    return torch.is_tensor(value) and bool(torch.count_nonzero(value).item() == 0)
+
+
 class _CONDDeepstackTextStates:
     def __init__(self, cond):
         self.cond = cond
@@ -148,18 +152,24 @@ def ensure_hy_omniweaving_deepstack_support(model_patcher, sd: dict | None = Non
         raise ValueError("HY-OmniWeaving mm_in weights are incomplete.")
 
     linear_cls = nn.Linear
+    target_dtype = linear_1_weight.dtype
+    target_device = linear_1_weight.device
     time_in = getattr(diffusion_model, "time_in", None)
     if time_in is not None:
         in_layer = getattr(time_in, "in_layer", None)
         if in_layer is not None:
             linear_cls = type(in_layer)
+            weight = getattr(in_layer, "weight", None)
+            if torch.is_tensor(weight):
+                target_dtype = weight.dtype
+                target_device = weight.device
 
     module = _TextProjection(
         in_channels=linear_1_weight.shape[1],
         hidden_size=linear_1_weight.shape[0],
         linear_cls=linear_cls,
-        dtype=linear_1_weight.dtype,
-        device=linear_1_weight.device,
+        dtype=target_dtype,
+        device=target_device,
     )
     missing, unexpected = module.load_state_dict(mm_in_sd, strict=False)
     if len(missing) > 0 or len(unexpected) > 0:
@@ -170,6 +180,9 @@ def ensure_hy_omniweaving_deepstack_support(model_patcher, sd: dict | None = Non
     freeze_main = getattr(diffusion_model, "freeze_main", True)
     diffusion_model.mm_in = module
     diffusion_model.freeze_main = freeze_main
+    diffusion_model._hy_omniweaving_mm_in_inactive = _is_effectively_zero(module.linear_2.weight) and _is_effectively_zero(module.linear_2.bias)
+    if diffusion_model._hy_omniweaving_mm_in_inactive:
+        logging.warning("HY-OmniWeaving attached mm_in, but linear_2 is all-zero so deepstack injection is numerically inactive.")
     _debug_log(
         "mm_in source_vs_attach source_linear1_norm=%.6f source_linear2_norm=%.6f attached_linear1_norm=%.6f attached_linear2_norm=%.6f",
         _norm_of(linear_1_weight) or -1.0,
@@ -187,7 +200,11 @@ def _hy_omniweaving_diffusion_model_wrapper(executor, *args, **kwargs):
 
     all_stack_text_states = kwargs.pop("all_stack_text_states", None)
     diffusion_model = executor.class_obj
-    if all_stack_text_states is not None and getattr(diffusion_model, "mm_in", None) is not None:
+    if (
+        all_stack_text_states is not None
+        and getattr(diffusion_model, "mm_in", None) is not None
+        and not getattr(diffusion_model, "_hy_omniweaving_mm_in_inactive", False)
+    ):
         context = args[2] if len(args) > 2 else kwargs.get("context")
         projected = diffusion_model.mm_in(all_stack_text_states.to(dtype=context.dtype))
         patches_replace = dict(transformer_options.get("patches_replace", {}))

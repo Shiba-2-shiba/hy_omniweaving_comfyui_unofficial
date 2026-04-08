@@ -673,6 +673,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
                 io.Boolean.Input("setclip", default=True, advanced=True),
                 io.ClipVisionOutput.Input("clip_vision_output", optional=True),
                 io.Image.Input("reference_images", optional=True),
+                io.Image.Input("semantic_images", optional=True),
             ],
             outputs=[
                 io.Conditioning.Output(),
@@ -747,11 +748,11 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         return [mm_projected[i] for i in range(count)]
 
     @staticmethod
-    def _extract_visual_images(reference_images, max_visual_inputs: int):
-        if reference_images is None:
+    def _extract_visual_images(images, max_visual_inputs: int):
+        if images is None:
             return []
-        count = min(reference_images.shape[0], max_visual_inputs)
-        return [reference_images[i:i + 1, :, :, :3] for i in range(count)]
+        count = min(images.shape[0], max_visual_inputs)
+        return [images[i:i + 1, :, :, :3] for i in range(count)]
 
     @staticmethod
     def _require_full_text_path(clip):
@@ -763,17 +764,19 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         )
 
     @staticmethod
-    def _require_visual_inputs(task: str, use_visual_inputs: bool, clip_vision_output, reference_images):
+    def _require_visual_inputs(task: str, use_visual_inputs: bool, clip_vision_output, reference_images, semantic_images):
         if not use_visual_inputs:
             return
         if task not in ("i2v", "interpolation", "reference2v", "editing", "tiv2v"):
+            return
+        if semantic_images is not None and semantic_images.shape[0] > 0:
             return
         if reference_images is not None and reference_images.shape[0] > 0:
             return
         if clip_vision_output is not None:
             return
         raise ValueError(
-            f"Task '{task}' with use_visual_inputs=True requires reference_images or clip_vision_output for HY-OmniWeaving parity."
+            f"Task '{task}' with use_visual_inputs=True requires semantic_images, reference_images, or clip_vision_output for HY-OmniWeaving parity."
         )
 
     @classmethod
@@ -847,17 +850,18 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         return [[cond, pooled_dict]]
 
     @classmethod
-    def execute(cls, clip, prompt, task, use_visual_inputs, max_visual_inputs, think, think_max_new_tokens, deepstack_layers, setclip, reference_images=None, clip_vision_output=None) -> io.NodeOutput:
+    def execute(cls, clip, prompt, task, use_visual_inputs, max_visual_inputs, think, think_max_new_tokens, deepstack_layers, setclip, reference_images=None, semantic_images=None, clip_vision_output=None) -> io.NodeOutput:
         ensure_runtime_patches()
         ensure_hy_omniweaving_text_encoder_support(clip)
         cls._require_full_text_path(clip)
-        cls._require_visual_inputs(task, use_visual_inputs, clip_vision_output, reference_images)
+        cls._require_visual_inputs(task, use_visual_inputs, clip_vision_output, reference_images, semantic_images)
         vision_shapes = _clip_vision_shapes(clip_vision_output)
-        visual_images = cls._extract_visual_images(reference_images, max_visual_inputs) if use_visual_inputs else []
+        visual_inputs = semantic_images if semantic_images is not None else reference_images
+        visual_images = cls._extract_visual_images(visual_inputs, max_visual_inputs) if use_visual_inputs else []
         image_embeds = []
         visual_source = "none"
         if len(visual_images) > 0:
-            visual_source = "reference_images"
+            visual_source = "semantic_images" if semantic_images is not None else "reference_images"
         elif use_visual_inputs:
             image_embeds = cls._extract_image_embeds(clip_vision_output, max_visual_inputs)
             if len(image_embeds) > 0:

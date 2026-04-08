@@ -337,9 +337,10 @@ def test_extract_image_embeds_uses_mm_projected_when_present():
     assert tuple(embeds[0].shape) == (16, 4096)
 
 
-def test_hy_omniweaving_text_encode_prefers_reference_images_for_i2v():
+def test_hy_omniweaving_text_encode_prefers_semantic_images_over_reference_images_for_i2v():
     clip = _ClipStub(has_byt5=True)
     reference_images = torch.zeros((1, 640, 640, 3))
+    semantic_images = torch.ones((1, 320, 320, 3))
     clip_vision_output = types.SimpleNamespace(
         last_hidden_state=torch.zeros((1, 729, 1152)),
         penultimate_hidden_states=torch.zeros((1, 729, 1152)),
@@ -358,12 +359,13 @@ def test_hy_omniweaving_text_encode_prefers_reference_images_for_i2v():
         deepstack_layers="8,16,24",
         setclip=True,
         reference_images=reference_images,
+        semantic_images=semantic_images,
         clip_vision_output=clip_vision_output,
     )
 
     assert "images" in clip.tokenize_calls[0][1]
     assert len(clip.tokenize_calls[0][1]["images"]) == 1
-    assert tuple(clip.tokenize_calls[0][1]["images"][0].shape) == (1, 640, 640, 3)
+    assert tuple(clip.tokenize_calls[0][1]["images"][0].shape) == (1, 320, 320, 3)
 
 
 def test_hy_omniweaving_text_encode_warns_when_i2v_has_no_usable_text_side_visual_input(caplog):
@@ -387,6 +389,7 @@ def test_hy_omniweaving_text_encode_warns_when_i2v_has_no_usable_text_side_visua
             deepstack_layers="8,16,24",
             setclip=True,
             reference_images=None,
+            semantic_images=None,
             clip_vision_output=clip_vision_output,
         )
 
@@ -406,6 +409,7 @@ def test_hy_omniweaving_text_encode_think_rewrites_prompt():
         think_max_new_tokens=111,
         deepstack_layers="8,16,24",
         setclip=True,
+        semantic_images=None,
         clip_vision_output=None,
     )
 
@@ -433,6 +437,7 @@ def test_hy_omniweaving_text_encode_uses_reference_style_task_template():
         think_max_new_tokens=1000,
         deepstack_layers="8,16,24",
         setclip=True,
+        semantic_images=None,
         clip_vision_output=None,
     )
 
@@ -831,7 +836,8 @@ def test_hy_omniweaving_text_encoder_loader_outputs_dual_clip(monkeypatch):
 
 
 def test_ensure_hy_omniweaving_deepstack_support_attaches_mm_in():
-    diffusion_model = types.SimpleNamespace(mm_in=None)
+    in_layer = torch.nn.Linear(3, 4, dtype=torch.float16)
+    diffusion_model = types.SimpleNamespace(mm_in=None, time_in=types.SimpleNamespace(in_layer=in_layer))
 
     class _Model:
         def __init__(self):
@@ -856,6 +862,8 @@ def test_ensure_hy_omniweaving_deepstack_support_attaches_mm_in():
     assert attached is True
     assert diffusion_model.mm_in is not None
     assert diffusion_model.freeze_main is True
+    assert diffusion_model.mm_in.linear_1.weight.dtype == torch.float16
+    assert diffusion_model._hy_omniweaving_mm_in_inactive is True
     assert len(patcher.wrappers) == 1
     out = model.extra_conds(all_stack_text_states=torch.tensor([1.0]))
     assert out["base"] == 1
@@ -949,6 +957,49 @@ def test_hy_omniweaving_diffusion_wrapper_injects_dit_patch():
     assert "patches_replace" in patched_options
     assert "dit" in patched_options["patches_replace"]
     assert ("double_block", 0) in patched_options["patches_replace"]["dit"]
+
+
+def test_hy_omniweaving_diffusion_wrapper_skips_inactive_connector():
+    class _Executor:
+        def __init__(self):
+            mm_in = lambda x: (_ for _ in ()).throw(AssertionError("inactive mm_in should not run"))
+            self.class_obj = types.SimpleNamespace(
+                mm_in=mm_in,
+                _hy_omniweaving_mm_in_inactive=True,
+                freeze_main=True,
+                double_blocks=[object(), object()],
+            )
+            self.calls = []
+
+        def __call__(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return "ok"
+
+    executor = _Executor()
+    context = torch.zeros((1, 5, 3))
+    transformer_options = {}
+
+    out = runtime_patches._hy_omniweaving_diffusion_model_wrapper(
+        executor,
+        torch.zeros((1, 1)),
+        torch.tensor([1.0]),
+        context,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        transformer_options,
+        all_stack_text_states=torch.zeros((2, 1, 3)),
+    )
+
+    assert out == "ok"
+    args, kwargs = executor.calls[0]
+    assert args[-1] == {}
+    assert kwargs == {}
 
 
 def test_cond_deepstack_preserves_layer_dim_when_processing_and_concat():
