@@ -813,9 +813,22 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
 
         generated = clip.generate(tokens, do_sample=False, max_length=max_new_tokens)
         generated_text = cls._decode_generated_text(clip, generated, tokens)
+        _debug_log(
+            "think rewrite task=%s original_chars=%s generated_chars=%s visual_inputs=%s",
+            task,
+            len(prompt),
+            len(generated_text),
+            think_visual_count,
+        )
         if len(generated_text) == 0:
             return prompt
-        return f"{prompt} Here is a more detailed description. {generated_text}"
+        rewritten = f"{prompt} Here is a more detailed description. {generated_text}"
+        _debug_log(
+            "think rewrite result task=%s rewritten_chars=%s",
+            task,
+            len(rewritten),
+        )
+        return rewritten
 
     @staticmethod
     def _parse_deepstack_layers(deepstack_layers: str):
@@ -854,17 +867,24 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
 
     @staticmethod
     def _decode_generated_text(clip, generated, tokens) -> str:
-        prompt_length = None
-        attention_mask = tokens.get("attention_mask") if isinstance(tokens, dict) else None
-        if torch.is_tensor(attention_mask):
-            prompt_length = int(attention_mask[0].sum().item())
-
         decode_input = generated
-        if prompt_length is not None:
-            if torch.is_tensor(generated) and generated.ndim >= 2 and generated.shape[-1] > prompt_length:
-                decode_input = generated[0, prompt_length:]
-            elif isinstance(generated, (list, tuple)) and len(generated) > prompt_length:
-                decode_input = generated[prompt_length:]
+        if torch.is_tensor(generated) and generated.ndim >= 2:
+            decode_input = generated[0]
+        elif isinstance(generated, (list, tuple)) and len(generated) == 1:
+            decode_input = generated[0]
+
+        token_input_ids = tokens.get("input_ids") if isinstance(tokens, dict) else None
+        token_attention_mask = tokens.get("attention_mask") if isinstance(tokens, dict) else None
+        if (
+            torch.is_tensor(token_input_ids)
+            and torch.is_tensor(token_attention_mask)
+            and torch.is_tensor(decode_input)
+            and decode_input.ndim == 1
+        ):
+            prompt_length = int(token_attention_mask[0].sum().item())
+            prompt_ids = token_input_ids[0, :prompt_length]
+            if prompt_length > 0 and decode_input.shape[0] >= prompt_length and torch.equal(decode_input[:prompt_length], prompt_ids):
+                decode_input = decode_input[prompt_length:]
 
         try:
             return clip.decode(decode_input, skip_special_tokens=True).strip()
@@ -872,7 +892,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             return clip.decode(decode_input).strip()
 
     @staticmethod
-    def _encode_with_parity_options(clip, tokens, deepstack_layers, setclip):
+    def _encode_with_parity_options(clip, tokens, deepstack_layers, setclip, crop_start: int | None, task: str, visual_input_count: int = 0):
         clip.cond_stage_model.reset_clip_options()
         clip.load_model(tokens)
         clip.cond_stage_model.set_clip_options(
@@ -880,6 +900,9 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
                 "execution_device": clip.patcher.load_device,
                 "deepstack": deepstack_layers,
                 "setclip": setclip,
+                "crop_start": crop_start,
+                "task_name": task,
+                "visual_input_count": visual_input_count,
             }
         )
         encoded = clip.cond_stage_model.encode_token_weights(tokens)
@@ -889,7 +912,10 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             pooled_dict.update(encoded[2])
         clip.add_hooks_to_dict(pooled_dict)
         _debug_log(
-            "text encode output cond_shape=%s pooled_keys=%s all_stack_text_states_shape=%s attention_mask_shape=%s",
+            "text encode output task=%s crop_start=%s visual_input_count=%s cond_shape=%s pooled_keys=%s all_stack_text_states_shape=%s attention_mask_shape=%s",
+            task,
+            crop_start,
+            visual_input_count,
             _shape_of(cond),
             sorted(pooled_dict.keys()),
             _shape_of(pooled_dict.get("all_stack_text_states")),
@@ -940,7 +966,9 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             template = cls._build_template(task, len(visual_images), add_generation_prompt=True)
         tokens = cls._tokenize_with_template(clip, prompt, template, image_embeds, visual_images=visual_images if len(visual_images) > 0 else None)
         deepstack = cls._parse_deepstack_layers(deepstack_layers)
-        return io.NodeOutput(cls._encode_with_parity_options(clip, tokens, deepstack, setclip))
+        crop_start = cls._task_crop_start(task)
+        visual_input_count = len(visual_images) if len(visual_images) > 0 else len(image_embeds)
+        return io.NodeOutput(cls._encode_with_parity_options(clip, tokens, deepstack, setclip, crop_start, task, visual_input_count))
 
 
 class HunyuanClipVisionOutputConcat(io.ComfyNode):
@@ -1098,16 +1126,12 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
             _clip_vision_shapes(clip_vision_output),
         )
 
-        if task == "t2v":
-            if clip_vision_output is not None:
-                positive = node_helpers.conditioning_set_values(positive, {"clip_vision_output": clip_vision_output})
-                negative = node_helpers.conditioning_set_values(negative, {"clip_vision_output": clip_vision_output})
-            return io.NodeOutput(positive, negative, {"samples": latent})
-
         cond_latent = torch.zeros_like(latent[:1])
         omni_mask = torch.zeros((latent_length,), device=cond_latent.device, dtype=cond_latent.dtype)
 
-        if task == "i2v":
+        if task == "t2v":
+            pass
+        elif task == "i2v":
             if reference_images is None or reference_images.shape[0] < 1:
                 raise ValueError("Task i2v requires at least one reference image.")
             cond_latent = _derive_i2v_semantic_conditioning(vae, reference_images, width, height, latent_length)[0]
@@ -1155,6 +1179,14 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
         concat_mask = (1.0 - omni_mask).view(1, 1, latent_length, 1, 1).expand(
             cond_latent.shape[0], 1, latent_length, cond_latent.shape[-2], cond_latent.shape[-1]
         ).to(cond_latent.dtype)
+        _debug_log(
+            "conditioning output task=%s cond_latent_shape=%s cond_latent_norm=%s concat_mask_shape=%s concat_mask_sum=%s",
+            task,
+            _shape_of(cond_latent),
+            _norm_of(cond_latent),
+            _shape_of(concat_mask),
+            float(concat_mask.sum().item()) if torch.is_tensor(concat_mask) else None,
+        )
 
         positive = node_helpers.conditioning_set_values(positive, {"concat_latent_image": cond_latent, "concat_mask": concat_mask})
         negative = node_helpers.conditioning_set_values(negative, {"concat_latent_image": cond_latent, "concat_mask": concat_mask})
