@@ -434,6 +434,33 @@ def test_hy_omniweaving_text_encode_think_rewrites_prompt():
     ) in clip.clip_options
 
 
+def test_hy_omniweaving_text_encode_think_rejects_runaway_rewrite(monkeypatch):
+    clip = _ClipStub(has_byt5=True)
+    monkeypatch.setattr(
+        nodes.TextEncodeHunyuanVideo15Omni,
+        "_decode_generated_text",
+        staticmethod(lambda clip, generated, tokens: "x" * 3000),
+    )
+
+    nodes.TextEncodeHunyuanVideo15Omni.execute(
+        clip=clip,
+        prompt="An anime girl dancing intensely",
+        task="t2v",
+        use_visual_inputs=False,
+        max_visual_inputs=8,
+        think=True,
+        think_max_new_tokens=1000,
+        deepstack_layers="8,16,24",
+        setclip=True,
+        semantic_images=None,
+        clip_vision_output=None,
+    )
+
+    assert len(clip.tokenize_calls) == 2
+    assert clip.tokenize_calls[1][0] == "An anime girl dancing intensely"
+    assert clip.last_generate["max_length"] == 256
+
+
 def test_hy_omniweaving_text_encode_think_resizes_visual_inputs_for_ar_prompt():
     clip = _ClipStub(has_byt5=True)
     semantic_images = torch.zeros((1, 1024, 512, 3))
@@ -704,6 +731,60 @@ def test_hy_omniweaving_conditioning_t2v_sets_zero_concat_latent_and_mask():
     assert torch.equal(pos_values["concat_mask"], torch.ones((2, 1, 2, 2, 2)))
     assert torch.equal(neg_values["concat_latent_image"], pos_values["concat_latent_image"])
     assert torch.equal(neg_values["concat_mask"], pos_values["concat_mask"])
+
+
+def test_hy_omniweaving_conditioning_t2v_does_not_forward_clip_vision_output():
+    clip_vision_output = types.SimpleNamespace(
+        last_hidden_state=torch.zeros((1, 729, 1152)),
+        penultimate_hidden_states=torch.zeros((1, 729, 1152)),
+        image_embeds=torch.zeros((1, 729, 1152)),
+        mm_projected=None,
+    )
+
+    positive, negative, _ = nodes.HunyuanVideo15OmniConditioning.execute(
+        positive="pos",
+        negative="neg",
+        vae=object(),
+        task="t2v",
+        width=32,
+        height=32,
+        length=5,
+        batch_size=1,
+        reference_images=None,
+        condition_video=None,
+        clip_vision_output=clip_vision_output,
+    )
+
+    assert "clip_vision_output" not in positive[1]
+    assert "clip_vision_output" not in negative[1]
+
+
+def test_hy_omniweaving_conditioning_i2v_keeps_clip_vision_output():
+    class _VAE:
+        def encode(self, image):
+            return torch.full((1, 32, 1, 2, 2), 1.0, dtype=image.dtype)
+
+        def decode(self, latent):
+            return torch.full((1, 8, 8, 3), 0.5, dtype=latent.dtype)
+
+    clip_vision_output = types.SimpleNamespace(mm_projected=torch.zeros((1, 16, 4096)))
+
+    positive, negative, _ = nodes.HunyuanVideo15OmniConditioning.execute(
+        positive="pos",
+        negative="neg",
+        vae=_VAE(),
+        task="i2v",
+        width=32,
+        height=32,
+        length=5,
+        batch_size=1,
+        reference_images=torch.zeros((1, 8, 8, 3)),
+        condition_video=None,
+        clip_vision_output=clip_vision_output,
+    )
+
+    assert positive[1]["clip_vision_output"] is clip_vision_output
+    assert negative[1]["clip_vision_output"] is clip_vision_output
 
 
 def test_ensure_runtime_patches_is_idempotent(monkeypatch):

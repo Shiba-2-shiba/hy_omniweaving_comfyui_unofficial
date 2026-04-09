@@ -183,12 +183,16 @@ def ensure_hy_omniweaving_deepstack_support(model_patcher, sd: dict | None = Non
     diffusion_model._hy_omniweaving_mm_in_inactive = _is_effectively_zero(module.linear_2.weight) and _is_effectively_zero(module.linear_2.bias)
     if diffusion_model._hy_omniweaving_mm_in_inactive:
         logging.warning("HY-OmniWeaving attached mm_in, but linear_2 is all-zero so deepstack injection is numerically inactive.")
+    source_linear_1_norm = _norm_of(linear_1_weight)
+    source_linear_2_norm = _norm_of(linear_2_weight)
+    attached_linear_1_norm = _norm_of(module.linear_1.weight)
+    attached_linear_2_norm = _norm_of(module.linear_2.weight)
     _debug_log(
         "mm_in source_vs_attach source_linear1_norm=%.6f source_linear2_norm=%.6f attached_linear1_norm=%.6f attached_linear2_norm=%.6f",
-        _norm_of(linear_1_weight) or -1.0,
-        _norm_of(linear_2_weight) or -1.0,
-        _norm_of(module.linear_1.weight) or -1.0,
-        _norm_of(module.linear_2.weight) or -1.0,
+        source_linear_1_norm if source_linear_1_norm is not None else -1.0,
+        source_linear_2_norm if source_linear_2_norm is not None else -1.0,
+        attached_linear_1_norm if attached_linear_1_norm is not None else -1.0,
+        attached_linear_2_norm if attached_linear_2_norm is not None else -1.0,
     )
     return True
 
@@ -242,9 +246,9 @@ def _hy_omniweaving_diffusion_model_wrapper(executor, *args, **kwargs):
             _debug_log(
                 "diffusion wrapper fired all_stack_text_states_shape=%s all_stack_text_states_norm=%.6f projected_shape=%s projected_norm=%.6f patched_double_blocks=%s freeze_main=%s",
                 _shape_of(all_stack_text_states),
-                _norm_of(all_stack_text_states) or -1.0,
+                _norm_of(all_stack_text_states) if _norm_of(all_stack_text_states) is not None else -1.0,
                 _shape_of(projected),
-                _norm_of(projected) or -1.0,
+                _norm_of(projected) if _norm_of(projected) is not None else -1.0,
                 min(len(projected), len(diffusion_model.double_blocks)),
                 freeze_main,
             )

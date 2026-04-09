@@ -547,13 +547,15 @@ class HYOmniWeavingUNetLoader(io.ComfyNode):
         sd, converted, partial = _convert_split_hy_omniweaving_attention_qkv(sd, strict_mode=strict_mode)
         mm_in_sd = extract_hy_omniweaving_mm_in_state_dict(sd)
         if len(mm_in_sd) > 0:
+            linear_1_norm = _norm_of(mm_in_sd.get("linear_1.weight"))
+            linear_2_norm = _norm_of(mm_in_sd.get("linear_2.weight"))
             _debug_log(
                 "unet loader detected mm_in tensors count=%s source_linear1_shape=%s source_linear1_norm=%.6f source_linear2_shape=%s source_linear2_norm=%.6f",
                 len(mm_in_sd),
                 _shape_of(mm_in_sd.get("linear_1.weight")),
-                _norm_of(mm_in_sd.get("linear_1.weight")) or -1.0,
+                linear_1_norm if linear_1_norm is not None else -1.0,
                 _shape_of(mm_in_sd.get("linear_2.weight")),
-                _norm_of(mm_in_sd.get("linear_2.weight")) or -1.0,
+                linear_2_norm if linear_2_norm is not None else -1.0,
             )
         if converted > 0:
             logging.info(f"HYOmniWeavingUNetLoader converted {converted} split attention tensors to qkv format.")
@@ -622,6 +624,8 @@ class HYOmniWeavingVAELoader(io.ComfyNode):
 
 
 class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
+    THINK_MAX_EFFECTIVE_NEW_TOKENS = 256
+    THINK_MAX_REWRITE_CHARS = 2048
     TASK_SPECS = {
         "t2v": {
             "prompt_mode": 1,
@@ -788,6 +792,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             raise ValueError("Think mode is currently intended only for t2v, i2v, or interpolation tasks.")
         if max_new_tokens <= 0:
             return prompt
+        effective_max_new_tokens = min(max_new_tokens, cls.THINK_MAX_EFFECTIVE_NEW_TOKENS)
 
         if task == "i2v":
             expand_prefix = "Here is a concise description of the target video starting with the given image: "
@@ -811,7 +816,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             visual_images=think_visual_images if len(think_visual_images) > 0 else None,
         )
 
-        generated = clip.generate(tokens, do_sample=False, max_length=max_new_tokens)
+        generated = clip.generate(tokens, do_sample=False, max_length=effective_max_new_tokens)
         generated_text = cls._decode_generated_text(clip, generated, tokens)
         _debug_log(
             "think rewrite task=%s original_chars=%s generated_chars=%s visual_inputs=%s",
@@ -821,6 +826,13 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             think_visual_count,
         )
         if len(generated_text) == 0:
+            return prompt
+        if len(generated_text) > cls.THINK_MAX_REWRITE_CHARS:
+            logging.warning(
+                "HYOmniWeavingTextEncode rejected runaway think rewrite for task '%s' because generated text was too long (%s chars).",
+                task,
+                len(generated_text),
+            )
             return prompt
         rewritten = f"{prompt} Here is a more detailed description. {generated_text}"
         _debug_log(
@@ -1190,9 +1202,13 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
 
         positive = node_helpers.conditioning_set_values(positive, {"concat_latent_image": cond_latent, "concat_mask": concat_mask})
         negative = node_helpers.conditioning_set_values(negative, {"concat_latent_image": cond_latent, "concat_mask": concat_mask})
-        if clip_vision_output is not None:
+        if clip_vision_output is not None and task != "t2v":
             positive = node_helpers.conditioning_set_values(positive, {"clip_vision_output": clip_vision_output})
             negative = node_helpers.conditioning_set_values(negative, {"clip_vision_output": clip_vision_output})
+        elif clip_vision_output is not None:
+            logging.warning(
+                "HYOmniWeavingConditioning ignored clip_vision_output for task 't2v' to keep text-only generation isolated."
+            )
 
         return io.NodeOutput(positive, negative, {"samples": latent})
 
