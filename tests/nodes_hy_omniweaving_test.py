@@ -704,8 +704,8 @@ def test_hy_omniweaving_conditioning_i2v_sets_stock_comfy_mask_polarity():
     assert torch.equal(pos_values["concat_mask"][:, :, 1], torch.ones((1, 1, 2, 2)))
     assert torch.equal(neg_values["concat_mask"], pos_values["concat_mask"])
     assert pos_values["guiding_frame_index"] == 0
-    assert tuple(pos_values["ref_latent"].shape) == (1, 32, 1, 2, 2)
-    assert torch.equal(neg_values["ref_latent"], pos_values["ref_latent"])
+    assert "ref_latent" not in pos_values
+    assert "ref_latent" not in neg_values
     assert len(vae.encode_inputs) == 2
     assert len(vae.decode_inputs) == 1
 

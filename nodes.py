@@ -1141,8 +1141,6 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
         cond_latent = torch.zeros_like(latent[:1])
         omni_mask = torch.zeros((latent_length,), device=cond_latent.device, dtype=cond_latent.dtype)
         guiding_frame_index = None
-        ref_latent = None
-
         if task == "t2v":
             pass
         elif task == "i2v":
@@ -1151,7 +1149,6 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
             cond_latent = _derive_i2v_semantic_conditioning(vae, reference_images, width, height, latent_length)[0]
             omni_mask[0] = 1.0
             guiding_frame_index = 0
-            ref_latent = cond_latent[:, :, :1].clone()
         elif task == "interpolation":
             if reference_images is None or reference_images.shape[0] < 2:
                 raise ValueError("Task interpolation requires at least two reference images.")
@@ -1206,8 +1203,6 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
         cond_values = {"concat_latent_image": cond_latent, "concat_mask": concat_mask}
         if guiding_frame_index is not None:
             cond_values["guiding_frame_index"] = guiding_frame_index
-        if ref_latent is not None:
-            cond_values["ref_latent"] = ref_latent
         positive = node_helpers.conditioning_set_values(positive, cond_values)
         negative = node_helpers.conditioning_set_values(negative, cond_values)
         if clip_vision_output is not None and task != "t2v":
