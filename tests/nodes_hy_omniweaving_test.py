@@ -1053,14 +1053,14 @@ def test_ensure_hy_omniweaving_text_encoder_support_patches_clip_instance():
     assert "all_stack_text_states" in extra
 
 
-def test_hy_omniweaving_text_encoder_support_crops_cond_and_deepstack_with_explicit_crop_start():
+def test_hy_omniweaving_text_encoder_support_does_not_double_crop_cond_with_explicit_crop_start():
     clip = _ClipStub(has_byt5=True)
 
     def encode_token_weights(tokens):
         return (
-            torch.arange(1 * 6 * 2, dtype=torch.float32).reshape(1, 6, 2),
+            torch.arange(1 * 4 * 2, dtype=torch.float32).reshape(1, 4, 2),
             torch.zeros((1, 2)),
-            {"attention_mask": torch.ones((1, 6))},
+            {},
         )
 
     clip.cond_stage_model.encode_token_weights = encode_token_weights
@@ -1072,8 +1072,36 @@ def test_hy_omniweaving_text_encoder_support_crops_cond_and_deepstack_with_expli
     )
 
     assert tuple(cond.shape) == (1, 4, 2)
-    assert tuple(extra["attention_mask"].shape) == (1, 4)
+    assert "attention_mask" not in extra
     assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 4, 2)
+
+
+def test_hy_omniweaving_text_encoder_support_preserves_nonempty_t2v_cond():
+    clip = _ClipStub(has_byt5=True)
+
+    def encode_token_weights(tokens):
+        return (
+            torch.arange(1 * 8 * 2, dtype=torch.float32).reshape(1, 8, 2),
+            torch.zeros((1, 2)),
+            {},
+        )
+
+    def qwen_encode_token_weights(token_weight_pairs):
+        qwen_out = torch.ones((1, 3, 116, 2))
+        qwen_extra = {"attention_mask": torch.ones((1, 116))}
+        return qwen_out, None, qwen_extra
+
+    clip.cond_stage_model.encode_token_weights = encode_token_weights
+    clip.cond_stage_model.qwen25_7b.encode_token_weights = qwen_encode_token_weights
+    runtime_patches.ensure_hy_omniweaving_text_encoder_support(clip)
+    clip.cond_stage_model.set_clip_options({"deepstack": [8, 16], "setclip": True, "crop_start": 108, "task_name": "t2v"})
+
+    cond, _, extra = clip.cond_stage_model.encode_token_weights(
+        {"qwen25_7b": [[(151644, 1.0)] * 108 + [(1, 1.0), (2, 1.0), (3, 1.0), (4, 1.0), (5, 1.0), (6, 1.0), (7, 1.0), (8, 1.0)]]}
+    )
+
+    assert tuple(cond.shape) == (1, 8, 2)
+    assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 8, 2)
 
 
 def test_ensure_hy_omniweaving_text_encoder_support_is_idempotent():
