@@ -1190,6 +1190,35 @@ def test_hy_omniweaving_text_encoder_support_preserves_nonempty_t2v_cond():
     assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 8, 2)
 
 
+def test_hy_omniweaving_text_encoder_support_applies_setclip_to_cond_and_deepstack():
+    clip = _ClipStub(has_byt5=True)
+
+    def encode_token_weights(tokens):
+        return (
+            torch.arange(1 * 7 * 2, dtype=torch.float32).reshape(1, 7, 2),
+            torch.zeros((1, 2)),
+            {},
+        )
+
+    def qwen_encode_token_weights(token_weight_pairs):
+        qwen_out = torch.ones((1, 3, 9, 2))
+        qwen_extra = {"attention_mask": torch.ones((1, 9))}
+        return qwen_out, None, qwen_extra
+
+    clip.cond_stage_model.encode_token_weights = encode_token_weights
+    clip.cond_stage_model.qwen25_7b.encode_token_weights = qwen_encode_token_weights
+    runtime_patches.ensure_hy_omniweaving_text_encoder_support(clip)
+    clip.cond_stage_model.set_clip_options({"deepstack": [8, 16], "setclip": True, "crop_start": 2, "task_name": "i2v"})
+
+    cond, _, extra = clip.cond_stage_model.encode_token_weights(
+        {"qwen25_7b": [[(151644, 1.0), (151644, 1.0), (11, 1.0), (12, 1.0), (151653, 1.0), (21, 1.0), (22, 1.0), (23, 1.0), (24, 1.0)]]}
+    )
+
+    assert tuple(cond.shape) == (1, 4, 2)
+    assert "attention_mask" not in extra
+    assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 4, 2)
+
+
 def test_ensure_hy_omniweaving_text_encoder_support_is_idempotent():
     clip = _ClipStub(has_byt5=True)
 
