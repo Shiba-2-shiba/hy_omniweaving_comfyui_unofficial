@@ -1,9 +1,9 @@
 # HY OmniWeaving ComfyUI refactor status report
 
-This note summarizes what has worked, what has failed, and what has been
-learned during the current refactor pass.
+This note summarizes the current best-known state of the refactor and records
+which conclusions are now stable enough to build on.
 
-Its purpose is to help future development avoid repeating already-settled
+Its purpose is to help future work avoid repeating already-settled
 investigation loops.
 
 ---
@@ -24,31 +24,29 @@ Architectural goal:
 
 ---
 
-## High-level outcome so far
+## Current best-known state
 
-### What has improved
+At the time of this note, this repo is in its best practical state so far:
 
-- text-side image input for `i2v` is now routed through images instead of
-  relying on `CLIP_VISION_OUTPUT.mm_projected`
-- deepstack tensor transport now preserves the **layer axis**
-- deepstack model attachment is now **instance-local**, not global monkey patch
-- text encoder patching is now **instance-local**
-- diffusion-time deepstack injection is now **instance-local wrapper-based**
-- VAE path is stable and correctly recognizes OmniWeaving's 3D VAE layout
+- `t2v` runs successfully and produces sharp, stable output in the currently
+  validated workflow
+- `i2v` runs successfully in the currently validated workflow
+- the earlier `i2v` failure mode where frames progressively collapsed from the
+  first frame is no longer reproduced in the current validated workflow
+- the earlier `i2v` runtime crash caused by an invalid `ref_latent` payload has
+  been removed from the active conditioning path
 
-### What has not improved enough yet
-
-- prompt-following is still weaker than expected
-- UNet-side OmniWeaving deepstack effect is still effectively zero because the
-  model's `mm_in.linear_2` weights are zero in both fp8 and fp32 checkpoints
+This does **not** mean full original-repo parity has been reached. It means the
+current custom-node direction is now functionally usable and materially better
+than earlier refactor states.
 
 ---
 
-## Successful refactor steps
+## What is now working
 
-### 1. Boundaries were clarified correctly
+### 1. Boundary direction is correct
 
-This direction appears correct and should be preserved:
+This direction should be preserved:
 
 - ComfyUI owns:
   - sampler
@@ -62,83 +60,92 @@ This direction appears correct and should be preserved:
   - OmniWeaving task conditioning
   - OmniWeaving-specific deepstack compatibility
 
-This reduced unnecessary reimplementation risk.
+This continues to look like the right architecture.
+
+### 2. The blessed `i2v` path is now viable
+
+The current best-performing path is:
+
+1. reference image
+2. `HY OmniWeaving Image Prep`
+3. `HY OmniWeaving I2V Semantic Images`
+4. stock ComfyUI CLIP-Vision encode
+5. `HY OmniWeaving Text Encode`
+6. `HY OmniWeaving Conditioning`
+7. stock ComfyUI sampler / scheduler / CFG
+
+Important confirmed detail:
+
+- `i2v` text-side multimodal input is now intentionally driven by
+  `semantic_images`
+- this avoids relying on `clip_vision_output.mm_projected`, which is often
+  absent in the tested workflow
+
+### 3. The blessed `t2v` path is also viable
+
+The current best-performing path is:
+
+1. `HY OmniWeaving Text Encode` with `task=t2v`
+2. `HY OmniWeaving Conditioning` with `task=t2v`
+3. stock ComfyUI sampler / scheduler / CFG
+
+Important confirmed detail:
+
+- the explicit zero-conditioning path for `t2v` is now working as intended
+- `t2v` no longer depends on accidental visual-input leakage
+
+### 4. VAE compatibility is in good shape
+
+Observed:
+
+- Omni layout detection succeeds
+- expected 3D VAE tensor shapes are recognized
+- the local `AutoencoderKLConv3D`-equivalent path is stable in the current
+  validated runs
+
+Current assessment:
+
+- VAE compatibility is no longer the main blocker
+
+### 5. Deepstack transport structure is fixed
+
+Observed:
+
+- `all_stack_text_states` now preserves the layer axis
+- deepstack conditioning is no longer collapsed onto a generic batch-like path
+- deepstack attachment and diffusion-time injection are now instance-local
+
+Current assessment:
+
+- structural deepstack transport is working
+- this was a real fix, not just added logging
 
 ---
 
-### 2. Blessed `i2v` image-prep path was introduced
+## What was fixed recently
 
-Added:
+### `i2v` runtime crash from invalid `ref_latent`
 
-- `HY OmniWeaving Image Prep`
+The previous `i2v` crash was caused by passing a raw semantic latent through
+`ref_latent` even though the active ComfyUI HunyuanVideo runtime expected a
+different channel contract at `img_in`.
 
-Purpose:
+Practical effect:
 
-- enforce original-style `Lanczos + center crop`
-- let the same prepared image feed:
-  - VAE conditioning
-  - text-side multimodal input
-  - CLIP-Vision conditioning path
+- sampling crashed before generation could proceed
 
-This was a good change.
+Resolution:
 
----
+- the invalid `ref_latent` payload was removed from the current `i2v`
+  conditioning path
+- `i2v` now proceeds using the working `concat_latent_image`,
+  `concat_mask`, and `guiding_frame_index` path
 
-### 3. Prompt/template parity work was useful
+Current assessment:
 
-The task-to-template mapping was aligned with original OmniWeaving
-`prompt_mode` semantics:
-
-- `t2v`
-- `i2v`
-- `reference2v`
-- `interpolation`
-- `editing`
-- `tiv2v`
-
-This helped reduce silent semantic drift in the text encoder path.
-
----
-
-### 4. Global monkey patches were reduced successfully
-
-The following global patches were removed in favor of instance-local behavior:
-
-- model detection patch
-- model base patch
-- text encoder class-wide patch
-- global HunyuanVideo `_forward` patch
-
-Replaced by:
-
-- per-model `mm_in` attach
-- per-model `extra_conds` adapter
-- per-model `DIFFUSION_MODEL` wrapper
-- per-clip text encoder patch
-
-This was a substantial architecture improvement.
-
----
-
-### 5. Deepstack layer collapse bug was found and fixed
-
-Important finding:
-
-- text encode produced `all_stack_text_states` with shape like
-  `(3, 1, tokens, 3584)`
-- but the default conditioning path collapsed that to `(1, 1, tokens, 3584)`
-
-Cause:
-
-- using generic `CONDRegular` for a tensor whose first dimension is **layer**,
-  not batch
-
-Fix:
-
-- introduced a dedicated deepstack conditioning carrier that preserves the
-  layer axis and only expands/concats on the batch axis
-
-This was an important real fix, not just logging.
+- this was a runtime-contract bug in the integration layer
+- this issue is now considered resolved unless a later ComfyUI runtime change
+  reintroduces a valid `ref_latent` contract we intentionally support
 
 ---
 
@@ -146,153 +153,118 @@ This was an important real fix, not just logging.
 
 ### 1. `CLIP_VISION_OUTPUT` alone was enough for text-side `i2v`
 
-This turned out to be false for the tested workflow.
+This was false for the tested workflow.
 
 Observed:
 
 - `clip_vision_output` was connected
 - `mm_projected` was `None`
-- `image_embeds=0`
-
-Meaning:
-
-- conditioning-side CLIP-Vision path existed
-- but Qwen-side multimodal image input was still absent
+- text-side image embeddings were absent
 
 Conclusion:
 
-- `HYOmniWeavingTextEncode` must accept actual image input for parity-sensitive
-  `i2v` runs
-
----
+- parity-sensitive `i2v` runs must provide actual image input to the text path
+- `semantic_images` is currently the correct practical route
 
 ### 2. fp8 quantization was probably killing `mm_in.linear_2`
 
 This was investigated and disproven.
 
-Comparison result:
+Observed:
 
-- `mm_in.linear_2.weight` is zero in the fp8 checkpoint
-- `mm_in.linear_2.weight` is also zero in the fp32 checkpoint
+- `mm_in.linear_2.weight` is zero in the tested fp8 checkpoint
+- `mm_in.linear_2.weight` is also zero in the tested fp32 checkpoint
 
 Conclusion:
 
-- this is **not** caused by fp8 quantization
-- the zero output is already present in the original fp32 checkpoint being used
-
----
+- this is not caused by fp8 quantization
+- the current public weights themselves are the issue
 
 ### 3. `mm_in` unexpected-key warnings were the main issue
 
 This is not the best current interpretation.
 
-The warning:
-
-- `unet unexpected: ['mm_in.linear_1.bias', ...]`
-
-is currently consistent with the chosen architecture:
-
-- core ComfyUI load ignores OmniWeaving-only `mm_in.*`
-- custom node re-attaches them after load
-
-This warning should still be kept as a diagnostic signal, but it is no longer
-the strongest root-cause candidate for quality issues.
-
----
-
-## Confirmed current findings
-
-### A. VAE path is in comparatively good shape
-
 Observed:
 
-- Omni layout detection succeeds
-- expected 3D VAE tensor shapes are recognized
+- stock ComfyUI load ignores OmniWeaving-only `mm_in.*`
+- the custom loader re-attaches them afterward
 
-Current assessment:
+Conclusion:
 
-- VAE is not the main blocker right now
-
----
-
-### B. Text-side `i2v` image path is now structurally correct
-
-Observed:
-
-- `visual_source=reference_images`
-- `visual_images=1`
-- large text-side sequence length increase after the image-based path was wired
-
-Current assessment:
-
-- this change improved image faithfulness / stability
+- keep the warning as a diagnostic signal
+- do not treat it as the primary explanation for current behavior
 
 ---
 
-### C. Deepstack tensors are now preserved up to diffusion wrapper entry
+## Remaining known issues
 
-Observed after custom COND fix:
-
-- text encode output: `(3, 1, tokens, 3584)`
-- wrapper input: `(3, 1, tokens, 3584)`
-- patched blocks: `3`
-
-Current assessment:
-
-- structural deepstack transport is now working as intended
-
----
-
-### D. `mm_in` projection is still numerically dead
+### A. Deepstack connector is still numerically inactive
 
 Observed:
 
 - `mm_in.linear_1.weight` is non-zero
 - `mm_in.linear_2.weight` is all-zero
-- `projected_norm` is effectively zero
+- `mm_in.linear_2.bias` is all-zero
+- the runtime correctly warns that deepstack injection is numerically inactive
 
 Meaning:
 
-- deepstack reaches the model
-- but the learned connector path produces zero output
+- transport is wired
+- the learned connector currently produces no useful output
 
 Current assessment:
 
-- this is the strongest remaining explanation for weak prompt-following once
-  the structural bugs were fixed
+- this is still the strongest explanation for weak OmniWeaving-specific
+  deepstack steering
+- this is currently a model-weight-side issue, not the main integration bug
+
+### B. Small token-count mismatch remains after crop/setclip
+
+Observed in current successful runs:
+
+- `cond_tokens` and `deepstack_tokens` still differ by a small amount after
+  crop/setclip
+
+Meaning:
+
+- the current path is good enough to run and produce clear output
+- crop/setclip parity is still not exact
+
+Current assessment:
+
+- not a current execution blocker
+- still a valid target for future parity cleanup
+
+### C. Motion-heavy scenes can still flicker
+
+Observed qualitatively in current successful runs:
+
+- output is much clearer than before
+- strong motion can still introduce some flicker
+
+Current assessment:
+
+- the major collapse bug is gone
+- remaining issues are now in the quality/parity tier, not the execution tier
 
 ---
 
-## Current best explanation of behavior
+## Working interpretation
 
 The current state appears to be:
 
-1. image conditioning is better than before
-2. text-side multimodal input is better than before
-3. deepstack transport is structurally fixed
-4. but the OmniWeaving deepstack connector itself is numerically inactive
+1. `i2v` conditioning path is structurally viable
+2. `t2v` conditioning path is structurally viable
+3. VAE path is stable
+4. deepstack transport is structurally fixed
+5. deepstack connector weights are still numerically inactive
+6. crop/setclip parity is close enough to run, but not exact
 
 Practical effect:
 
-- image coherence improves
-- prompt specificity remains weak
-
-This matches the observed outputs so far.
-
----
-
-## Recommended interpretation of remaining problem
-
-At this stage, the main blocker is likely **model-weight-side**, not
-pipeline-structure-side.
-
-In particular:
-
-- `mm_in.linear_2 == 0` in both tested checkpoints strongly suggests that
-  OmniWeaving's expected deepstack effect is absent in the actual weights being
-  used
-
-This should be investigated separately from the ComfyUI integration layer.
+- the repo is now usable for current `i2v` / `t2v` workflows
+- the next layer of work is about parity refinement and quality, not basic
+  execution recovery
 
 ---
 
@@ -300,49 +272,44 @@ This should be investigated separately from the ComfyUI integration layer.
 
 ### Priority 1
 
-Verify whether the original OmniWeaving runtime is expected to function with
-the exact same checkpoint despite `mm_in.linear_2` being zero.
+Keep the current blessed `i2v` / `t2v` workflows stable.
 
-Questions:
-
-- Is this intentional?
-- Is another code path compensating for it?
-- Is a different checkpoint supposed to be used?
+- do not reintroduce the invalid `ref_latent` path casually
+- keep `semantic_images` explicit for `i2v`
+- keep `HY OmniWeaving Image Prep` as the blessed image-entry point
 
 ### Priority 2
 
-Continue quality comparison focusing on paths **other than** deepstack:
+Investigate the remaining crop/setclip token mismatch.
 
-- prompt templates
-- image preparation consistency
-- conditioning-side vision path
-- workflow wiring discipline
+- compare current crop/setclip slicing against the original `prepare_input()`
+  and encode behavior
+- verify whether the remaining delta is expected metadata, special tokens, or a
+  real alignment bug
 
 ### Priority 3
 
-If needed, add a repo note or experiment branch for:
+Track the model-provider fix for `mm_in.linear_2`.
 
-- temporary deepstack bypass experiments
-- replacement connector experiments
-- direct comparison against original runtime outputs
-
-These should be treated as experiments, not merged assumptions.
+- once a corrected checkpoint is available, re-evaluate prompt-following and
+  motion-heavy scenes before making further architectural conclusions
 
 ---
 
 ## Keep doing
 
 - keep debug logs available behind `HY_OMNIWEAVING_DEBUG=1`
-- keep `HY OmniWeaving Image Prep` in the blessed workflow
-- keep text-side image input explicit for `i2v`
 - keep instance-local adapters instead of returning to global monkey patches
-
----
+- keep the blessed `i2v` path centered on prepared image -> semantic image ->
+  text/vision conditioning
+- keep the blessed `t2v` path text-only
 
 ## Avoid doing
 
 - do not suppress `mm_in` unexpected-key warnings just to quiet logs
 - do not revert to `clip_vision_output`-only text-side visual input for `i2v`
 - do not assume fp8 is the reason `mm_in.linear_2` is zero
-- do not reintroduce broad global patches unless a specific regression proves
-  they are necessary
+- do not reintroduce `ref_latent` without verifying the exact current ComfyUI
+  runtime channel contract
+- do not treat the remaining crop/setclip mismatch as proof that the whole path
+  is broken; it is now a refinement issue

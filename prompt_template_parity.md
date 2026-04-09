@@ -8,35 +8,43 @@ original repository's `prompt_mode` definitions in
 
 | Task | Original prompt_mode | Original crop_start | Current custom node status |
 |---|---:|---:|---|
-| `t2v` | 1 | 108 | aligned |
-| `i2v` | 2 | 92 | aligned |
-| `reference2v` | 3 | 102 | aligned |
-| `interpolation` | 4 | 109 | aligned |
-| `editing` | 5 | 90 | aligned |
-| `tiv2v` | 6 | 104 | aligned |
+| `t2v` | 1 | 108 | aligned and validated in current best-known workflow |
+| `i2v` | 2 | 92 | aligned and validated in current best-known workflow |
+| `reference2v` | 3 | 102 | mapped |
+| `interpolation` | 4 | 109 | mapped |
+| `editing` | 5 | 90 | mapped |
+| `tiv2v` | 6 | 104 | mapped |
 
-## Important detail
+## Confirmed current behavior
 
-The biggest wording mismatch found during analysis was the `i2v` system prompt.
+- The custom node preserves the original task-to-`prompt_mode` mapping and
+  carries the original `crop_start` values into the patched text encoder path.
+- The `i2v` system prompt now matches the original wording closely enough to
+  avoid the earlier semantic drift caused by prompt mismatch.
+- In the current validated `i2v` path, text-side multimodal input is driven by
+  `semantic_images`, not by `clip_vision_output.mm_projected`.
+- In the current validated `t2v` path, `use_visual_inputs=false` and the node
+  follows the intended text-only task route.
 
-- **Original** starts with:
-  - `Describe the key features of the input image...`
-- **Current refactor target** now uses the same wording.
+## Important limitation
 
-This matters because the project goal is not generic HunyuanVideo prompting,
-but OmniWeaving-style multimodal semantics on top of ComfyUI-native inference.
-
-## Current limitation
-
-The custom node records the original `prompt_mode` and `crop_start` metadata,
-but ComfyUI tokenization still flows through its own text-encoder path rather
-than the original `prepare_input()` implementation.
-
-So parity here currently means:
+Parity here currently means:
 
 - same task-to-template intent
 - same system-prompt wording
-- preserved metadata for future stricter alignment work
+- same `crop_start` metadata
+- same high-level workflow expectation about whether images should be present
 
-It does **not yet** mean byte-for-byte tokenization parity with the original
+It does **not** yet mean byte-for-byte tokenization parity with the original
 processor stack.
+
+## Remaining mismatch to investigate
+
+Current `i2v` / `t2v` debug logs still show a small token-count mismatch after
+crop/setclip:
+
+- `cond_tokens`
+- `deepstack_tokens`
+
+The mismatch is small and no longer blocks execution, but it is still a useful
+parity-quality signal and should be treated as a remaining follow-up item.
