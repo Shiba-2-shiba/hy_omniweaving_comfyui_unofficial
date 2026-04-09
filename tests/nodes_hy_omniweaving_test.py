@@ -218,7 +218,7 @@ class _ClipStub:
         }
         return self.generated
 
-    def decode(self, token_ids):
+    def decode(self, token_ids, **kwargs):
         assert token_ids == self.generated
         return "expanded prompt"
 
@@ -337,9 +337,10 @@ def test_extract_image_embeds_uses_mm_projected_when_present():
     assert tuple(embeds[0].shape) == (16, 4096)
 
 
-def test_hy_omniweaving_text_encode_prefers_reference_images_for_i2v():
+def test_hy_omniweaving_text_encode_prefers_semantic_images_over_reference_images_for_i2v():
     clip = _ClipStub(has_byt5=True)
     reference_images = torch.zeros((1, 640, 640, 3))
+    semantic_images = torch.ones((1, 320, 320, 3))
     clip_vision_output = types.SimpleNamespace(
         last_hidden_state=torch.zeros((1, 729, 1152)),
         penultimate_hidden_states=torch.zeros((1, 729, 1152)),
@@ -358,12 +359,13 @@ def test_hy_omniweaving_text_encode_prefers_reference_images_for_i2v():
         deepstack_layers="8,16,24",
         setclip=True,
         reference_images=reference_images,
+        semantic_images=semantic_images,
         clip_vision_output=clip_vision_output,
     )
 
     assert "images" in clip.tokenize_calls[0][1]
     assert len(clip.tokenize_calls[0][1]["images"]) == 1
-    assert tuple(clip.tokenize_calls[0][1]["images"][0].shape) == (1, 640, 640, 3)
+    assert tuple(clip.tokenize_calls[0][1]["images"][0].shape) == (1, 320, 320, 3)
 
 
 def test_hy_omniweaving_text_encode_warns_when_i2v_has_no_usable_text_side_visual_input(caplog):
@@ -387,6 +389,7 @@ def test_hy_omniweaving_text_encode_warns_when_i2v_has_no_usable_text_side_visua
             deepstack_layers="8,16,24",
             setclip=True,
             reference_images=None,
+            semantic_images=None,
             clip_vision_output=clip_vision_output,
         )
 
@@ -406,6 +409,7 @@ def test_hy_omniweaving_text_encode_think_rewrites_prompt():
         think_max_new_tokens=111,
         deepstack_layers="8,16,24",
         setclip=True,
+        semantic_images=None,
         clip_vision_output=None,
     )
 
@@ -417,7 +421,148 @@ def test_hy_omniweaving_text_encode_think_rewrites_prompt():
     assert "Here is a more detailed description. expanded prompt" in clip.tokenize_calls[1][0]
     assert "Here is a more detailed description. expanded prompt" in clip.last_encoded["tokens"]
     assert "Describe the key features of the input image" in clip.tokenize_calls[1][1]["llama_template"]
-    assert ("set", {"execution_device": "cpu", "deepstack": [8, 16, 24], "setclip": True}) in clip.clip_options
+    assert (
+        "set",
+        {
+            "execution_device": "cpu",
+            "deepstack": [8, 16, 24],
+            "setclip": True,
+            "crop_start": 92,
+            "task_name": "i2v",
+            "visual_input_count": 0,
+        },
+    ) in clip.clip_options
+
+
+def test_hy_omniweaving_text_encode_think_rejects_runaway_rewrite(monkeypatch):
+    clip = _ClipStub(has_byt5=True)
+    monkeypatch.setattr(
+        nodes.TextEncodeHunyuanVideo15Omni,
+        "_decode_generated_text",
+        staticmethod(lambda clip, generated, tokens: "x" * 3000),
+    )
+
+    nodes.TextEncodeHunyuanVideo15Omni.execute(
+        clip=clip,
+        prompt="An anime girl dancing intensely",
+        task="t2v",
+        use_visual_inputs=False,
+        max_visual_inputs=8,
+        think=True,
+        think_max_new_tokens=1000,
+        deepstack_layers="8,16,24",
+        setclip=True,
+        semantic_images=None,
+        clip_vision_output=None,
+    )
+
+    assert len(clip.tokenize_calls) == 2
+    assert clip.tokenize_calls[1][0] == "An anime girl dancing intensely"
+    assert clip.last_generate["max_length"] == 256
+
+
+def test_hy_omniweaving_text_encode_think_resizes_visual_inputs_for_ar_prompt():
+    clip = _ClipStub(has_byt5=True)
+    semantic_images = torch.zeros((1, 1024, 512, 3))
+
+    nodes.TextEncodeHunyuanVideo15Omni.execute(
+        clip=clip,
+        prompt="A dancer starts moving",
+        task="i2v",
+        use_visual_inputs=True,
+        max_visual_inputs=8,
+        think=True,
+        think_max_new_tokens=128,
+        deepstack_layers="8,16,24",
+        setclip=True,
+        reference_images=None,
+        semantic_images=semantic_images,
+        clip_vision_output=None,
+    )
+
+    think_images = clip.tokenize_calls[0][1]["images"]
+    assert len(think_images) == 1
+    assert tuple(think_images[0].shape[-3:-1]) == (560, 280)
+
+
+def test_decode_generated_text_trims_prompt_prefix_only_when_it_matches():
+    clip = _ClipStub(has_byt5=True)
+    generated = torch.tensor([[101, 102, 201, 202]])
+    tokens = {
+        "input_ids": torch.tensor([[101, 102, 0, 0]]),
+        "attention_mask": torch.tensor([[1, 1, 0, 0]]),
+    }
+
+    seen = {}
+
+    def decode(token_ids, **kwargs):
+        seen["token_ids"] = token_ids
+        seen["kwargs"] = kwargs
+        return "tail only"
+
+    clip.decode = decode
+
+    out = nodes.TextEncodeHunyuanVideo15Omni._decode_generated_text(clip, generated, tokens)
+
+    assert out == "tail only"
+    assert torch.equal(seen["token_ids"], torch.tensor([201, 202]))
+    assert seen["kwargs"] == {"skip_special_tokens": True}
+
+
+def test_decode_generated_text_keeps_continuation_when_prefix_does_not_match():
+    clip = _ClipStub(has_byt5=True)
+    generated = torch.tensor([[301, 302, 201, 202]])
+    tokens = {
+        "input_ids": torch.tensor([[101, 102, 0, 0]]),
+        "attention_mask": torch.tensor([[1, 1, 0, 0]]),
+    }
+
+    seen = {}
+
+    def decode(token_ids, **kwargs):
+        seen["token_ids"] = token_ids
+        seen["kwargs"] = kwargs
+        return "full continuation"
+
+    clip.decode = decode
+
+    out = nodes.TextEncodeHunyuanVideo15Omni._decode_generated_text(clip, generated, tokens)
+
+    assert out == "full continuation"
+    assert torch.equal(seen["token_ids"], torch.tensor([301, 302, 201, 202]))
+    assert seen["kwargs"] == {"skip_special_tokens": True}
+
+
+def test_hy_omniweaving_text_encode_passes_visual_input_metadata_into_clip_options():
+    clip = _ClipStub(has_byt5=True)
+    semantic_images = torch.zeros((2, 320, 320, 3))
+
+    nodes.TextEncodeHunyuanVideo15Omni.execute(
+        clip=clip,
+        prompt="A dancer starts moving",
+        task="i2v",
+        use_visual_inputs=True,
+        max_visual_inputs=1,
+        think=False,
+        think_max_new_tokens=128,
+        deepstack_layers="8,16,24",
+        setclip=True,
+        reference_images=None,
+        semantic_images=semantic_images,
+        clip_vision_output=None,
+    )
+
+    assert (
+        "set",
+        {
+            "execution_device": "cpu",
+            "deepstack": [8, 16, 24],
+            "setclip": True,
+            "crop_start": 92,
+            "task_name": "i2v",
+            "visual_input_count": 1,
+        },
+    ) in clip.clip_options
 
 
 def test_hy_omniweaving_text_encode_uses_reference_style_task_template():
@@ -433,6 +578,7 @@ def test_hy_omniweaving_text_encode_uses_reference_style_task_template():
         think_max_new_tokens=1000,
         deepstack_layers="8,16,24",
         setclip=True,
+        semantic_images=None,
         clip_vision_output=None,
     )
 
@@ -490,15 +636,53 @@ def test_hy_omniweaving_image_prep_uses_lanczos_center(monkeypatch):
     }
 
 
+def test_hy_omniweaving_i2v_semantic_images_roundtrip_reference_frame(monkeypatch):
+    class _VAE:
+        def __init__(self):
+            self.encode_inputs = []
+            self.decode_inputs = []
+
+        def encode(self, image):
+            self.encode_inputs.append(image.clone())
+            return torch.full((1, 32, 1, 2, 2), float(len(self.encode_inputs)), dtype=image.dtype)
+
+        def decode(self, latent):
+            self.decode_inputs.append(latent.clone())
+            return torch.full((1, 8, 8, 3), 0.75, dtype=latent.dtype)
+
+    monkeypatch.setattr(nodes.comfy.utils, "common_upscale", lambda tensor, width, height, method, crop: tensor)
+
+    semantic_images, = nodes.HYOmniWeavingI2VSemanticImages.execute(
+        vae=_VAE(),
+        reference_images=torch.zeros((1, 8, 8, 3)),
+        width=832,
+        height=480,
+    )
+
+    assert tuple(semantic_images.shape) == (1, 8, 8, 3)
+    assert torch.equal(semantic_images, torch.full((1, 8, 8, 3), 0.75))
+
+
 def test_hy_omniweaving_conditioning_i2v_sets_stock_comfy_mask_polarity():
     class _VAE:
+        def __init__(self):
+            self.encode_inputs = []
+            self.decode_inputs = []
+
         def encode(self, image):
-            return torch.ones((1, 32, 1, 2, 2), dtype=image.dtype)
+            self.encode_inputs.append(image.clone())
+            return torch.full((1, 32, 1, 2, 2), float(len(self.encode_inputs)), dtype=image.dtype)
+
+        def decode(self, latent):
+            self.decode_inputs.append(latent.clone())
+            return torch.full((1, 8, 8, 3), 0.5, dtype=latent.dtype)
+
+    vae = _VAE()
 
     positive, negative, latent = nodes.HunyuanVideo15OmniConditioning.execute(
         positive="pos",
         negative="neg",
-        vae=_VAE(),
+        vae=vae,
         task="i2v",
         width=32,
         height=32,
@@ -514,11 +698,111 @@ def test_hy_omniweaving_conditioning_i2v_sets_stock_comfy_mask_polarity():
     assert tuple(latent["samples"].shape) == (1, 32, 2, 2, 2)
     assert tuple(pos_values["concat_latent_image"].shape) == (1, 32, 2, 2, 2)
     assert tuple(pos_values["concat_mask"].shape) == (1, 1, 2, 2, 2)
-    assert torch.equal(pos_values["concat_latent_image"][:, :, 0], torch.ones((1, 32, 2, 2)))
+    assert torch.equal(pos_values["concat_latent_image"][:, :, 0], torch.full((1, 32, 2, 2), 2.0))
     assert torch.equal(pos_values["concat_latent_image"][:, :, 1], torch.zeros((1, 32, 2, 2)))
     assert torch.equal(pos_values["concat_mask"][:, :, 0], torch.zeros((1, 1, 2, 2)))
     assert torch.equal(pos_values["concat_mask"][:, :, 1], torch.ones((1, 1, 2, 2)))
     assert torch.equal(neg_values["concat_mask"], pos_values["concat_mask"])
+    assert pos_values["guiding_frame_index"] == 0
+    assert "ref_latent" not in pos_values
+    assert "ref_latent" not in neg_values
+    assert len(vae.encode_inputs) == 2
+    assert len(vae.decode_inputs) == 1
+
+
+def test_hy_omniweaving_conditioning_t2v_sets_zero_concat_latent_and_mask():
+    positive, negative, latent = nodes.HunyuanVideo15OmniConditioning.execute(
+        positive="pos",
+        negative="neg",
+        vae=object(),
+        task="t2v",
+        width=32,
+        height=32,
+        length=5,
+        batch_size=2,
+        reference_images=None,
+        condition_video=None,
+        clip_vision_output=None,
+    )
+
+    pos_values = positive[1]
+    neg_values = negative[1]
+    assert tuple(latent["samples"].shape) == (2, 32, 2, 2, 2)
+    assert tuple(pos_values["concat_latent_image"].shape) == (2, 32, 2, 2, 2)
+    assert tuple(pos_values["concat_mask"].shape) == (2, 1, 2, 2, 2)
+    assert torch.equal(pos_values["concat_latent_image"], torch.zeros((2, 32, 2, 2, 2)))
+    assert torch.equal(pos_values["concat_mask"], torch.ones((2, 1, 2, 2, 2)))
+    assert torch.equal(neg_values["concat_latent_image"], pos_values["concat_latent_image"])
+    assert torch.equal(neg_values["concat_mask"], pos_values["concat_mask"])
+    assert "guiding_frame_index" not in pos_values
+    assert "ref_latent" not in pos_values
+
+
+def test_hy_omniweaving_conditioning_t2v_does_not_forward_clip_vision_output():
+    clip_vision_output = types.SimpleNamespace(
+        last_hidden_state=torch.zeros((1, 729, 1152)),
+        penultimate_hidden_states=torch.zeros((1, 729, 1152)),
+        image_embeds=torch.zeros((1, 729, 1152)),
+        mm_projected=None,
+    )
+
+    positive, negative, _ = nodes.HunyuanVideo15OmniConditioning.execute(
+        positive="pos",
+        negative="neg",
+        vae=object(),
+        task="t2v",
+        width=32,
+        height=32,
+        length=5,
+        batch_size=1,
+        reference_images=None,
+        condition_video=None,
+        clip_vision_output=clip_vision_output,
+    )
+
+    assert "clip_vision_output" not in positive[1]
+    assert "clip_vision_output" not in negative[1]
+
+
+def test_hy_omniweaving_conditioning_i2v_keeps_clip_vision_output():
+    class _VAE:
+        def encode(self, image):
+            return torch.full((1, 32, 1, 2, 2), 1.0, dtype=image.dtype)
+
+        def decode(self, latent):
+            return torch.full((1, 8, 8, 3), 0.5, dtype=latent.dtype)
+
+    clip_vision_output = types.SimpleNamespace(mm_projected=torch.zeros((1, 16, 4096)))
+
+    positive, negative, _ = nodes.HunyuanVideo15OmniConditioning.execute(
+        positive="pos",
+        negative="neg",
+        vae=_VAE(),
+        task="i2v",
+        width=32,
+        height=32,
+        length=5,
+        batch_size=1,
+        reference_images=torch.zeros((1, 8, 8, 3)),
+        condition_video=None,
+        clip_vision_output=clip_vision_output,
+    )
+
+    assert positive[1]["clip_vision_output"] is clip_vision_output
+    assert negative[1]["clip_vision_output"] is clip_vision_output
+
+
+def test_ensure_runtime_patches_is_idempotent(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(runtime_patches, "_patch_qwen25_think_generation", lambda: calls.append("think"))
+    monkeypatch.setattr(runtime_patches, "_patch_autoencoder_legacy", lambda: calls.append("vae"))
+    if hasattr(runtime_patches, "_HY_OMNIWEAVING_RUNTIME_PATCHES_READY"):
+        monkeypatch.setattr(runtime_patches, "_HY_OMNIWEAVING_RUNTIME_PATCHES_READY", False)
+
+    assert runtime_patches.ensure_runtime_patches() is True
+    assert runtime_patches.ensure_runtime_patches() is False
+    assert calls == ["think", "vae"]
 
 
 def test_convert_split_hy_omniweaving_attention_qkv_weight_and_bias():
@@ -778,7 +1062,8 @@ def test_hy_omniweaving_text_encoder_loader_outputs_dual_clip(monkeypatch):
 
 
 def test_ensure_hy_omniweaving_deepstack_support_attaches_mm_in():
-    diffusion_model = types.SimpleNamespace(mm_in=None)
+    in_layer = torch.nn.Linear(3, 4, dtype=torch.float16)
+    diffusion_model = types.SimpleNamespace(mm_in=None, time_in=types.SimpleNamespace(in_layer=in_layer))
 
     class _Model:
         def __init__(self):
@@ -803,6 +1088,8 @@ def test_ensure_hy_omniweaving_deepstack_support_attaches_mm_in():
     assert attached is True
     assert diffusion_model.mm_in is not None
     assert diffusion_model.freeze_main is True
+    assert diffusion_model.mm_in.linear_1.weight.dtype == torch.float16
+    assert diffusion_model._hy_omniweaving_mm_in_inactive is True
     assert len(patcher.wrappers) == 1
     out = model.extra_conds(all_stack_text_states=torch.tensor([1.0]))
     assert out["base"] == 1
@@ -839,13 +1126,68 @@ def test_ensure_hy_omniweaving_text_encoder_support_patches_clip_instance():
 
     assert patched is True
     assert clip.cond_stage_model._hy_omniweaving_text_encoder_patched is True
-    clip.cond_stage_model.set_clip_options({"deepstack": [8, 16], "setclip": True})
+    clip.cond_stage_model.set_clip_options({"deepstack": [8, 16], "setclip": True, "crop_start": 2, "task_name": "i2v", "visual_input_count": 1})
     assert clip.cond_stage_model.deepstack_layers == [8, 16]
     assert clip.cond_stage_model.setclip_output is True
+    assert clip.cond_stage_model.crop_start_output == 2
+    assert clip.cond_stage_model.crop_start_source == "explicit"
+    assert clip.cond_stage_model._hy_task_name == "i2v"
+    assert clip.cond_stage_model._hy_visual_input_count == 1
     cond, pooled, extra = clip.cond_stage_model.encode_token_weights({"qwen25_7b": [[(151644, 1.0), (151644, 1.0), (1, 1.0), (2, 1.0)]]})
     assert cond == "cond_tensor"
     assert pooled == "pooled_tensor"
     assert "all_stack_text_states" in extra
+
+
+def test_hy_omniweaving_text_encoder_support_does_not_double_crop_cond_with_explicit_crop_start():
+    clip = _ClipStub(has_byt5=True)
+
+    def encode_token_weights(tokens):
+        return (
+            torch.arange(1 * 4 * 2, dtype=torch.float32).reshape(1, 4, 2),
+            torch.zeros((1, 2)),
+            {},
+        )
+
+    clip.cond_stage_model.encode_token_weights = encode_token_weights
+    runtime_patches.ensure_hy_omniweaving_text_encoder_support(clip)
+    clip.cond_stage_model.set_clip_options({"deepstack": [8, 16], "setclip": False, "crop_start": 2})
+
+    cond, _, extra = clip.cond_stage_model.encode_token_weights(
+        {"qwen25_7b": [[(151644, 1.0), (151644, 1.0), (11, 1.0), (12, 1.0), (13, 1.0), (14, 1.0)]]}
+    )
+
+    assert tuple(cond.shape) == (1, 4, 2)
+    assert "attention_mask" not in extra
+    assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 4, 2)
+
+
+def test_hy_omniweaving_text_encoder_support_preserves_nonempty_t2v_cond():
+    clip = _ClipStub(has_byt5=True)
+
+    def encode_token_weights(tokens):
+        return (
+            torch.arange(1 * 8 * 2, dtype=torch.float32).reshape(1, 8, 2),
+            torch.zeros((1, 2)),
+            {},
+        )
+
+    def qwen_encode_token_weights(token_weight_pairs):
+        qwen_out = torch.ones((1, 3, 116, 2))
+        qwen_extra = {"attention_mask": torch.ones((1, 116))}
+        return qwen_out, None, qwen_extra
+
+    clip.cond_stage_model.encode_token_weights = encode_token_weights
+    clip.cond_stage_model.qwen25_7b.encode_token_weights = qwen_encode_token_weights
+    runtime_patches.ensure_hy_omniweaving_text_encoder_support(clip)
+    clip.cond_stage_model.set_clip_options({"deepstack": [8, 16], "setclip": True, "crop_start": 108, "task_name": "t2v"})
+
+    cond, _, extra = clip.cond_stage_model.encode_token_weights(
+        {"qwen25_7b": [[(151644, 1.0)] * 108 + [(1, 1.0), (2, 1.0), (3, 1.0), (4, 1.0), (5, 1.0), (6, 1.0), (7, 1.0), (8, 1.0)]]}
+    )
+
+    assert tuple(cond.shape) == (1, 8, 2)
+    assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 8, 2)
 
 
 def test_ensure_hy_omniweaving_text_encoder_support_is_idempotent():
@@ -896,6 +1238,49 @@ def test_hy_omniweaving_diffusion_wrapper_injects_dit_patch():
     assert "patches_replace" in patched_options
     assert "dit" in patched_options["patches_replace"]
     assert ("double_block", 0) in patched_options["patches_replace"]["dit"]
+
+
+def test_hy_omniweaving_diffusion_wrapper_skips_inactive_connector():
+    class _Executor:
+        def __init__(self):
+            mm_in = lambda x: (_ for _ in ()).throw(AssertionError("inactive mm_in should not run"))
+            self.class_obj = types.SimpleNamespace(
+                mm_in=mm_in,
+                _hy_omniweaving_mm_in_inactive=True,
+                freeze_main=True,
+                double_blocks=[object(), object()],
+            )
+            self.calls = []
+
+        def __call__(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return "ok"
+
+    executor = _Executor()
+    context = torch.zeros((1, 5, 3))
+    transformer_options = {}
+
+    out = runtime_patches._hy_omniweaving_diffusion_model_wrapper(
+        executor,
+        torch.zeros((1, 1)),
+        torch.tensor([1.0]),
+        context,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        transformer_options,
+        all_stack_text_states=torch.zeros((2, 1, 3)),
+    )
+
+    assert out == "ok"
+    args, kwargs = executor.calls[0]
+    assert args[-1] == {}
+    assert kwargs == {}
 
 
 def test_cond_deepstack_preserves_layer_dim_when_processing_and_concat():

@@ -4,6 +4,7 @@ import math
 import node_helpers
 import os
 import torch
+import torch.nn.functional as F
 import comfy.clip_vision
 import comfy.model_management
 import comfy.model_patcher
@@ -16,12 +17,14 @@ from comfy_api.latest import ComfyExtension, io
 
 try:
     from .runtime_patches import (
+        ensure_runtime_patches,
         ensure_hy_omniweaving_deepstack_support,
         ensure_hy_omniweaving_text_encoder_support,
         extract_hy_omniweaving_mm_in_state_dict,
     )
 except ImportError:
     from runtime_patches import (
+        ensure_runtime_patches,
         ensure_hy_omniweaving_deepstack_support,
         ensure_hy_omniweaving_text_encoder_support,
         extract_hy_omniweaving_mm_in_state_dict,
@@ -117,6 +120,7 @@ def _normalize_hy_omniweaving_text_encoder_state_dict(sd: dict) -> dict:
 
 
 def _load_hy_omniweaving_dual_text_encoder(qwen_text_encoder: str, byt5_text_encoder: str, device: str = "default"):
+    ensure_runtime_patches()
     qwen_path = folder_paths.get_full_path_or_raise("text_encoders", qwen_text_encoder)
     byt5_path = folder_paths.get_full_path_or_raise("text_encoders", byt5_text_encoder)
 
@@ -256,6 +260,61 @@ def _filter_known_optional_vae_missing_keys(missing_keys):
 
 def _prepare_omniweaving_images(images: torch.Tensor, width: int, height: int):
     return comfy.utils.common_upscale(images.movedim(-1, 1), width, height, "lanczos", "center").movedim(1, -1)
+
+
+def _ensure_video_latent_dims(latent: torch.Tensor) -> torch.Tensor:
+    if not torch.is_tensor(latent):
+        raise TypeError("Expected VAE latent tensor output.")
+    if latent.ndim == 4:
+        return latent.unsqueeze(2)
+    if latent.ndim != 5:
+        raise ValueError(f"Expected 4D or 5D latent tensor, got shape {tuple(latent.shape)}")
+    return latent
+
+
+def _unwrap_decoded_image_tensor(decoded) -> torch.Tensor:
+    if isinstance(decoded, dict):
+        decoded = decoded.get("samples", decoded.get("sample"))
+    elif isinstance(decoded, (list, tuple)):
+        decoded = decoded[0]
+
+    if not torch.is_tensor(decoded):
+        raise TypeError("Expected decoded image tensor output from VAE.")
+
+    if decoded.ndim == 5:
+        if decoded.shape[-1] in (1, 3, 4):
+            decoded = decoded[:, 0]
+        elif decoded.shape[1] in (1, 3, 4):
+            decoded = decoded[:, :, 0].movedim(1, -1)
+        else:
+            raise ValueError(f"Unsupported decoded video tensor shape {tuple(decoded.shape)}")
+    elif decoded.ndim == 4:
+        if decoded.shape[-1] in (1, 3, 4):
+            pass
+        elif decoded.shape[1] in (1, 3, 4):
+            decoded = decoded.movedim(1, -1)
+        else:
+            raise ValueError(f"Unsupported decoded image tensor shape {tuple(decoded.shape)}")
+    else:
+        raise ValueError(f"Unsupported decoded tensor rank {decoded.ndim}")
+
+    return decoded[:, :, :, :3].contiguous()
+
+
+def _derive_i2v_semantic_conditioning(vae, reference_images: torch.Tensor, width: int, height: int, latent_length: int):
+    prepared = _prepare_omniweaving_images(reference_images[:1], width, height)[:, :, :, :3]
+    first_latent = _ensure_video_latent_dims(vae.encode(prepared))
+    semantic_images = _unwrap_decoded_image_tensor(vae.decode(first_latent[:, :, :1]))
+    semantic_images = semantic_images.to(device=prepared.device, dtype=prepared.dtype)
+    semantic_latent = _ensure_video_latent_dims(vae.encode(semantic_images))
+
+    cond_latent = torch.zeros(
+        (first_latent.shape[0], first_latent.shape[1], latent_length, first_latent.shape[-2], first_latent.shape[-1]),
+        dtype=semantic_latent.dtype,
+        device=semantic_latent.device,
+    )
+    cond_latent[:, :, 0:1] = semantic_latent[:, :, :1]
+    return cond_latent, semantic_images
 
 
 class HYOmniWeavingVAE(comfy.sd.VAE):
@@ -488,13 +547,15 @@ class HYOmniWeavingUNetLoader(io.ComfyNode):
         sd, converted, partial = _convert_split_hy_omniweaving_attention_qkv(sd, strict_mode=strict_mode)
         mm_in_sd = extract_hy_omniweaving_mm_in_state_dict(sd)
         if len(mm_in_sd) > 0:
+            linear_1_norm = _norm_of(mm_in_sd.get("linear_1.weight"))
+            linear_2_norm = _norm_of(mm_in_sd.get("linear_2.weight"))
             _debug_log(
                 "unet loader detected mm_in tensors count=%s source_linear1_shape=%s source_linear1_norm=%.6f source_linear2_shape=%s source_linear2_norm=%.6f",
                 len(mm_in_sd),
                 _shape_of(mm_in_sd.get("linear_1.weight")),
-                _norm_of(mm_in_sd.get("linear_1.weight")) or -1.0,
+                linear_1_norm if linear_1_norm is not None else -1.0,
                 _shape_of(mm_in_sd.get("linear_2.weight")),
-                _norm_of(mm_in_sd.get("linear_2.weight")) or -1.0,
+                linear_2_norm if linear_2_norm is not None else -1.0,
             )
         if converted > 0:
             logging.info(f"HYOmniWeavingUNetLoader converted {converted} split attention tensors to qkv format.")
@@ -549,6 +610,7 @@ class HYOmniWeavingVAELoader(io.ComfyNode):
 
     @classmethod
     def execute(cls, vae_name) -> io.NodeOutput:
+        ensure_runtime_patches()
         vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
         sd, metadata = comfy.utils.load_torch_file(vae_path, return_metadata=True)
         _debug_log(
@@ -562,6 +624,8 @@ class HYOmniWeavingVAELoader(io.ComfyNode):
 
 
 class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
+    THINK_MAX_EFFECTIVE_NEW_TOKENS = 256
+    THINK_MAX_REWRITE_CHARS = 2048
     TASK_SPECS = {
         "t2v": {
             "prompt_mode": 1,
@@ -614,6 +678,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
                 io.Boolean.Input("setclip", default=True, advanced=True),
                 io.ClipVisionOutput.Input("clip_vision_output", optional=True),
                 io.Image.Input("reference_images", optional=True),
+                io.Image.Input("semantic_images", optional=True),
             ],
             outputs=[
                 io.Conditioning.Output(),
@@ -688,11 +753,11 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         return [mm_projected[i] for i in range(count)]
 
     @staticmethod
-    def _extract_visual_images(reference_images, max_visual_inputs: int):
-        if reference_images is None:
+    def _extract_visual_images(images, max_visual_inputs: int):
+        if images is None:
             return []
-        count = min(reference_images.shape[0], max_visual_inputs)
-        return [reference_images[i:i + 1, :, :, :3] for i in range(count)]
+        count = min(images.shape[0], max_visual_inputs)
+        return [images[i:i + 1, :, :, :3] for i in range(count)]
 
     @staticmethod
     def _require_full_text_path(clip):
@@ -704,23 +769,30 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         )
 
     @staticmethod
-    def _require_visual_inputs(task: str, use_visual_inputs: bool, clip_vision_output, reference_images):
+    def _require_visual_inputs(task: str, use_visual_inputs: bool, clip_vision_output, reference_images, semantic_images):
         if not use_visual_inputs:
             return
         if task not in ("i2v", "interpolation", "reference2v", "editing", "tiv2v"):
+            return
+        if semantic_images is not None and semantic_images.shape[0] > 0:
             return
         if reference_images is not None and reference_images.shape[0] > 0:
             return
         if clip_vision_output is not None:
             return
         raise ValueError(
-            f"Task '{task}' with use_visual_inputs=True requires reference_images or clip_vision_output for HY-OmniWeaving parity."
+            f"Task '{task}' with use_visual_inputs=True requires semantic_images, reference_images, or clip_vision_output for HY-OmniWeaving parity."
         )
 
     @classmethod
     def _rewrite_prompt_with_think(cls, clip, prompt, task, image_embeds, visual_images, max_new_tokens: int) -> str:
+        if not isinstance(prompt, str):
+            raise ValueError("Think mode currently requires a single string prompt.")
         if task not in ("t2v", "i2v", "interpolation"):
             raise ValueError("Think mode is currently intended only for t2v, i2v, or interpolation tasks.")
+        if max_new_tokens <= 0:
+            return prompt
+        effective_max_new_tokens = min(max_new_tokens, cls.THINK_MAX_EFFECTIVE_NEW_TOKENS)
 
         if task == "i2v":
             expand_prefix = "Here is a concise description of the target video starting with the given image: "
@@ -733,21 +805,42 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             expand_postfix = " Please generate a more detailed description based on the short description."
 
         think_prompt = f"{expand_prefix}{prompt}{expand_postfix}"
-        think_visual_count = len(visual_images) if len(visual_images) > 0 else len(image_embeds)
+        think_visual_images = cls._prepare_think_visual_images(visual_images)
+        think_visual_count = len(think_visual_images) if len(think_visual_images) > 0 else len(image_embeds)
         think_template = cls._build_think_template(task, think_visual_count)
         tokens = cls._tokenize_with_template(
             clip,
             think_prompt,
             think_template,
             image_embeds,
-            visual_images=visual_images if len(visual_images) > 0 else None,
+            visual_images=think_visual_images if len(think_visual_images) > 0 else None,
         )
 
-        generated = clip.generate(tokens, do_sample=False, max_length=max_new_tokens)
-        generated_text = clip.decode(generated).strip()
+        generated = clip.generate(tokens, do_sample=False, max_length=effective_max_new_tokens)
+        generated_text = cls._decode_generated_text(clip, generated, tokens)
+        _debug_log(
+            "think rewrite task=%s original_chars=%s generated_chars=%s visual_inputs=%s",
+            task,
+            len(prompt),
+            len(generated_text),
+            think_visual_count,
+        )
         if len(generated_text) == 0:
             return prompt
-        return f"{prompt} Here is a more detailed description. {generated_text}"
+        if len(generated_text) > cls.THINK_MAX_REWRITE_CHARS:
+            logging.warning(
+                "HYOmniWeavingTextEncode rejected runaway think rewrite for task '%s' because generated text was too long (%s chars).",
+                task,
+                len(generated_text),
+            )
+            return prompt
+        rewritten = f"{prompt} Here is a more detailed description. {generated_text}"
+        _debug_log(
+            "think rewrite result task=%s rewritten_chars=%s",
+            task,
+            len(rewritten),
+        )
+        return rewritten
 
     @staticmethod
     def _parse_deepstack_layers(deepstack_layers: str):
@@ -762,7 +855,56 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         return values
 
     @staticmethod
-    def _encode_with_parity_options(clip, tokens, deepstack_layers, setclip):
+    def _resize_visual_for_think(image: torch.Tensor, max_side: int = 560):
+        if image.ndim != 4:
+            return image
+        _, height, width, channels = image.shape
+        if channels < 1 or max(height, width) <= max_side:
+            return image[:, :, :, :3]
+
+        scale = max_side / max(height, width)
+        resized_height = max(1, int(round(height * scale)))
+        resized_width = max(1, int(round(width * scale)))
+        resized = F.interpolate(
+            image[:, :, :, :3].movedim(-1, 1),
+            size=(resized_height, resized_width),
+            mode="bilinear",
+            align_corners=False,
+        ).movedim(1, -1)
+        return resized
+
+    @classmethod
+    def _prepare_think_visual_images(cls, visual_images):
+        return [cls._resize_visual_for_think(image) for image in visual_images]
+
+    @staticmethod
+    def _decode_generated_text(clip, generated, tokens) -> str:
+        decode_input = generated
+        if torch.is_tensor(generated) and generated.ndim >= 2:
+            decode_input = generated[0]
+        elif isinstance(generated, (list, tuple)) and len(generated) == 1:
+            decode_input = generated[0]
+
+        token_input_ids = tokens.get("input_ids") if isinstance(tokens, dict) else None
+        token_attention_mask = tokens.get("attention_mask") if isinstance(tokens, dict) else None
+        if (
+            torch.is_tensor(token_input_ids)
+            and torch.is_tensor(token_attention_mask)
+            and torch.is_tensor(decode_input)
+            and decode_input.ndim == 1
+        ):
+            prompt_length = int(token_attention_mask[0].sum().item())
+            prompt_ids = token_input_ids[0, :prompt_length]
+            if prompt_length > 0 and decode_input.shape[0] >= prompt_length and torch.equal(decode_input[:prompt_length], prompt_ids):
+                decode_input = decode_input[prompt_length:]
+
+        try:
+            return clip.decode(decode_input, skip_special_tokens=True).strip()
+        except TypeError:
+            return clip.decode(decode_input).strip()
+
+    @staticmethod
+    def _encode_with_parity_options(clip, tokens, deepstack_layers, setclip, crop_start: int | None, task: str, visual_input_count: int = 0):
         clip.cond_stage_model.reset_clip_options()
         clip.load_model(tokens)
         clip.cond_stage_model.set_clip_options(
@@ -770,6 +912,9 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
                 "execution_device": clip.patcher.load_device,
                 "deepstack": deepstack_layers,
                 "setclip": setclip,
+                "crop_start": crop_start,
+                "task_name": task,
+                "visual_input_count": visual_input_count,
             }
         )
         encoded = clip.cond_stage_model.encode_token_weights(tokens)
@@ -779,7 +924,10 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             pooled_dict.update(encoded[2])
         clip.add_hooks_to_dict(pooled_dict)
         _debug_log(
-            "text encode output cond_shape=%s pooled_keys=%s all_stack_text_states_shape=%s attention_mask_shape=%s",
+            "text encode output task=%s crop_start=%s visual_input_count=%s cond_shape=%s pooled_keys=%s all_stack_text_states_shape=%s attention_mask_shape=%s",
+            task,
+            crop_start,
+            visual_input_count,
             _shape_of(cond),
             sorted(pooled_dict.keys()),
             _shape_of(pooled_dict.get("all_stack_text_states")),
@@ -788,16 +936,18 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         return [[cond, pooled_dict]]
 
     @classmethod
-    def execute(cls, clip, prompt, task, use_visual_inputs, max_visual_inputs, think, think_max_new_tokens, deepstack_layers, setclip, reference_images=None, clip_vision_output=None) -> io.NodeOutput:
+    def execute(cls, clip, prompt, task, use_visual_inputs, max_visual_inputs, think, think_max_new_tokens, deepstack_layers, setclip, reference_images=None, semantic_images=None, clip_vision_output=None) -> io.NodeOutput:
+        ensure_runtime_patches()
         ensure_hy_omniweaving_text_encoder_support(clip)
         cls._require_full_text_path(clip)
-        cls._require_visual_inputs(task, use_visual_inputs, clip_vision_output, reference_images)
+        cls._require_visual_inputs(task, use_visual_inputs, clip_vision_output, reference_images, semantic_images)
         vision_shapes = _clip_vision_shapes(clip_vision_output)
-        visual_images = cls._extract_visual_images(reference_images, max_visual_inputs) if use_visual_inputs else []
+        visual_inputs = semantic_images if semantic_images is not None else reference_images
+        visual_images = cls._extract_visual_images(visual_inputs, max_visual_inputs) if use_visual_inputs else []
         image_embeds = []
         visual_source = "none"
         if len(visual_images) > 0:
-            visual_source = "reference_images"
+            visual_source = "semantic_images" if semantic_images is not None else "reference_images"
         elif use_visual_inputs:
             image_embeds = cls._extract_image_embeds(clip_vision_output, max_visual_inputs)
             if len(image_embeds) > 0:
@@ -828,7 +978,9 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             template = cls._build_template(task, len(visual_images), add_generation_prompt=True)
         tokens = cls._tokenize_with_template(clip, prompt, template, image_embeds, visual_images=visual_images if len(visual_images) > 0 else None)
         deepstack = cls._parse_deepstack_layers(deepstack_layers)
-        return io.NodeOutput(cls._encode_with_parity_options(clip, tokens, deepstack, setclip))
+        crop_start = cls._task_crop_start(task)
+        visual_input_count = len(visual_images) if len(visual_images) > 0 else len(image_embeds)
+        return io.NodeOutput(cls._encode_with_parity_options(clip, tokens, deepstack, setclip, crop_start, task, visual_input_count))
 
 
 class HunyuanClipVisionOutputConcat(io.ComfyNode):
@@ -891,6 +1043,31 @@ class HYOmniWeavingImagePrep(io.ComfyNode):
     def execute(cls, reference_images, width, height) -> io.NodeOutput:
         prepared = _prepare_omniweaving_images(reference_images, width, height)
         return io.NodeOutput(prepared)
+
+
+class HYOmniWeavingI2VSemanticImages(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="HYOmniWeavingI2VSemanticImages",
+            display_name="HY OmniWeaving I2V Semantic Images",
+            category="conditioning/video_models",
+            description="Derive OmniWeaving-style i2v semantic images through the VAE roundtrip so the same semantic frame can feed text-side multimodal input and CLIP-Vision encoding.",
+            inputs=[
+                io.Vae.Input("vae"),
+                io.Image.Input("reference_images"),
+                io.Int.Input("width", default=848, min=16, max=8192, step=16),
+                io.Int.Input("height", default=480, min=16, max=8192, step=16),
+            ],
+            outputs=[
+                io.Image.Output(display_name="semantic_images"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, vae, reference_images, width, height) -> io.NodeOutput:
+        semantic_images = _derive_i2v_semantic_conditioning(vae, reference_images, width, height, latent_length=1)[1]
+        return io.NodeOutput(semantic_images)
 
 
 class HunyuanVideo15OmniConditioning(io.ComfyNode):
@@ -961,21 +1138,17 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
             _clip_vision_shapes(clip_vision_output),
         )
 
-        if task == "t2v":
-            if clip_vision_output is not None:
-                positive = node_helpers.conditioning_set_values(positive, {"clip_vision_output": clip_vision_output})
-                negative = node_helpers.conditioning_set_values(negative, {"clip_vision_output": clip_vision_output})
-            return io.NodeOutput(positive, negative, {"samples": latent})
-
         cond_latent = torch.zeros_like(latent[:1])
         omni_mask = torch.zeros((latent_length,), device=cond_latent.device, dtype=cond_latent.dtype)
-
-        if task == "i2v":
+        guiding_frame_index = None
+        if task == "t2v":
+            pass
+        elif task == "i2v":
             if reference_images is None or reference_images.shape[0] < 1:
                 raise ValueError("Task i2v requires at least one reference image.")
-            encoded = cls._encode_single_image(vae, reference_images, width, height)
-            cls._assign_frame(cond_latent, encoded, 0)
+            cond_latent = _derive_i2v_semantic_conditioning(vae, reference_images, width, height, latent_length)[0]
             omni_mask[0] = 1.0
+            guiding_frame_index = 0
         elif task == "interpolation":
             if reference_images is None or reference_images.shape[0] < 2:
                 raise ValueError("Task interpolation requires at least two reference images.")
@@ -1019,12 +1192,26 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
         concat_mask = (1.0 - omni_mask).view(1, 1, latent_length, 1, 1).expand(
             cond_latent.shape[0], 1, latent_length, cond_latent.shape[-2], cond_latent.shape[-1]
         ).to(cond_latent.dtype)
-
-        positive = node_helpers.conditioning_set_values(positive, {"concat_latent_image": cond_latent, "concat_mask": concat_mask})
-        negative = node_helpers.conditioning_set_values(negative, {"concat_latent_image": cond_latent, "concat_mask": concat_mask})
-        if clip_vision_output is not None:
+        _debug_log(
+            "conditioning output task=%s cond_latent_shape=%s cond_latent_norm=%s concat_mask_shape=%s concat_mask_sum=%s",
+            task,
+            _shape_of(cond_latent),
+            _norm_of(cond_latent),
+            _shape_of(concat_mask),
+            float(concat_mask.sum().item()) if torch.is_tensor(concat_mask) else None,
+        )
+        cond_values = {"concat_latent_image": cond_latent, "concat_mask": concat_mask}
+        if guiding_frame_index is not None:
+            cond_values["guiding_frame_index"] = guiding_frame_index
+        positive = node_helpers.conditioning_set_values(positive, cond_values)
+        negative = node_helpers.conditioning_set_values(negative, cond_values)
+        if clip_vision_output is not None and task != "t2v":
             positive = node_helpers.conditioning_set_values(positive, {"clip_vision_output": clip_vision_output})
             negative = node_helpers.conditioning_set_values(negative, {"clip_vision_output": clip_vision_output})
+        elif clip_vision_output is not None:
+            logging.warning(
+                "HYOmniWeavingConditioning ignored clip_vision_output for task 't2v' to keep text-only generation isolated."
+            )
 
         return io.NodeOutput(positive, negative, {"samples": latent})
 
@@ -1038,6 +1225,7 @@ class HYOmniWeavingExtension(ComfyExtension):
             HYOmniWeavingVAELoader,
             TextEncodeHunyuanVideo15Omni,
             HYOmniWeavingImagePrep,
+            HYOmniWeavingI2VSemanticImages,
             HunyuanClipVisionOutputConcat,
             HunyuanVideo15OmniConditioning,
         ]
