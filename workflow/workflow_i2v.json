@@ -187,21 +187,22 @@
     },
     {
       "id": 16,
-      "type": "CLIPVisionLoader",
-      "pos": [-416.5076842078905, 646.3119449072899],
-      "size": [270, 58],
+      "type": "HYOmniWeavingReduxVisionEncode",
+      "pos": [-250.04464004379082, 593.7274716374795],
+      "size": [343.20001220703125, 150],
       "flags": {},
-      "order": 4,
+      "order": 10,
       "mode": 0,
-      "inputs": [],
-      "outputs": [{"name": "CLIP_VISION", "type": "CLIP_VISION", "links": [13]}],
+      "inputs": [
+        {"name": "images", "type": "IMAGE", "link": 38}
+      ],
+      "outputs": [{"name": "CLIP_VISION_OUTPUT", "type": "CLIP_VISION_OUTPUT", "links": [21, 28, 29]}],
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.18.1",
-        "Node name for S&R": "CLIPVisionLoader",
-        "ue_properties": {"widget_ue_connectable": {}, "version": "7.8", "input_ue_unconnectable": {}}
+        "aux_id": "Shiba-2-shiba/hy_omniweaving_comfyui_unofficial",
+        "ver": "c95a06717f536d547ecb953b9753e313b92a35b5",
+        "Node name for S&R": "HYOmniWeavingReduxVisionEncode"
       },
-      "widgets_values": ["sigclip_vision_patch14_384.safetensors"]
+      "widgets_values": ["image_encoder.safetensors", "image_embedder.safetensors", "center", "default"]
     },
     {
       "id": 6,
@@ -305,27 +306,6 @@
       "widgets_values": ["260407-003439_00001__20260407-003442_1570657_76611a73.png", "image"]
     },
     {
-      "id": 17,
-      "type": "CLIPVisionEncode",
-      "pos": [-41.04464004379082, 620.7274716374795],
-      "size": [267.791015625, 78],
-      "flags": {},
-      "order": 10,
-      "mode": 0,
-      "inputs": [
-        {"name": "clip_vision", "type": "CLIP_VISION", "link": 13},
-        {"name": "image", "type": "IMAGE", "link": 38}
-      ],
-      "outputs": [{"name": "CLIP_VISION_OUTPUT", "type": "CLIP_VISION_OUTPUT", "links": [21, 28, 29]}],
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.18.1",
-        "Node name for S&R": "CLIPVisionEncode",
-        "ue_properties": {"widget_ue_connectable": {}, "version": "7.8", "input_ue_unconnectable": {}}
-      },
-      "widgets_values": ["center"]
-    },
-    {
       "id": 22,
       "type": "HYOmniWeavingVAELoader",
       "pos": [-89.79276331370998, 153.80439937423517],
@@ -420,21 +400,20 @@
     [10, 13, 0, 8, 0, "NOISE"],
     [11, 14, 0, 8, 2, "SAMPLER"],
     [12, 4, 2, 8, 4, "LATENT"],
-    [13, 16, 0, 17, 0, "CLIP_VISION"],
     [18, 8, 0, 10, 0, "LATENT"],
-    [21, 17, 0, 4, 5, "CLIP_VISION_OUTPUT"],
+    [21, 16, 0, 4, 5, "CLIP_VISION_OUTPUT"],
     [25, 22, 0, 4, 2, "VAE"],
     [26, 22, 0, 10, 1, "VAE"],
     [27, 23, 0, 6, 0, "MODEL"],
-    [28, 17, 0, 24, 1, "CLIP_VISION_OUTPUT"],
-    [29, 17, 0, 25, 1, "CLIP_VISION_OUTPUT"],
+    [28, 16, 0, 24, 1, "CLIP_VISION_OUTPUT"],
+    [29, 16, 0, 25, 1, "CLIP_VISION_OUTPUT"],
     [30, 24, 0, 4, 0, "CONDITIONING"],
     [31, 25, 0, 4, 1, "CONDITIONING"],
     [32, 27, 0, 24, 0, "CLIP"],
     [33, 27, 0, 25, 0, "CLIP"],
     [34, 6, 0, 12, 0, "MODEL"],
     [37, 15, 0, 28, 0, "IMAGE"],
-    [38, 29, 0, 17, 1, "IMAGE"],
+    [38, 29, 0, 16, 0, "IMAGE"],
     [40, 28, 0, 4, 3, "IMAGE"],
     [42, 22, 0, 29, 0, "VAE"],
     [43, 28, 0, 29, 1, "IMAGE"],
