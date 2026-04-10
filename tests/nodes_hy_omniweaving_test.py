@@ -388,11 +388,10 @@ def test_encode_hy_omniweaving_redux_clip_vision_output_combines_encoder_and_emb
     assert torch.all(output.mm_projected[:, :, 0] == 7.0)
 
 
-def test_resolve_redux_model_dir_accepts_clip_vision_relative_model_file(monkeypatch, tmp_path):
+def test_resolve_redux_model_file_accepts_clip_vision_relative_model_file(monkeypatch, tmp_path):
     relative_model = "redux_encoder_test/model.safetensors"
     model_dir = tmp_path / "clip_vision" / "redux_encoder_test"
     model_dir.mkdir(parents=True)
-    (model_dir / "config.json").write_text("{}", encoding="utf-8")
     (model_dir / "model.safetensors").write_bytes(b"stub")
 
     monkeypatch.setattr(
@@ -404,13 +403,46 @@ def test_resolve_redux_model_dir_accepts_clip_vision_relative_model_file(monkeyp
         raising=False,
     )
 
-    resolved = nodes._resolve_redux_model_dir(
+    resolved = nodes._resolve_redux_model_file(
         relative_model,
-        subdirs=("image_encoder",),
-        required_files=("config.json", "model.safetensors"),
+        default_filenames=("model.safetensors",),
     )
 
-    assert resolved == str(model_dir.resolve())
+    assert resolved == str((model_dir / "model.safetensors").resolve())
+
+
+def test_select_siglip_vision_config_uses_bundled_config_when_shapes_match():
+    sd = {
+        "vision_model.embeddings.patch_embedding.weight": torch.zeros((1152, 3, 16, 16)),
+        "vision_model.embeddings.position_embedding.weight": torch.zeros((1024, 1152)),
+        "vision_model.encoder.layers.0.mlp.fc1.weight": torch.zeros((4304, 1152)),
+        "vision_model.encoder.layers.0.layer_norm1.weight": torch.zeros((1152,)),
+        "vision_model.encoder.layers.26.layer_norm1.weight": torch.zeros((1152,)),
+    }
+
+    config = nodes._select_siglip_vision_config(sd)
+
+    assert config["image_size"] == 512
+    assert config["patch_size"] == 16
+    assert config["num_hidden_layers"] == 27
+    assert config["num_attention_heads"] == 16
+
+
+def test_select_redux_embedder_config_falls_back_to_state_dict_when_bundled_mismatches(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "_load_json_file",
+        lambda path: {"redux_dim": 999, "txt_in_features": 999},
+    )
+    sd = {
+        "redux_up.weight": torch.zeros((12288, 1152)),
+        "redux_down.weight": torch.zeros((4096, 12288)),
+    }
+
+    config = nodes._select_redux_embedder_config(sd)
+
+    assert config["redux_dim"] == 1152
+    assert config["txt_in_features"] == 4096
 
 
 def test_hy_omniweaving_redux_vision_encode_node_returns_clip_vision_output(monkeypatch):
