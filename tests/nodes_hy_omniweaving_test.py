@@ -388,6 +388,31 @@ def test_encode_hy_omniweaving_redux_clip_vision_output_combines_encoder_and_emb
     assert torch.all(output.mm_projected[:, :, 0] == 7.0)
 
 
+def test_resolve_redux_model_dir_accepts_clip_vision_relative_model_file(monkeypatch, tmp_path):
+    relative_model = "redux_encoder_test/model.safetensors"
+    model_dir = tmp_path / "clip_vision" / "redux_encoder_test"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.safetensors").write_bytes(b"stub")
+
+    monkeypatch.setattr(
+        nodes.folder_paths,
+        "get_full_path",
+        lambda folder_name, filename: str(model_dir / "model.safetensors")
+        if folder_name == "clip_vision" and filename == relative_model
+        else None,
+        raising=False,
+    )
+
+    resolved = nodes._resolve_redux_model_dir(
+        relative_model,
+        subdirs=("image_encoder",),
+        required_files=("config.json", "model.safetensors"),
+    )
+
+    assert resolved == str(model_dir.resolve())
+
+
 def test_hy_omniweaving_redux_vision_encode_node_returns_clip_vision_output(monkeypatch):
     captured = {}
     fake_output = types.SimpleNamespace(mm_projected=torch.zeros((1, 8, 4096)))
@@ -407,8 +432,8 @@ def test_hy_omniweaving_redux_vision_encode_node_returns_clip_vision_output(monk
     images = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
     out = nodes.HYOmniWeavingReduxVisionEncode.execute(
         images=images,
-        image_encoder_dir="image_encorder",
-        image_embedder_dir="image_embedder",
+        image_encoder_model="image_encorder/model.safetensors",
+        image_embedder_model="image_embedder/diffusion_pytorch_model.safetensors",
         crop="none",
         device="cpu",
     )
@@ -416,8 +441,8 @@ def test_hy_omniweaving_redux_vision_encode_node_returns_clip_vision_output(monk
     assert out[0] is fake_output
     assert captured["args"] == {
         "shape": (1, 512, 512, 3),
-        "image_encoder_dir": "image_encorder",
-        "image_embedder_dir": "image_embedder",
+        "image_encoder_dir": "image_encorder/model.safetensors",
+        "image_embedder_dir": "image_embedder/diffusion_pytorch_model.safetensors",
         "crop": "none",
         "device": "cpu",
     }

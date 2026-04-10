@@ -276,11 +276,33 @@ class _ReduxImageEncoder(nn.Module):
 _HY_OMNIWEAVING_REDUX_VISION_CACHE = {}
 
 
+def _preferred_clip_vision_model_name(*preferred_substrings: str) -> str | None:
+    options = folder_paths.get_filename_list("clip_vision")
+    if len(options) == 0:
+        return None
+    lowered_pairs = [(option, option.lower()) for option in options]
+    for substring in preferred_substrings:
+        lowered_substring = substring.lower()
+        for option, lowered_option in lowered_pairs:
+            if lowered_substring in lowered_option:
+                return option
+    return options[0]
+
+
 def _resolve_redux_model_dir(path: str, *, subdirs: tuple[str, ...], required_files: tuple[str, ...]) -> str:
     if not isinstance(path, str) or len(path.strip()) == 0:
         raise ValueError("Expected a non-empty model directory path.")
 
-    base = path if os.path.isabs(path) else os.path.join(os.path.dirname(__file__), path)
+    base = path
+    if os.path.isfile(base):
+        base = os.path.dirname(base)
+    elif not os.path.isabs(base):
+        full_model_path = folder_paths.get_full_path("clip_vision", path)
+        if full_model_path is not None:
+            base = os.path.dirname(full_model_path)
+        else:
+            base = os.path.join(os.path.dirname(__file__), path)
+
     candidates = [base] + [os.path.join(base, subdir) for subdir in subdirs]
     for candidate in candidates:
         if not os.path.isdir(candidate):
@@ -1208,6 +1230,7 @@ class HunyuanClipVisionOutputConcat(io.ComfyNode):
 class HYOmniWeavingReduxVisionEncode(io.ComfyNode):
     @classmethod
     def define_schema(cls):
+        clip_vision_options = folder_paths.get_filename_list("clip_vision")
         return io.Schema(
             node_id="HYOmniWeavingReduxVisionEncode",
             display_name="HY OmniWeaving Redux Vision Encode",
@@ -1215,8 +1238,16 @@ class HYOmniWeavingReduxVisionEncode(io.ComfyNode):
             description="Encode images with a local SigLIP image encoder plus Redux image embedder and emit a single CLIP_VISION_OUTPUT with mm_projected populated.",
             inputs=[
                 io.Image.Input("images"),
-                io.String.Input("image_encoder_dir", default="image_encorder", advanced=True),
-                io.String.Input("image_embedder_dir", default="image_embedder", advanced=True),
+                io.Combo.Input(
+                    "image_encoder_model",
+                    options=clip_vision_options,
+                    default=_preferred_clip_vision_model_name("image_encorder", "image_encoder", "siglip"),
+                ),
+                io.Combo.Input(
+                    "image_embedder_model",
+                    options=clip_vision_options,
+                    default=_preferred_clip_vision_model_name("image_embedder", "redux"),
+                ),
                 io.Combo.Input("crop", options=["center", "none"], default="center", advanced=True),
                 io.Combo.Input("device", options=["default", "cpu"], default="default", advanced=True),
             ],
@@ -1226,11 +1257,11 @@ class HYOmniWeavingReduxVisionEncode(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, images, image_encoder_dir="image_encorder", image_embedder_dir="image_embedder", crop="center", device="default") -> io.NodeOutput:
+    def execute(cls, images, image_encoder_model, image_embedder_model, crop="center", device="default") -> io.NodeOutput:
         output = _encode_hy_omniweaving_redux_clip_vision_output(
             images=images,
-            image_encoder_dir=image_encoder_dir,
-            image_embedder_dir=image_embedder_dir,
+            image_encoder_dir=image_encoder_model,
+            image_embedder_dir=image_embedder_model,
             crop=crop,
             device=device,
         )
