@@ -337,6 +337,92 @@ def test_extract_image_embeds_uses_mm_projected_when_present():
     assert tuple(embeds[0].shape) == (16, 4096)
 
 
+def test_encode_hy_omniweaving_redux_clip_vision_output_combines_encoder_and_embedder(monkeypatch):
+    class _FakeEncoder:
+        def __call__(self, pixel_values=None, output_hidden_states=False):
+            batch = pixel_values.shape[0]
+            last_hidden = torch.full((batch, 4, 1152), 3.0, dtype=pixel_values.dtype, device=pixel_values.device)
+            penultimate = torch.full((batch, 4, 1152), 2.0, dtype=pixel_values.dtype, device=pixel_values.device)
+            first = torch.full((batch, 4, 1152), 1.0, dtype=pixel_values.dtype, device=pixel_values.device)
+            return types.SimpleNamespace(
+                last_hidden_state=last_hidden,
+                hidden_states=(first, penultimate, last_hidden),
+            )
+
+    class _FakeEmbedder(torch.nn.Module):
+        def forward(self, x):
+            batch, tokens, _ = x.shape
+            out = torch.zeros((batch, tokens, 4096), dtype=x.dtype, device=x.device)
+            out[:, :, 0] = 7.0
+            return out
+
+    monkeypatch.setattr(
+        nodes,
+        "_load_hy_omniweaving_redux_vision_models",
+        lambda image_encoder_dir, image_embedder_dir, device="default": {
+            "encoder": _FakeEncoder(),
+            "embedder": _FakeEmbedder(),
+            "image_size": 512,
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+            "device": torch.device("cpu"),
+            "dtype": torch.float32,
+        },
+    )
+
+    images = torch.rand((2, 240, 160, 3), dtype=torch.float32)
+    output = nodes._encode_hy_omniweaving_redux_clip_vision_output(
+        images=images,
+        image_encoder_dir="image_encorder",
+        image_embedder_dir="image_embedder",
+        crop="center",
+        device="default",
+    )
+
+    assert tuple(output.last_hidden_state.shape) == (2, 4, 1152)
+    assert tuple(output.penultimate_hidden_states.shape) == (2, 4, 1152)
+    assert tuple(output.all_hidden_states.shape) == (2, 3, 4, 1152)
+    assert tuple(output.image_embeds.shape) == (2, 4, 1152)
+    assert tuple(output.mm_projected.shape) == (2, 4, 4096)
+    assert output.image_sizes == [(3, 512, 512), (3, 512, 512)]
+    assert torch.all(output.mm_projected[:, :, 0] == 7.0)
+
+
+def test_hy_omniweaving_redux_vision_encode_node_returns_clip_vision_output(monkeypatch):
+    captured = {}
+    fake_output = types.SimpleNamespace(mm_projected=torch.zeros((1, 8, 4096)))
+
+    def fake_encode(images, image_encoder_dir, image_embedder_dir, crop="center", device="default"):
+        captured["args"] = {
+            "shape": tuple(images.shape),
+            "image_encoder_dir": image_encoder_dir,
+            "image_embedder_dir": image_embedder_dir,
+            "crop": crop,
+            "device": device,
+        }
+        return fake_output
+
+    monkeypatch.setattr(nodes, "_encode_hy_omniweaving_redux_clip_vision_output", fake_encode)
+
+    images = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+    out = nodes.HYOmniWeavingReduxVisionEncode.execute(
+        images=images,
+        image_encoder_dir="image_encorder",
+        image_embedder_dir="image_embedder",
+        crop="none",
+        device="cpu",
+    )
+
+    assert out[0] is fake_output
+    assert captured["args"] == {
+        "shape": (1, 512, 512, 3),
+        "image_encoder_dir": "image_encorder",
+        "image_embedder_dir": "image_embedder",
+        "crop": "none",
+        "device": "cpu",
+    }
+
+
 def test_hy_omniweaving_text_encode_prefers_semantic_images_over_reference_images_for_i2v():
     clip = _ClipStub(has_byt5=True)
     reference_images = torch.zeros((1, 640, 640, 3))
