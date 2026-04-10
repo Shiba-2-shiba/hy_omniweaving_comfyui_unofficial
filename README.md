@@ -6,6 +6,7 @@ Current scope:
 
 - dedicated dual text-encoder loader for OmniWeaving's fine-tuned Qwen2.5-VL plus ByT5
 - dedicated VAE loader path for OmniWeaving-style `AutoencoderKLConv3D` checkpoints
+- dedicated Redux-backed vision encode path for SigLIP image encoder + Redux image embedder checkpoints
 - `i2v` / `t2v` workflow support
 - HY-OmniWeaving-oriented text encoding
 - ByT5/visual-input parity guards
@@ -34,6 +35,7 @@ Current status:
 - `HY OmniWeaving VAE Loader` detects OmniWeaving-style `decoder.conv_in.conv.weight` checkpoints and instantiates a local `AutoencoderKLConv3D`-equivalent model from tracked config instead of relying on generic Comfy VAE fallback paths.
 - `HY OmniWeaving Image Prep` is the blessed image preprocessing step for parity-sensitive `i2v` / `reference2v` style workflows.
 - `HY OmniWeaving I2V Semantic Images` reproduces the original i2v VAE roundtrip so the same semantic first frame can feed CLIP-Vision and text-side multimodal input.
+- `HY OmniWeaving Redux Vision Encode` loads a selected SigLIP image encoder checkpoint plus a selected Redux image embedder checkpoint from `models/clip_vision`, uses bundled tracked configs for the fixed local pair, and falls back to state-dict shape inference when alternate weights do not match those configs.
 - Runtime-patch reduction has started: deepstack `mm_in` is attached loader-side after model load, `all_stack_text_states` is injected by patching `extra_conds` per loaded model instance, text-encoder deepstack/setclip support is applied per loaded clip instance, and early-block deepstack injection is attached through a per-model `DIFFUSION_MODEL` wrapper.
 - Remaining global compatibility patches are applied lazily when the relevant loader/node path is used, not at package import time.
 
@@ -49,7 +51,7 @@ Recommended blessed paths:
   1. reference image
   2. `HY OmniWeaving Image Prep`
   3. `HY OmniWeaving I2V Semantic Images`
-  4. stock ComfyUI CLIP-Vision encode
+  4. `HY OmniWeaving Redux Vision Encode`
   5. `HY OmniWeaving Text Encode`
   6. `HY OmniWeaving Conditioning`
   7. stock ComfyUI sampler / scheduler / CFG
@@ -61,6 +63,7 @@ Recommended blessed paths:
 
 Debugging notes:
 
-- `mm_projected` being `None` is currently expected in the validated `i2v` path because text-side multimodal input is supplied through `semantic_images`, not `clip_vision_output.mm_projected`.
+- In the current validated `i2v` path, text-side multimodal input still prefers explicit `semantic_images` when they are connected, even if `HY OmniWeaving Redux Vision Encode` also populates `clip_vision_output.mm_projected`.
+- `mm_projected` being `None` is no longer expected in the Redux-backed `i2v` workflow, but it can still appear in fallback/legacy CLIP-Vision paths.
 - `unet unexpected: ['mm_in...']` is currently a diagnostic signal, not by itself a failure, because the stock loader ignores OmniWeaving-only `mm_in.*` keys and the custom loader re-attaches them afterward.
 - The previous `i2v` runtime crash caused by an invalid `ref_latent` payload has been removed from the current conditioning path.

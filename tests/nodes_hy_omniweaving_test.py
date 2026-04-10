@@ -337,6 +337,149 @@ def test_extract_image_embeds_uses_mm_projected_when_present():
     assert tuple(embeds[0].shape) == (16, 4096)
 
 
+def test_encode_hy_omniweaving_redux_clip_vision_output_combines_encoder_and_embedder(monkeypatch):
+    class _FakeEncoder:
+        def __call__(self, pixel_values=None, output_hidden_states=False):
+            batch = pixel_values.shape[0]
+            last_hidden = torch.full((batch, 4, 1152), 3.0, dtype=pixel_values.dtype, device=pixel_values.device)
+            penultimate = torch.full((batch, 4, 1152), 2.0, dtype=pixel_values.dtype, device=pixel_values.device)
+            first = torch.full((batch, 4, 1152), 1.0, dtype=pixel_values.dtype, device=pixel_values.device)
+            return types.SimpleNamespace(
+                last_hidden_state=last_hidden,
+                hidden_states=(first, penultimate, last_hidden),
+            )
+
+    class _FakeEmbedder(torch.nn.Module):
+        def forward(self, x):
+            batch, tokens, _ = x.shape
+            out = torch.zeros((batch, tokens, 4096), dtype=x.dtype, device=x.device)
+            out[:, :, 0] = 7.0
+            return out
+
+    monkeypatch.setattr(
+        nodes,
+        "_load_hy_omniweaving_redux_vision_models",
+        lambda image_encoder_dir, image_embedder_dir, device="default": {
+            "encoder": _FakeEncoder(),
+            "embedder": _FakeEmbedder(),
+            "image_size": 512,
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+            "device": torch.device("cpu"),
+            "dtype": torch.float32,
+        },
+    )
+
+    images = torch.rand((2, 240, 160, 3), dtype=torch.float32)
+    output = nodes._encode_hy_omniweaving_redux_clip_vision_output(
+        images=images,
+        image_encoder_dir="image_encorder",
+        image_embedder_dir="image_embedder",
+        crop="center",
+        device="default",
+    )
+
+    assert tuple(output.last_hidden_state.shape) == (2, 4, 1152)
+    assert tuple(output.penultimate_hidden_states.shape) == (2, 4, 1152)
+    assert tuple(output.all_hidden_states.shape) == (2, 3, 4, 1152)
+    assert tuple(output.image_embeds.shape) == (2, 4, 1152)
+    assert tuple(output.mm_projected.shape) == (2, 4, 4096)
+    assert output.image_sizes == [(3, 512, 512), (3, 512, 512)]
+    assert torch.all(output.mm_projected[:, :, 0] == 7.0)
+
+
+def test_resolve_redux_model_file_accepts_clip_vision_relative_model_file(monkeypatch, tmp_path):
+    relative_model = "redux_encoder_test/model.safetensors"
+    model_dir = tmp_path / "clip_vision" / "redux_encoder_test"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.safetensors").write_bytes(b"stub")
+
+    monkeypatch.setattr(
+        nodes.folder_paths,
+        "get_full_path",
+        lambda folder_name, filename: str(model_dir / "model.safetensors")
+        if folder_name == "clip_vision" and filename == relative_model
+        else None,
+        raising=False,
+    )
+
+    resolved = nodes._resolve_redux_model_file(
+        relative_model,
+        default_filenames=("model.safetensors",),
+    )
+
+    assert resolved == str((model_dir / "model.safetensors").resolve())
+
+
+def test_select_siglip_vision_config_uses_bundled_config_when_shapes_match():
+    sd = {
+        "vision_model.embeddings.patch_embedding.weight": torch.zeros((1152, 3, 16, 16)),
+        "vision_model.embeddings.position_embedding.weight": torch.zeros((1024, 1152)),
+        "vision_model.encoder.layers.0.mlp.fc1.weight": torch.zeros((4304, 1152)),
+        "vision_model.encoder.layers.0.layer_norm1.weight": torch.zeros((1152,)),
+        "vision_model.encoder.layers.26.layer_norm1.weight": torch.zeros((1152,)),
+    }
+
+    config = nodes._select_siglip_vision_config(sd)
+
+    assert config["image_size"] == 512
+    assert config["patch_size"] == 16
+    assert config["num_hidden_layers"] == 27
+    assert config["num_attention_heads"] == 16
+
+
+def test_select_redux_embedder_config_falls_back_to_state_dict_when_bundled_mismatches(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "_load_json_file",
+        lambda path: {"redux_dim": 999, "txt_in_features": 999},
+    )
+    sd = {
+        "redux_up.weight": torch.zeros((12288, 1152)),
+        "redux_down.weight": torch.zeros((4096, 12288)),
+    }
+
+    config = nodes._select_redux_embedder_config(sd)
+
+    assert config["redux_dim"] == 1152
+    assert config["txt_in_features"] == 4096
+
+
+def test_hy_omniweaving_redux_vision_encode_node_returns_clip_vision_output(monkeypatch):
+    captured = {}
+    fake_output = types.SimpleNamespace(mm_projected=torch.zeros((1, 8, 4096)))
+
+    def fake_encode(images, image_encoder_dir, image_embedder_dir, crop="center", device="default"):
+        captured["args"] = {
+            "shape": tuple(images.shape),
+            "image_encoder_dir": image_encoder_dir,
+            "image_embedder_dir": image_embedder_dir,
+            "crop": crop,
+            "device": device,
+        }
+        return fake_output
+
+    monkeypatch.setattr(nodes, "_encode_hy_omniweaving_redux_clip_vision_output", fake_encode)
+
+    images = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+    out = nodes.HYOmniWeavingReduxVisionEncode.execute(
+        images=images,
+        image_encoder_model="image_encorder/model.safetensors",
+        image_embedder_model="image_embedder/diffusion_pytorch_model.safetensors",
+        crop="none",
+        device="cpu",
+    )
+
+    assert out[0] is fake_output
+    assert captured["args"] == {
+        "shape": (1, 512, 512, 3),
+        "image_encoder_dir": "image_encorder/model.safetensors",
+        "image_embedder_dir": "image_embedder/diffusion_pytorch_model.safetensors",
+        "crop": "none",
+        "device": "cpu",
+    }
+
+
 def test_hy_omniweaving_text_encode_prefers_semantic_images_over_reference_images_for_i2v():
     clip = _ClipStub(has_byt5=True)
     reference_images = torch.zeros((1, 640, 640, 3))
@@ -1188,6 +1331,35 @@ def test_hy_omniweaving_text_encoder_support_preserves_nonempty_t2v_cond():
 
     assert tuple(cond.shape) == (1, 8, 2)
     assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 8, 2)
+
+
+def test_hy_omniweaving_text_encoder_support_applies_setclip_to_cond_and_deepstack():
+    clip = _ClipStub(has_byt5=True)
+
+    def encode_token_weights(tokens):
+        return (
+            torch.arange(1 * 7 * 2, dtype=torch.float32).reshape(1, 7, 2),
+            torch.zeros((1, 2)),
+            {},
+        )
+
+    def qwen_encode_token_weights(token_weight_pairs):
+        qwen_out = torch.ones((1, 3, 9, 2))
+        qwen_extra = {"attention_mask": torch.ones((1, 9))}
+        return qwen_out, None, qwen_extra
+
+    clip.cond_stage_model.encode_token_weights = encode_token_weights
+    clip.cond_stage_model.qwen25_7b.encode_token_weights = qwen_encode_token_weights
+    runtime_patches.ensure_hy_omniweaving_text_encoder_support(clip)
+    clip.cond_stage_model.set_clip_options({"deepstack": [8, 16], "setclip": True, "crop_start": 2, "task_name": "i2v"})
+
+    cond, _, extra = clip.cond_stage_model.encode_token_weights(
+        {"qwen25_7b": [[(151644, 1.0), (151644, 1.0), (11, 1.0), (12, 1.0), (151653, 1.0), (21, 1.0), (22, 1.0), (23, 1.0), (24, 1.0)]]}
+    )
+
+    assert tuple(cond.shape) == (1, 4, 2)
+    assert "attention_mask" not in extra
+    assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 4, 2)
 
 
 def test_ensure_hy_omniweaving_text_encoder_support_is_idempotent():

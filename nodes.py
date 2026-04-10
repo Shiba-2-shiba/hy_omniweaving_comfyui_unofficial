@@ -4,6 +4,7 @@ import math
 import node_helpers
 import os
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import comfy.clip_vision
 import comfy.model_management
@@ -260,6 +261,334 @@ def _filter_known_optional_vae_missing_keys(missing_keys):
 
 def _prepare_omniweaving_images(images: torch.Tensor, width: int, height: int):
     return comfy.utils.common_upscale(images.movedim(-1, 1), width, height, "lanczos", "center").movedim(1, -1)
+
+
+class _ReduxImageEncoder(nn.Module):
+    def __init__(self, redux_dim: int = 1152, txt_in_features: int = 4096):
+        super().__init__()
+        self.redux_up = nn.Linear(redux_dim, txt_in_features * 3)
+        self.redux_down = nn.Linear(txt_in_features * 3, txt_in_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.redux_down(F.silu(self.redux_up(x)))
+
+
+_HY_OMNIWEAVING_REDUX_VISION_CACHE = {}
+
+
+def _preferred_clip_vision_model_name(*preferred_substrings: str) -> str | None:
+    options = folder_paths.get_filename_list("clip_vision")
+    if len(options) == 0:
+        return None
+    lowered_pairs = [(option, option.lower()) for option in options]
+    for substring in preferred_substrings:
+        lowered_substring = substring.lower()
+        for option, lowered_option in lowered_pairs:
+            if lowered_substring in lowered_option:
+                return option
+    return options[0]
+
+
+def _load_json_file(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _bundled_redux_config_path(filename: str) -> str:
+    return os.path.join(os.path.dirname(__file__), "configs", filename)
+
+
+def _resolve_redux_model_file(path: str, *, default_filenames: tuple[str, ...]) -> str:
+    if not isinstance(path, str) or len(path.strip()) == 0:
+        raise ValueError("Expected a non-empty model path.")
+
+    candidates = []
+    if os.path.isabs(path):
+        candidates.append(path)
+    else:
+        full_model_path = folder_paths.get_full_path("clip_vision", path)
+        if full_model_path is not None:
+            candidates.append(full_model_path)
+        candidates.append(os.path.join(os.path.dirname(__file__), path))
+
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+        if os.path.isdir(candidate):
+            for default_filename in default_filenames:
+                default_path = os.path.join(candidate, default_filename)
+                if os.path.isfile(default_path):
+                    return os.path.abspath(default_path)
+
+    raise FileNotFoundError(
+        f"Could not find a compatible model file for '{path}'. "
+        f"Expected a file directly or one of {default_filenames} inside the selected directory."
+    )
+
+
+def _infer_siglip_attention_heads(hidden_size: int) -> int:
+    for preferred in (16, 12, 24, 18, 8):
+        if hidden_size % preferred == 0:
+            return preferred
+    return 16 if hidden_size >= 1024 else 12
+
+
+def _infer_siglip_vision_config_from_state_dict(sd: dict) -> dict:
+    patch_embedding = sd.get("vision_model.embeddings.patch_embedding.weight")
+    position_embedding = sd.get("vision_model.embeddings.position_embedding.weight")
+    mlp_fc1 = sd.get("vision_model.encoder.layers.0.mlp.fc1.weight")
+    layer_indices = []
+    for key in sd.keys():
+        if not key.startswith("vision_model.encoder.layers."):
+            continue
+        parts = key.split(".")
+        if len(parts) < 4:
+            continue
+        try:
+            layer_indices.append(int(parts[3]))
+        except ValueError:
+            continue
+
+    if not torch.is_tensor(patch_embedding) or not torch.is_tensor(position_embedding) or not torch.is_tensor(mlp_fc1):
+        raise ValueError("Could not infer SigLIP config from state_dict; expected patch embedding, position embedding, and MLP tensors.")
+
+    patch_size = int(patch_embedding.shape[-1])
+    num_channels = int(patch_embedding.shape[1]) if patch_embedding.ndim >= 4 else 3
+    hidden_size = int(mlp_fc1.shape[1])
+    intermediate_size = int(mlp_fc1.shape[0])
+    token_count = int(position_embedding.shape[0])
+    side_tokens = int(round(math.sqrt(token_count)))
+    if side_tokens * side_tokens != token_count:
+        adjusted = int(round(math.sqrt(max(1, token_count - 1))))
+        if adjusted * adjusted == token_count - 1:
+            side_tokens = adjusted
+        else:
+            raise ValueError(f"Unsupported SigLIP position embedding length {token_count}; cannot infer image_size cleanly.")
+
+    return {
+        "architectures": ["SiglipVisionModel"],
+        "attention_dropout": 0.0,
+        "hidden_act": "gelu_pytorch_tanh",
+        "hidden_size": hidden_size,
+        "image_size": side_tokens * patch_size,
+        "intermediate_size": intermediate_size,
+        "layer_norm_eps": 1e-06,
+        "model_type": "siglip_vision_model",
+        "num_attention_heads": _infer_siglip_attention_heads(hidden_size),
+        "num_channels": num_channels,
+        "num_hidden_layers": (max(layer_indices) + 1) if len(layer_indices) > 0 else 0,
+        "patch_size": patch_size,
+    }
+
+
+def _select_siglip_vision_config(sd: dict) -> dict:
+    inferred = _infer_siglip_vision_config_from_state_dict(sd)
+    bundled = _load_json_file(_bundled_redux_config_path("redux_image_encoder_config.json"))
+    compare_keys = (
+        "hidden_size",
+        "image_size",
+        "intermediate_size",
+        "num_attention_heads",
+        "num_channels",
+        "num_hidden_layers",
+        "patch_size",
+    )
+    if all(int(bundled.get(key, -1)) == int(inferred.get(key, -2)) for key in compare_keys):
+        merged = inferred.copy()
+        merged.update(bundled)
+        return merged
+    return inferred
+
+
+def _infer_redux_embedder_config_from_state_dict(sd: dict) -> dict:
+    redux_up = sd.get("redux_up.weight")
+    redux_down = sd.get("redux_down.weight")
+    if not torch.is_tensor(redux_up) or not torch.is_tensor(redux_down):
+        raise ValueError("Could not infer Redux embedder config from state_dict; expected redux_up.weight and redux_down.weight.")
+
+    return {
+        "_class_name": "ReduxImageEncoder",
+        "redux_dim": int(redux_up.shape[1]),
+        "txt_in_features": int(redux_down.shape[0]),
+    }
+
+
+def _select_redux_embedder_config(sd: dict) -> dict:
+    inferred = _infer_redux_embedder_config_from_state_dict(sd)
+    bundled = _load_json_file(_bundled_redux_config_path("redux_image_embedder_config.json"))
+    if (
+        int(bundled.get("redux_dim", -1)) == int(inferred["redux_dim"])
+        and int(bundled.get("txt_in_features", -1)) == int(inferred["txt_in_features"])
+    ):
+        merged = inferred.copy()
+        merged.update(bundled)
+        return merged
+    return inferred
+
+
+def _redux_target_device_and_dtype(device: str):
+    if device == "cpu":
+        return torch.device("cpu"), torch.float32
+
+    target_device = comfy.model_management.text_encoder_device()
+    target_dtype = comfy.model_management.text_encoder_dtype(target_device)
+    if target_dtype is None:
+        target_dtype = torch.float32
+    return target_device, target_dtype
+
+
+def _load_hy_omniweaving_redux_vision_models(
+    image_encoder_dir: str,
+    image_embedder_dir: str,
+    device: str = "default",
+):
+    encoder_file = _resolve_redux_model_file(
+        image_encoder_dir,
+        default_filenames=("model.safetensors", "image_encoder.safetensors"),
+    )
+    embedder_file = _resolve_redux_model_file(
+        image_embedder_dir,
+        default_filenames=("diffusion_pytorch_model.safetensors", "image_embedder.safetensors", "model.safetensors"),
+    )
+    target_device, target_dtype = _redux_target_device_and_dtype(device)
+    cache_key = (encoder_file, embedder_file, str(target_device), str(target_dtype))
+    cached = _HY_OMNIWEAVING_REDUX_VISION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    from transformers import SiglipVisionConfig, SiglipVisionModel
+
+    encoder_sd = comfy.utils.load_torch_file(encoder_file, safe_load=True)
+    encoder_config_dict = _select_siglip_vision_config(encoder_sd)
+    encoder_config = SiglipVisionConfig(
+        attention_dropout=encoder_config_dict.get("attention_dropout", 0.0),
+        hidden_act=encoder_config_dict.get("hidden_act", "gelu_pytorch_tanh"),
+        hidden_size=encoder_config_dict["hidden_size"],
+        image_size=encoder_config_dict["image_size"],
+        intermediate_size=encoder_config_dict["intermediate_size"],
+        layer_norm_eps=encoder_config_dict.get("layer_norm_eps", 1e-06),
+        num_attention_heads=encoder_config_dict["num_attention_heads"],
+        num_channels=encoder_config_dict.get("num_channels", 3),
+        num_hidden_layers=encoder_config_dict["num_hidden_layers"],
+        patch_size=encoder_config_dict["patch_size"],
+    )
+    encoder = SiglipVisionModel(encoder_config)
+    missing, unexpected = encoder.load_state_dict(encoder_sd, strict=False)
+    if len(missing) > 0 or len(unexpected) > 0:
+        raise ValueError(
+            f"Failed to load Redux image encoder cleanly. missing={missing} unexpected={unexpected}"
+        )
+    encoder = encoder.eval()
+    encoder.requires_grad_(False)
+    encoder = encoder.to(device=target_device, dtype=target_dtype)
+
+    embedder_sd = comfy.utils.load_torch_file(embedder_file, safe_load=True)
+    embedder_config = _select_redux_embedder_config(embedder_sd)
+    embedder = _ReduxImageEncoder(
+        redux_dim=embedder_config.get("redux_dim", 1152),
+        txt_in_features=embedder_config.get("txt_in_features", 4096),
+    )
+    missing, unexpected = embedder.load_state_dict(embedder_sd, strict=False)
+    if len(missing) > 0 or len(unexpected) > 0:
+        raise ValueError(
+            f"Failed to load Redux image embedder cleanly. missing={missing} unexpected={unexpected}"
+        )
+    embedder = embedder.eval()
+    embedder.requires_grad_(False)
+    embedder = embedder.to(device=target_device, dtype=target_dtype)
+
+    bundle = {
+        "encoder": encoder,
+        "embedder": embedder,
+        "image_size": int(encoder_config_dict.get("image_size", getattr(encoder.config, "image_size", 384))),
+        "image_mean": encoder_config_dict.get("image_mean", [0.5, 0.5, 0.5]),
+        "image_std": encoder_config_dict.get("image_std", [0.5, 0.5, 0.5]),
+        "device": target_device,
+        "dtype": target_dtype,
+    }
+    _HY_OMNIWEAVING_REDUX_VISION_CACHE[cache_key] = bundle
+    return bundle
+
+
+def _preprocess_redux_vision_images(images: torch.Tensor, image_size: int, image_mean, image_std, crop: bool) -> torch.Tensor:
+    if not torch.is_tensor(images) or images.ndim != 4:
+        raise ValueError("HY OmniWeaving Redux Vision Encode expects IMAGE input with shape [B, H, W, C].")
+
+    pixel_values = images[:, :, :, :3].movedim(-1, 1).float().clamp(0.0, 1.0)
+    _, _, height, width = pixel_values.shape
+    if crop:
+        scale = max(image_size / max(1, height), image_size / max(1, width))
+        resized_height = max(image_size, int(round(height * scale)))
+        resized_width = max(image_size, int(round(width * scale)))
+        pixel_values = F.interpolate(
+            pixel_values,
+            size=(resized_height, resized_width),
+            mode="bicubic",
+            align_corners=False,
+        )
+        top = max(0, (resized_height - image_size) // 2)
+        left = max(0, (resized_width - image_size) // 2)
+        pixel_values = pixel_values[:, :, top:top + image_size, left:left + image_size]
+    else:
+        pixel_values = F.interpolate(
+            pixel_values,
+            size=(image_size, image_size),
+            mode="bicubic",
+            align_corners=False,
+        )
+
+    mean = torch.tensor(image_mean, dtype=pixel_values.dtype, device=pixel_values.device).view(1, -1, 1, 1)
+    std = torch.tensor(image_std, dtype=pixel_values.dtype, device=pixel_values.device).view(1, -1, 1, 1)
+    return pixel_values.sub(mean).div(std)
+
+
+def _encode_hy_omniweaving_redux_clip_vision_output(
+    images: torch.Tensor,
+    image_encoder_dir: str,
+    image_embedder_dir: str,
+    crop: str = "center",
+    device: str = "default",
+):
+    bundle = _load_hy_omniweaving_redux_vision_models(
+        image_encoder_dir=image_encoder_dir,
+        image_embedder_dir=image_embedder_dir,
+        device=device,
+    )
+    target_device = bundle["device"]
+    target_dtype = bundle["dtype"]
+    crop_center = crop == "center"
+    pixel_values = _preprocess_redux_vision_images(
+        images.to(device=target_device),
+        image_size=bundle["image_size"],
+        image_mean=bundle["image_mean"],
+        image_std=bundle["image_std"],
+        crop=crop_center,
+    ).to(dtype=target_dtype)
+
+    with torch.no_grad():
+        vision_outputs = bundle["encoder"](pixel_values=pixel_values, output_hidden_states=True)
+        last_hidden_state = vision_outputs.last_hidden_state
+        hidden_states = tuple(vision_outputs.hidden_states or ())
+        penultimate_hidden_states = hidden_states[-2] if len(hidden_states) >= 2 else last_hidden_state
+        all_hidden_states = torch.stack(hidden_states, dim=1) if len(hidden_states) > 0 else last_hidden_state.unsqueeze(1)
+        mm_projected = bundle["embedder"](last_hidden_state)
+
+    output = comfy.clip_vision.Output()
+    intermediate_device = comfy.model_management.intermediate_device()
+    output.last_hidden_state = last_hidden_state.to(intermediate_device)
+    output.penultimate_hidden_states = penultimate_hidden_states.to(intermediate_device)
+    output.all_hidden_states = all_hidden_states.to(intermediate_device)
+    output.image_embeds = last_hidden_state.to(intermediate_device)
+    output.mm_projected = mm_projected.to(intermediate_device)
+    output.image_sizes = [pixel_values.shape[1:]] * pixel_values.shape[0]
+    _debug_log(
+        "redux vision encode crop=%s image_size=%s last_hidden_state=%s mm_projected=%s",
+        crop,
+        bundle["image_size"],
+        _shape_of(output.last_hidden_state),
+        _shape_of(output.mm_projected),
+    )
+    return output
 
 
 def _ensure_video_latent_dims(latent: torch.Tensor) -> torch.Tensor:
@@ -1021,6 +1350,47 @@ class HunyuanClipVisionOutputConcat(io.ComfyNode):
         return io.NodeOutput(merged)
 
 
+class HYOmniWeavingReduxVisionEncode(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        clip_vision_options = folder_paths.get_filename_list("clip_vision")
+        return io.Schema(
+            node_id="HYOmniWeavingReduxVisionEncode",
+            display_name="HY OmniWeaving Redux Vision Encode",
+            category="conditioning/video_models",
+            description="Encode images with a local SigLIP image encoder plus Redux image embedder and emit a single CLIP_VISION_OUTPUT with mm_projected populated.",
+            inputs=[
+                io.Image.Input("images"),
+                io.Combo.Input(
+                    "image_encoder_model",
+                    options=clip_vision_options,
+                    default=_preferred_clip_vision_model_name("image_encorder", "image_encoder", "siglip"),
+                ),
+                io.Combo.Input(
+                    "image_embedder_model",
+                    options=clip_vision_options,
+                    default=_preferred_clip_vision_model_name("image_embedder", "redux"),
+                ),
+                io.Combo.Input("crop", options=["center", "none"], default="center", advanced=True),
+                io.Combo.Input("device", options=["default", "cpu"], default="default", advanced=True),
+            ],
+            outputs=[
+                io.ClipVisionOutput.Output(),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, images, image_encoder_model, image_embedder_model, crop="center", device="default") -> io.NodeOutput:
+        output = _encode_hy_omniweaving_redux_clip_vision_output(
+            images=images,
+            image_encoder_dir=image_encoder_model,
+            image_embedder_dir=image_embedder_model,
+            crop=crop,
+            device=device,
+        )
+        return io.NodeOutput(output)
+
+
 class HYOmniWeavingImagePrep(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -1224,6 +1594,7 @@ class HYOmniWeavingExtension(ComfyExtension):
             HYOmniWeavingUNetLoader,
             HYOmniWeavingVAELoader,
             TextEncodeHunyuanVideo15Omni,
+            HYOmniWeavingReduxVisionEncode,
             HYOmniWeavingImagePrep,
             HYOmniWeavingI2VSemanticImages,
             HunyuanClipVisionOutputConcat,

@@ -69,7 +69,7 @@ The current best-performing path is:
 1. reference image
 2. `HY OmniWeaving Image Prep`
 3. `HY OmniWeaving I2V Semantic Images`
-4. stock ComfyUI CLIP-Vision encode
+4. `HY OmniWeaving Redux Vision Encode`
 5. `HY OmniWeaving Text Encode`
 6. `HY OmniWeaving Conditioning`
 7. stock ComfyUI sampler / scheduler / CFG
@@ -78,8 +78,12 @@ Important confirmed detail:
 
 - `i2v` text-side multimodal input is now intentionally driven by
   `semantic_images`
-- this avoids relying on `clip_vision_output.mm_projected`, which is often
-  absent in the tested workflow
+- the Redux vision node now fills `clip_vision_output.mm_projected`, but the
+  current blessed text path still prefers explicit `semantic_images` when
+  connected
+- the Redux loader uses tracked in-repo configs for the fixed local encoder /
+  embedder pair and falls back to state-dict shape inference when alternate
+  weights do not match those configs
 
 ### 3. The blessed `t2v` path is also viable
 
@@ -157,7 +161,7 @@ This was false for the tested workflow.
 
 Observed:
 
-- `clip_vision_output` was connected
+- in the older stock CLIP-Vision path, `clip_vision_output` was connected
 - `mm_projected` was `None`
 - text-side image embeddings were absent
 
@@ -165,6 +169,8 @@ Conclusion:
 
 - parity-sensitive `i2v` runs must provide actual image input to the text path
 - `semantic_images` is currently the correct practical route
+- populating `mm_projected` through the Redux vision node is still useful for
+  conditioning transport and future text-side fallback paths
 
 ### 2. fp8 quantization was probably killing `mm_in.linear_2`
 

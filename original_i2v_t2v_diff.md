@@ -47,11 +47,12 @@ otherwise:
 |---|---|---|---|---|
 | Sampler / scheduler / CFG | Pipeline-owned | ComfyUI-owned | Good | Keep in ComfyUI |
 | Text encoder weights | Qwen2.5-VL + ByT5 | Dedicated dual loader exists | Good | Keep custom loader |
+| Vision encoder / projector | SigLIP + Redux image embedder | Dedicated Redux vision node exists | Good | Keep custom loader-style path |
 | Task prompt routing | Pipeline `prepare_input(prompt_mode=1..8)` | Custom task templates in `TextEncodeHunyuanVideo15Omni` | Good enough for current `i2v` / `t2v` | Still not byte-for-byte processor parity |
 | Think rewrite | Pipeline AR rewrite for `t2v/i2v/interpolation` | Custom `think` rewrite exists | Partial | Keep custom, refine only if needed |
 | DeepStack text states | Native in original text encoder + transformer | Recreated by runtime patching | Structurally fixed, numerically limited | Transport works, connector weights do not |
 | ByT5 conditioning | Native in original | Uses ComfyUI HunyuanImage path + dual load | Good | Keep on ComfyUI transport path |
-| Vision semantic path | Original pipeline prepares semantic images + vision states together | `Image Prep` + `I2V Semantic Images` + stock CLIP-Vision path | Good for current `i2v` | This is now the blessed path |
+| Vision semantic path | Original pipeline prepares semantic images + vision states together | `Image Prep` + `I2V Semantic Images` + `Redux Vision Encode` | Good for current `i2v` | This is now the blessed path |
 | i2v latent packing | Original task-specific | Custom node implements | Good enough for current `i2v` | Execution issue from invalid `ref_latent` removed |
 | t2v routing | Original has task-aware text path even with no image | Custom text-only path plus explicit zero-conditioning | Good | Keep path thin |
 | VAE | Original `AutoencoderKLConv3D` | Local equivalent exists | Good | Keep custom VAE path |
@@ -66,9 +67,10 @@ otherwise:
 | Text prompt template | Qwen-VL multimodal prompt mode 2 | Custom `i2v` template with original wording and `crop_start=92` metadata | Good enough for current validated path |
 | Visual prompt ingestion | Original text encoder consumes image objects via processor | Current node consumes `semantic_images` for text-side multimodal input | Correct practical direction |
 | Vision image preprocessing | Original pipeline resizes/crops reference image to task bucket before semantic encoding | `HY OmniWeaving Image Prep` performs Lanczos + center crop before semantic and vision paths | Correct practical direction |
+| Vision encoder path | Original pipeline uses SigLIP plus Redux image embedder | `HY OmniWeaving Redux Vision Encode` loads selected encoder/embedder checkpoints from `clip_vision` with bundled-config matching and state-dict fallback | Implemented |
 | Semantic image / latent roundtrip | Original derives semantic image from VAE latent roundtrip | `HY OmniWeaving I2V Semantic Images` reproduces this path | Implemented |
 | Latent conditioning | Original VAE-encodes first frame and builds task mask | `HYOmniWeavingConditioning` builds `concat_latent_image` and `concat_mask` | Implemented and currently working |
-| CLIP-Vision path | Original uses vision states tied to the prepared semantic image | Current blessed workflow uses stock CLIP-Vision on `semantic_images` | Implemented and currently working |
+| Vision output transport | Original uses vision states tied to the prepared semantic image | Current blessed workflow uses Redux-backed `clip_vision_output` while text-side image input still prefers `semantic_images` | Implemented and currently working |
 | Extra guiding path | Original runtime combines multiple guidance mechanisms | Current path uses `guiding_frame_index` but no longer sends the invalid `ref_latent` payload | Fixed execution bug; keep this direction unless runtime contract changes |
 | Remaining parity gap | Original processor stack defines final token slicing | Current path still shows a small crop/setclip token mismatch | Remaining quality/parity task |
 
@@ -108,7 +110,7 @@ shape of the original flow closely enough to generate clear output:
 1. reference image
 2. `HY OmniWeaving Image Prep`
 3. `HY OmniWeaving I2V Semantic Images`
-4. stock CLIP-Vision encode
+4. `HY OmniWeaving Redux Vision Encode`
 5. `HY OmniWeaving Text Encode`
 6. `HY OmniWeaving Conditioning`
 7. stock ComfyUI sampler / scheduler / CFG

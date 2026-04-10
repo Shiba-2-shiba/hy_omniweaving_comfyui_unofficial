@@ -410,6 +410,12 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         setclip_source = "disabled"
         if self.setclip_output:
             setclip_start, setclip_source = _find_setclip_start(tok_pairs, effective_crop_start)
+            if setclip_start > 0:
+                cond, attention_mask = _slice_seq_and_mask(cond, attention_mask, setclip_start)
+                if torch.is_tensor(attention_mask):
+                    extra["attention_mask"] = attention_mask
+                else:
+                    extra.pop("attention_mask", None)
 
         deepstack_hidden_states = _encode_deepstack(self, token_weight_pairs["qwen25_7b"], getattr(self, "crop_start_output", None), template_end)
         if deepstack_hidden_states is not None:

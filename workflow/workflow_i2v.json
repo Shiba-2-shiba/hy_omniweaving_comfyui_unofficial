@@ -1,0 +1,434 @@
+{
+  "id": "7f6f60ef-8d44-4aea-bfc3-cf14a7ef4b72",
+  "revision": 0,
+  "last_node_id": 29,
+  "last_link_id": 45,
+  "nodes": [
+    {
+      "id": 7,
+      "type": "CFGGuider",
+      "pos": [1479.4773619384628, 10.007793571542011],
+      "size": [210, 98],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        {"name": "model", "type": "MODEL", "link": 3},
+        {"name": "positive", "type": "CONDITIONING", "link": 7},
+        {"name": "negative", "type": "CONDITIONING", "link": 8}
+      ],
+      "outputs": [{"name": "GUIDER", "type": "GUIDER", "links": [4]}],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.68",
+        "Node name for S&R": "CFGGuider",
+        "ue_properties": {"widget_ue_connectable": {}, "version": "7.8", "input_ue_unconnectable": {}}
+      },
+      "widgets_values": [6]
+    },
+    {
+      "id": 9,
+      "type": "CreateVideo",
+      "pos": [1934.7669413958436, 97.42743432182759],
+      "size": [210, 80.38363530754543],
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "inputs": [
+        {"name": "images", "type": "IMAGE", "link": 5},
+        {"name": "audio", "shape": 7, "type": "AUDIO", "link": null}
+      ],
+      "outputs": [{"name": "VIDEO", "type": "VIDEO", "links": [6]}],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.68",
+        "Node name for S&R": "CreateVideo",
+        "ue_properties": {"widget_ue_connectable": {}, "version": "7.8", "input_ue_unconnectable": {}}
+      },
+      "widgets_values": [16]
+    },
+    {
+      "id": 10,
+      "type": "VAEDecodeTiled",
+      "pos": [1982.800976247781, 272.3723406323768],
+      "size": [270, 150],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [
+        {"name": "samples", "type": "LATENT", "link": 18},
+        {"name": "vae", "type": "VAE", "link": 26}
+      ],
+      "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [5]}],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.18.1",
+        "Node name for S&R": "VAEDecodeTiled",
+        "ue_properties": {"widget_ue_connectable": {}, "version": "7.8", "input_ue_unconnectable": {}}
+      },
+      "widgets_values": [128, 64, 64, 8]
+    },
+    {
+      "id": 12,
+      "type": "BasicScheduler",
+      "pos": [1280.137124615043, 335.80075163286295],
+      "size": [225.45697567447678, 106],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [{"name": "model", "type": "MODEL", "link": 34}],
+      "outputs": [{"name": "SIGMAS", "type": "SIGMAS", "links": [9]}],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.68",
+        "Node name for S&R": "BasicScheduler",
+        "ue_properties": {"widget_ue_connectable": {}, "version": "7.8", "input_ue_unconnectable": {}}
+      },
+      "widgets_values": ["simple", 20, 1]
+    },
+    {
+      "id": 13,
+      "type": "RandomNoise",
+      "pos": [1295.3594387503795, 500.8727984440097],
+      "size": [212.02552202564812, 82],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [{"name": "NOISE", "type": "NOISE", "links": [10]}],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.68",
+        "Node name for S&R": "RandomNoise",
+        "ue_properties": {"widget_ue_connectable": {}, "version": "7.8", "input_ue_unconnectable": {}}
+      },
+      "widgets_values": [887963123424675, "fixed"],
+      "color": "#2a363b",
+      "bgcolor": "#3f5159"
+    },
+    {
+      "id": 14,
+      "type": "KSamplerSelect",
+      "pos": [1309.6863226424641, 639.8271008765614],
+      "size": [210, 58],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [{"name": "SAMPLER", "type": "SAMPLER", "links": [11]}],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.68",
+        "Node name for S&R": "KSamplerSelect",
+        "ue_properties": {"widget_ue_connectable": {}, "version": "7.8", "input_ue_unconnectable": {}}
+      },
+      "widgets_values": ["res_multistep"]
+    },
+    {
+      "id": 8,
+      "type": "SamplerCustomAdvanced",
+      "pos": [1642.3411230293204, 212.1345946260486],
+      "size": [272.3617858886719, 326],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [
+        {"name": "noise", "type": "NOISE", "link": 10},
+        {"name": "guider", "type": "GUIDER", "link": 4},
+        {"name": "sampler", "type": "SAMPLER", "link": 11},
+        {"name": "sigmas", "type": "SIGMAS", "link": 9},
+        {"name": "latent_image", "type": "LATENT", "link": 12}
+      ],
+      "outputs": [
+        {"name": "output", "type": "LATENT", "slot_index": 0, "links": [18]},
+        {"name": "denoised_output", "type": "LATENT", "links": []}
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.68",
+        "Node name for S&R": "SamplerCustomAdvanced",
+        "ue_properties": {"widget_ue_connectable": {}, "version": "7.8", "input_ue_unconnectable": {}}
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 23,
+      "type": "HYOmniWeavingUNetLoader",
+      "pos": [-98.63871282541426, -42.210012160444464],
+      "size": [303.4263671875, 106],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [{"name": "MODEL", "type": "MODEL", "links": [27]}],
+      "properties": {
+        "aux_id": "Shiba-2-shiba/hy_omniweaving_comfyui_unofficial",
+        "ver": "72d41e150003deb41442ae8a2a3d8b3654b8cbaf",
+        "Node name for S&R": "HYOmniWeavingUNetLoader"
+      },
+      "widgets_values": ["hy_omniweaving_hunyuanvideo15_transformer_fp8_e4m3fn.safetensors", "default", true]
+    },
+    {
+      "id": 27,
+      "type": "HYOmniWeavingTextEncoderLoader",
+      "pos": [-165.80029129849538, 282.60258453651943],
+      "size": [357.026953125, 106],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [{"name": "CLIP", "type": "CLIP", "links": [32, 33]}],
+      "properties": {
+        "aux_id": "Shiba-2-shiba/hy_omniweaving_comfyui_unofficial",
+        "ver": "72d41e150003deb41442ae8a2a3d8b3654b8cbaf",
+        "Node name for S&R": "HYOmniWeavingTextEncoderLoader"
+      },
+      "widgets_values": ["qwen_2.5_vl_7b_finetuned_model.safetensors", "byt5_small_glyphxl_fp16.safetensors", "default"]
+    },
+    {
+      "id": 16,
+      "type": "HYOmniWeavingReduxVisionEncode",
+      "pos": [-250.04464004379082, 593.7274716374795],
+      "size": [343.20001220703125, 150],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {"name": "images", "type": "IMAGE", "link": 38}
+      ],
+      "outputs": [{"name": "CLIP_VISION_OUTPUT", "type": "CLIP_VISION_OUTPUT", "links": [21, 28, 29]}],
+      "properties": {
+        "aux_id": "Shiba-2-shiba/hy_omniweaving_comfyui_unofficial",
+        "ver": "c95a06717f536d547ecb953b9753e313b92a35b5",
+        "Node name for S&R": "HYOmniWeavingReduxVisionEncode"
+      },
+      "widgets_values": ["image_encoder.safetensors", "image_embedder.safetensors", "center", "default"]
+    },
+    {
+      "id": 6,
+      "type": "ModelSamplingSD3",
+      "pos": [1113.4561884083191, -90.2480176612536],
+      "size": [315, 58],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [{"name": "model", "type": "MODEL", "link": 27}],
+      "outputs": [{"name": "MODEL", "type": "MODEL", "slot_index": 0, "links": [3, 34]}],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.68",
+        "Node name for S&R": "ModelSamplingSD3",
+        "ue_properties": {"widget_ue_connectable": {}, "version": "7.8", "input_ue_unconnectable": {}}
+      },
+      "widgets_values": [7]
+    },
+    {
+      "id": 25,
+      "type": "HYOmniWeavingTextEncode",
+      "pos": [424.01423518797844, 628.1667070309255],
+      "size": [400, 316],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {"name": "clip", "type": "CLIP", "link": 33},
+        {"name": "clip_vision_output", "shape": 7, "type": "CLIP_VISION_OUTPUT", "link": 29},
+        {"name": "reference_images", "shape": 7, "type": "IMAGE", "link": null},
+        {"name": "semantic_images", "shape": 7, "type": "IMAGE", "link": 45}
+      ],
+      "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [31]}],
+      "properties": {
+        "aux_id": "Shiba-2-shiba/hy_omniweaving_comfyui_unofficial",
+        "ver": "72d41e150003deb41442ae8a2a3d8b3654b8cbaf",
+        "Node name for S&R": "HYOmniWeavingTextEncode"
+      },
+      "widgets_values": ["low quality, blur, deformed, artifacts, bad anatomy", "i2v", true, 8, false, 1000, "8,16,24", true]
+    },
+    {
+      "id": 24,
+      "type": "HYOmniWeavingTextEncode",
+      "pos": [375.8498154550263, 28.90284313168761],
+      "size": [400, 316],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {"name": "clip", "type": "CLIP", "link": 32},
+        {"name": "clip_vision_output", "shape": 7, "type": "CLIP_VISION_OUTPUT", "link": 28},
+        {"name": "reference_images", "shape": 7, "type": "IMAGE", "link": null},
+        {"name": "semantic_images", "shape": 7, "type": "IMAGE", "link": 44}
+      ],
+      "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [30]}],
+      "properties": {
+        "aux_id": "Shiba-2-shiba/hy_omniweaving_comfyui_unofficial",
+        "ver": "72d41e150003deb41442ae8a2a3d8b3654b8cbaf",
+        "Node name for S&R": "HYOmniWeavingTextEncode"
+      },
+      "widgets_values": ["An anime girl dancing intensely", "i2v", true, 8, false, 1000, "8,16,24", true]
+    },
+    {
+      "id": 11,
+      "type": "SaveVideo",
+      "pos": [2294.7208444562857, 475.5873211167031],
+      "size": [899.882313093954, 997.882313093954],
+      "flags": {},
+      "order": 19,
+      "mode": 0,
+      "inputs": [{"name": "video", "type": "VIDEO", "link": 6}],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.68",
+        "Node name for S&R": "SaveVideo",
+        "ue_properties": {"widget_ue_connectable": {}, "version": "7.8", "input_ue_unconnectable": {}}
+      },
+      "widgets_values": ["video/hunyuan_video_1.5", "auto", "h264"]
+    },
+    {
+      "id": 15,
+      "type": "LoadImage",
+      "pos": [-798.7002315528691, 339.6950687303359],
+      "size": [284, 314],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {"name": "IMAGE", "type": "IMAGE", "links": [37]},
+        {"name": "MASK", "type": "MASK", "links": null}
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.18.1",
+        "Node name for S&R": "LoadImage",
+        "ue_properties": {"widget_ue_connectable": {}, "version": "7.8", "input_ue_unconnectable": {}}
+      },
+      "widgets_values": ["260407-003439_00001__20260407-003442_1570657_76611a73.png", "image"]
+    },
+    {
+      "id": 22,
+      "type": "HYOmniWeavingVAELoader",
+      "pos": [-89.79276331370998, 153.80439937423517],
+      "size": [296.4947265625, 58],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [{"name": "VAE", "type": "VAE", "links": [25, 26, 42]}],
+      "properties": {
+        "aux_id": "Shiba-2-shiba/hy_omniweaving_comfyui_unofficial",
+        "ver": "72d41e150003deb41442ae8a2a3d8b3654b8cbaf",
+        "Node name for S&R": "HYOmniWeavingVAELoader"
+      },
+      "widgets_values": ["hunyuanvideo15_vae_fp32.safetensors"]
+    },
+    {
+      "id": 28,
+      "type": "HYOmniWeavingImagePrep",
+      "pos": [-431.56067279892574, 441.8494645965175],
+      "size": [304.62890625, 82],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [{"name": "reference_images", "type": "IMAGE", "link": 37}],
+      "outputs": [{"name": "prepared_images", "type": "IMAGE", "links": [40, 43]}],
+      "properties": {
+        "aux_id": "Shiba-2-shiba/hy_omniweaving_comfyui_unofficial",
+        "ver": "9eeddf7e0a0269b7f6d9c44329221f364a625101",
+        "Node name for S&R": "HYOmniWeavingImagePrep"
+      },
+      "widgets_values": [640, 640]
+    },
+    {
+      "id": 29,
+      "type": "HYOmniWeavingI2VSemanticImages",
+      "pos": [10.969790099748138, 470.81585389947566],
+      "size": [358.831640625, 102],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {"name": "vae", "type": "VAE", "link": 42},
+        {"name": "reference_images", "type": "IMAGE", "link": 43}
+      ],
+      "outputs": [{"name": "semantic_images", "type": "IMAGE", "links": [38, 44, 45]}],
+      "properties": {
+        "aux_id": "Shiba-2-shiba/hy_omniweaving_comfyui_unofficial",
+        "ver": "60214690f77d0a3501dfc87d46b7daa18f706792",
+        "Node name for S&R": "HYOmniWeavingI2VSemanticImages"
+      },
+      "widgets_values": [640, 640]
+    },
+    {
+      "id": 4,
+      "type": "HYOmniWeavingConditioning",
+      "pos": [910.3962524414062, 242],
+      "size": [303.2076171875, 254],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {"name": "positive", "type": "CONDITIONING", "link": 30},
+        {"name": "negative", "type": "CONDITIONING", "link": 31},
+        {"name": "vae", "type": "VAE", "link": 25},
+        {"name": "reference_images", "shape": 7, "type": "IMAGE", "link": 40},
+        {"name": "condition_video", "shape": 7, "type": "IMAGE", "link": null},
+        {"name": "clip_vision_output", "shape": 7, "type": "CLIP_VISION_OUTPUT", "link": 21}
+      ],
+      "outputs": [
+        {"name": "positive", "type": "CONDITIONING", "links": [7]},
+        {"name": "negative", "type": "CONDITIONING", "links": [8]},
+        {"name": "latent", "type": "LATENT", "links": [12]}
+      ],
+      "properties": {
+        "aux_id": "Shiba-2-shiba/hy_omniweaving_comfyui_unofficial",
+        "ver": "1150426b1eaf89e9224d9ba3224eccdc49a55fa2",
+        "Node name for S&R": "HYOmniWeavingConditioning",
+        "ue_properties": {"widget_ue_connectable": {}, "input_ue_unconnectable": {}, "version": "7.8"}
+      },
+      "widgets_values": ["i2v", 640, 640, 61, 1]
+    }
+  ],
+  "links": [
+    [3, 6, 0, 7, 0, "MODEL"],
+    [4, 7, 0, 8, 1, "GUIDER"],
+    [5, 10, 0, 9, 0, "IMAGE"],
+    [6, 9, 0, 11, 0, "VIDEO"],
+    [7, 4, 0, 7, 1, "CONDITIONING"],
+    [8, 4, 1, 7, 2, "CONDITIONING"],
+    [9, 12, 0, 8, 3, "SIGMAS"],
+    [10, 13, 0, 8, 0, "NOISE"],
+    [11, 14, 0, 8, 2, "SAMPLER"],
+    [12, 4, 2, 8, 4, "LATENT"],
+    [18, 8, 0, 10, 0, "LATENT"],
+    [21, 16, 0, 4, 5, "CLIP_VISION_OUTPUT"],
+    [25, 22, 0, 4, 2, "VAE"],
+    [26, 22, 0, 10, 1, "VAE"],
+    [27, 23, 0, 6, 0, "MODEL"],
+    [28, 16, 0, 24, 1, "CLIP_VISION_OUTPUT"],
+    [29, 16, 0, 25, 1, "CLIP_VISION_OUTPUT"],
+    [30, 24, 0, 4, 0, "CONDITIONING"],
+    [31, 25, 0, 4, 1, "CONDITIONING"],
+    [32, 27, 0, 24, 0, "CLIP"],
+    [33, 27, 0, 25, 0, "CLIP"],
+    [34, 6, 0, 12, 0, "MODEL"],
+    [37, 15, 0, 28, 0, "IMAGE"],
+    [38, 29, 0, 16, 0, "IMAGE"],
+    [40, 28, 0, 4, 3, "IMAGE"],
+    [42, 22, 0, 29, 0, "VAE"],
+    [43, 28, 0, 29, 1, "IMAGE"],
+    [44, 29, 0, 24, 3, "IMAGE"],
+    [45, 29, 0, 25, 3, "IMAGE"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ue_links": [],
+    "ds": {
+      "scale": 0.3969172072167451,
+      "offset": [561.5780950003724, 215.99685382263115]
+    },
+    "frontendVersion": "1.42.8"
+  },
+  "version": 0.4
+}
