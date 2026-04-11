@@ -628,6 +628,96 @@ def test_hy_omniweaving_text_encode_think_resizes_visual_inputs_for_ar_prompt():
     assert tuple(think_images[0].shape[-3:-1]) == (560, 280)
 
 
+def test_hy_omniweaving_text_encode_merge_hidden_merges_cond_and_deepstack(monkeypatch):
+    clip = _ClipStub(has_byt5=True)
+    pooled_base = torch.tensor([[1.0, 2.0]])
+
+    monkeypatch.setattr(nodes, "ensure_runtime_patches", lambda: None)
+    monkeypatch.setattr(nodes, "ensure_hy_omniweaving_text_encoder_support", lambda clip: None)
+
+    def encode_token_weights(tokens):
+        text = tokens["tokens"]
+        is_think = "Make the temporal progression explicit" in text
+        seq = 6 if is_think else 4
+        value = 2.0 if is_think else 1.0
+        pooled = torch.tensor([[9.0, 9.0]]) if is_think else pooled_base
+        return (
+            torch.full((1, seq, 2), value),
+            pooled,
+            {
+                "attention_mask": torch.ones((1, seq)),
+                "all_stack_text_states": torch.full((3, 1, seq, 2), value),
+            },
+        )
+
+    clip.cond_stage_model.encode_token_weights = encode_token_weights
+
+    out = nodes.TextEncodeHunyuanVideo15Omni.execute(
+        clip=clip,
+        prompt="A dancer starts moving",
+        task="t2v",
+        use_visual_inputs=False,
+        max_visual_inputs=8,
+        think=True,
+        think_max_new_tokens=128,
+        think_mode="merge_hidden",
+        think_keep_tokens=3,
+        deepstack_layers="8,16,24",
+        setclip=True,
+        semantic_images=None,
+        clip_vision_output=None,
+    )
+
+    cond, extra = out[0][0]
+    assert len(clip.tokenize_calls) == 2
+    assert not hasattr(clip, "last_generate")
+    assert tuple(cond.shape) == (1, 7, 2)
+    assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 7, 2)
+    assert tuple(extra["attention_mask"].shape) == (1, 7)
+    assert torch.equal(extra["pooled_output"], pooled_base)
+
+
+def test_hy_omniweaving_text_encode_merge_hidden_skips_negative_prompt_like_text(monkeypatch):
+    clip = _ClipStub(has_byt5=True)
+
+    monkeypatch.setattr(nodes, "ensure_runtime_patches", lambda: None)
+    monkeypatch.setattr(nodes, "ensure_hy_omniweaving_text_encoder_support", lambda clip: None)
+
+    def encode_token_weights(tokens):
+        return (
+            torch.ones((1, 4, 2)),
+            torch.zeros((1, 2)),
+            {
+                "attention_mask": torch.ones((1, 4)),
+                "all_stack_text_states": torch.ones((3, 1, 4, 2)),
+            },
+        )
+
+    clip.cond_stage_model.encode_token_weights = encode_token_weights
+
+    out = nodes.TextEncodeHunyuanVideo15Omni.execute(
+        clip=clip,
+        prompt="low quality, blurry artifacts, watermark, bad anatomy",
+        task="t2v",
+        use_visual_inputs=False,
+        max_visual_inputs=8,
+        think=True,
+        think_max_new_tokens=128,
+        think_mode="merge_hidden",
+        think_keep_tokens=3,
+        deepstack_layers="8,16,24",
+        setclip=True,
+        semantic_images=None,
+        clip_vision_output=None,
+    )
+
+    cond, extra = out[0][0]
+    assert len(clip.tokenize_calls) == 1
+    assert not hasattr(clip, "last_generate")
+    assert tuple(cond.shape) == (1, 4, 2)
+    assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 4, 2)
+
+
 def test_decode_generated_text_trims_prompt_prefix_only_when_it_matches():
     clip = _ClipStub(has_byt5=True)
     generated = torch.tensor([[101, 102, 201, 202]])
