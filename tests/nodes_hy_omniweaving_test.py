@@ -628,6 +628,26 @@ def test_hy_omniweaving_text_encode_think_resizes_visual_inputs_for_ar_prompt():
     assert tuple(think_images[0].shape[-3:-1]) == (560, 280)
 
 
+def test_hy_omniweaving_rewrite_suppression_sets_and_clears_transformer_tokens():
+    class _GenerateClip(_ClipStub):
+        def __init__(self):
+            super().__init__(has_byt5=True)
+            self.transformer = types.SimpleNamespace()
+            self.cond_stage_model.qwen25_7b = types.SimpleNamespace(transformer=self.transformer)
+
+        def generate(self, tokens, do_sample=False, max_length=256):
+            self.suppressed_during_generate = tuple(getattr(self.transformer, "_hy_suppressed_token_ids", ()))
+            return [151645]
+
+    clip = _GenerateClip()
+
+    generated = nodes.TextEncodeHunyuanVideo15Omni._generate_with_rewrite_suppression(clip, {"tokens": "x"}, 8)
+
+    assert generated == [151645]
+    assert 151653 in clip.suppressed_during_generate
+    assert not hasattr(clip.transformer, "_hy_suppressed_token_ids")
+
+
 def test_hy_omniweaving_text_encode_merge_hidden_merges_cond_and_deepstack(monkeypatch):
     clip = _ClipStub(has_byt5=True)
     pooled_base = torch.tensor([[1.0, 2.0]])
@@ -1058,6 +1078,61 @@ def test_ensure_runtime_patches_is_idempotent(monkeypatch):
     assert runtime_patches.ensure_runtime_patches() is True
     assert runtime_patches.ensure_runtime_patches() is False
     assert calls == ["think", "vae"]
+
+
+def test_patch_qwen25_think_generation_uses_lm_head_weight_for_logits(monkeypatch):
+    import comfy.text_encoders.llama as llama
+
+    class _BaseGenerate:
+        def generate(self, *args, **kwargs):
+            return []
+
+    monkeypatch.setattr(llama, "BaseGenerate", _BaseGenerate)
+    monkeypatch.setattr(llama, "Qwen25_7BVLI_Config", type("Qwen25_7BVLI_Config", (), {}))
+
+    runtime_patches._patch_qwen25_think_generation()
+
+    embed_tokens = types.SimpleNamespace(
+        weight=torch.nn.Parameter(torch.tensor([[1.0, 0.0], [0.0, 1.0]])),
+        comfy_cast_weights=False,
+    )
+    lm_head = types.SimpleNamespace(
+        weight=torch.nn.Parameter(torch.tensor([[0.0, 2.0], [3.0, 0.0]])),
+        comfy_cast_weights=False,
+    )
+    generator = llama.BaseGenerate()
+    generator.model = types.SimpleNamespace(embed_tokens=embed_tokens, lm_head=lm_head)
+
+    logits = generator.logits(torch.tensor([[[1.0, 2.0]]], dtype=torch.float32))
+
+    assert tuple(logits.shape) == (1, 1, 2)
+    assert torch.equal(logits[0, 0], torch.tensor([4.0, 3.0]))
+
+
+def test_patch_qwen25_think_generation_adds_qwen_lm_head(monkeypatch):
+    import comfy.text_encoders.llama as llama
+
+    class _BaseGenerate:
+        def generate(self, *args, **kwargs):
+            return []
+
+    class _FakeQwen25_7BVLI:
+        def __init__(self, config_dict, dtype, device, operations):
+            self.model = types.SimpleNamespace(
+                config=types.SimpleNamespace(hidden_size=3, vocab_size=5, lm_head=False)
+            )
+
+    monkeypatch.setattr(llama, "BaseGenerate", _BaseGenerate)
+    monkeypatch.setattr(llama, "Qwen25_7BVLI", _FakeQwen25_7BVLI, raising=False)
+    monkeypatch.setattr(llama, "Qwen25_7BVLI_Config", type("Qwen25_7BVLI_Config", (), {}))
+
+    runtime_patches._patch_qwen25_think_generation()
+
+    qwen = llama.Qwen25_7BVLI({}, torch.float32, "cpu", types.SimpleNamespace(Linear=torch.nn.Linear))
+
+    assert hasattr(qwen.model, "lm_head")
+    assert tuple(qwen.model.lm_head.weight.shape) == (5, 3)
+    assert qwen.model.config.lm_head is True
 
 
 def test_convert_split_hy_omniweaving_attention_qkv_weight_and_bias():

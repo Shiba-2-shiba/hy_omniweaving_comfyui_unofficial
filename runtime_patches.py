@@ -519,43 +519,123 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
 
 
 def _patch_qwen25_think_generation():
+    import comfy
     import comfy.text_encoders.llama as llama
 
     if getattr(llama.Qwen25_7BVLI_Config, "stop_tokens", None) is None:
         llama.Qwen25_7BVLI_Config.stop_tokens = [151643, 151645]
 
-    if getattr(llama.BaseGenerate.generate, "_hy_omniweaving_patched", False):
-        return
+    qwen25_cls = getattr(llama, "Qwen25_7BVLI", None)
+    if qwen25_cls is not None and not getattr(qwen25_cls.__init__, "_hy_omniweaving_patched", False):
+        original_qwen25_init = qwen25_cls.__init__
+
+        def patched_qwen25_init(self, config_dict, dtype, device, operations):
+            original_qwen25_init(self, config_dict, dtype, device, operations)
+            model = getattr(self, "model", None)
+            config = getattr(model, "config", None)
+            if model is None or config is None or hasattr(model, "lm_head"):
+                return
+
+            hidden_size = getattr(config, "hidden_size", None)
+            vocab_size = getattr(config, "vocab_size", None)
+            if hidden_size is None or vocab_size is None:
+                return
+
+            linear_cls = getattr(operations, "Linear", nn.Linear)
+            model.lm_head = linear_cls(hidden_size, vocab_size, bias=False, device=device, dtype=dtype)
+            if not hasattr(model.lm_head, "comfy_cast_weights"):
+                model.lm_head.comfy_cast_weights = False
+            config.lm_head = True
+
+        patched_qwen25_init._hy_omniweaving_patched = True
+        llama.Qwen25_7BVLI.__init__ = patched_qwen25_init
+
+    if not getattr(getattr(llama.BaseGenerate, "logits", None), "_hy_omniweaving_patched", False):
+        def patched_logits(self, x):
+            input = x[:, -1:]
+            if hasattr(self.model, "lm_head"):
+                module = self.model.lm_head
+            else:
+                module = self.model.embed_tokens
+
+            offload_stream = None
+            cast_bias_weight = getattr(comfy.ops, "cast_bias_weight", None)
+            if getattr(module, "comfy_cast_weights", False) and callable(cast_bias_weight):
+                weight, _, offload_stream = cast_bias_weight(module, input, offloadable=True)
+            else:
+                weight = module.weight.to(x)
+
+            x = torch.nn.functional.linear(input, weight, None)
+
+            uncast_bias_weight = getattr(comfy.ops, "uncast_bias_weight", None)
+            if callable(uncast_bias_weight):
+                uncast_bias_weight(module, weight, None, offload_stream)
+            return x
+
+        patched_logits._hy_omniweaving_patched = True
+        llama.BaseGenerate.logits = patched_logits
 
     original_generate = llama.BaseGenerate.generate
+    original_sample_token = getattr(llama.BaseGenerate, "sample_token", None)
 
-    def patched_generate(self, embeds=None, do_sample=True, max_length=256, temperature=1.0, top_k=50, top_p=0.9, min_p=0.0, repetition_penalty=1.0, seed=42, stop_tokens=None, initial_tokens=[], execution_dtype=None, min_tokens=0, presence_penalty=0.0):
-        if stop_tokens is None:
-            config = getattr(self, "model", None)
-            config = getattr(config, "config", None)
-            stop_tokens = getattr(config, "stop_tokens", None)
+    if original_sample_token is not None and not getattr(llama.BaseGenerate.sample_token, "_hy_omniweaving_patched", False):
+        def patched_sample_token(self, logits, temperature, top_k, top_p, min_p, repetition_penalty, token_history, generator, do_sample=True, presence_penalty=0.0):
+            suppressed_token_ids = getattr(self, "_hy_suppressed_token_ids", None)
+            if suppressed_token_ids:
+                logits = logits.clone()
+                valid_ids = [int(token_id) for token_id in suppressed_token_ids if 0 <= int(token_id) < logits.shape[-1]]
+                if len(valid_ids) > 0:
+                    logits[:, valid_ids] = torch.finfo(logits.dtype).min
+                    _debug_log(
+                        "rewrite token suppression active count=%s first_ids=%s",
+                        len(valid_ids),
+                        valid_ids[:8],
+                    )
+            return original_sample_token(
+                self,
+                logits,
+                temperature,
+                top_k,
+                top_p,
+                min_p,
+                repetition_penalty,
+                token_history,
+                generator,
+                do_sample=do_sample,
+                presence_penalty=presence_penalty,
+            )
+
+        patched_sample_token._hy_omniweaving_patched = True
+        llama.BaseGenerate.sample_token = patched_sample_token
+
+    if not getattr(llama.BaseGenerate.generate, "_hy_omniweaving_patched", False):
+        def patched_generate(self, embeds=None, do_sample=True, max_length=256, temperature=1.0, top_k=50, top_p=0.9, min_p=0.0, repetition_penalty=1.0, seed=42, stop_tokens=None, initial_tokens=[], execution_dtype=None, min_tokens=0, presence_penalty=0.0):
             if stop_tokens is None:
-                stop_tokens = [151643, 151645]
-        return original_generate(
-            self,
-            embeds=embeds,
-            do_sample=do_sample,
-            max_length=max_length,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            min_p=min_p,
-            repetition_penalty=repetition_penalty,
-            seed=seed,
-            stop_tokens=stop_tokens,
-            initial_tokens=initial_tokens,
-            execution_dtype=execution_dtype,
-            min_tokens=min_tokens,
-            presence_penalty=presence_penalty,
-        )
+                config = getattr(self, "model", None)
+                config = getattr(config, "config", None)
+                stop_tokens = getattr(config, "stop_tokens", None)
+                if stop_tokens is None:
+                    stop_tokens = [151643, 151645]
+            return original_generate(
+                self,
+                embeds=embeds,
+                do_sample=do_sample,
+                max_length=max_length,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                seed=seed,
+                stop_tokens=stop_tokens,
+                initial_tokens=initial_tokens,
+                execution_dtype=execution_dtype,
+                min_tokens=min_tokens,
+                presence_penalty=presence_penalty,
+            )
 
-    patched_generate._hy_omniweaving_patched = True
-    llama.BaseGenerate.generate = patched_generate
+        patched_generate._hy_omniweaving_patched = True
+        llama.BaseGenerate.generate = patched_generate
 def _patch_autoencoder_legacy():
     import math
     import comfy

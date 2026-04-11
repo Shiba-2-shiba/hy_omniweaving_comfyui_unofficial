@@ -955,6 +955,13 @@ class HYOmniWeavingVAELoader(io.ComfyNode):
 class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
     THINK_MAX_EFFECTIVE_NEW_TOKENS = 256
     THINK_MAX_REWRITE_CHARS = 2048
+    REWRITE_SUPPRESSED_TOKEN_IDS = (
+        151644,
+        151646, 151647, 151648, 151649, 151650, 151651,
+        151652, 151653, 151654, 151655, 151656,
+        151657, 151658, 151659, 151660, 151661, 151662, 151663, 151664, 151665, 151666,
+        151667, 151668,
+    )
     THINK_MODES = ("legacy_rewrite", "merge_hidden")
     THINK_KEEP_TOKENS_BY_TASK = {
         "i2v": 32,
@@ -1192,7 +1199,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             visual_images=think_visual_images if len(think_visual_images) > 0 else None,
         )
 
-        generated = clip.generate(tokens, do_sample=False, max_length=effective_max_new_tokens)
+        generated = cls._generate_with_rewrite_suppression(clip, tokens, effective_max_new_tokens)
         generated_text = cls._decode_generated_text(clip, generated, tokens)
         _debug_log(
             "think rewrite task=%s original_chars=%s generated_chars=%s visual_inputs=%s",
@@ -1280,6 +1287,39 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             return clip.decode(decode_input, skip_special_tokens=True).strip()
         except TypeError:
             return clip.decode(decode_input).strip()
+
+    @staticmethod
+    def _rewrite_generation_target(clip):
+        cond_stage_model = getattr(clip, "cond_stage_model", None)
+        clip_name = getattr(cond_stage_model, "clip", "qwen25_7b")
+        clip_model = getattr(cond_stage_model, clip_name, None)
+        if clip_model is None:
+            return None
+        return getattr(clip_model, "transformer", clip_model)
+
+    @classmethod
+    def _generate_with_rewrite_suppression(cls, clip, tokens, max_new_tokens: int):
+        target = cls._rewrite_generation_target(clip)
+        previous = None
+        had_previous = False
+        if target is not None:
+            had_previous = hasattr(target, "_hy_suppressed_token_ids")
+            previous = getattr(target, "_hy_suppressed_token_ids", None)
+            target._hy_suppressed_token_ids = cls.REWRITE_SUPPRESSED_TOKEN_IDS
+            _debug_log(
+                "rewrite suppression enabled token_count=%s first_ids=%s target=%s",
+                len(cls.REWRITE_SUPPRESSED_TOKEN_IDS),
+                cls.REWRITE_SUPPRESSED_TOKEN_IDS[:8],
+                type(target).__name__,
+            )
+        try:
+            return clip.generate(tokens, do_sample=False, max_length=max_new_tokens)
+        finally:
+            if target is not None:
+                if had_previous:
+                    target._hy_suppressed_token_ids = previous
+                elif hasattr(target, "_hy_suppressed_token_ids"):
+                    delattr(target, "_hy_suppressed_token_ids")
 
     @classmethod
     def _build_think_conditioning_prompt(cls, task: str, prompt: str) -> str:
