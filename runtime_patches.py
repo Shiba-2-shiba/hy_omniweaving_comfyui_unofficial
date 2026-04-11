@@ -329,6 +329,13 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
             attention_mask = attention_mask[:, start_index:]
         return seq, attention_mask
 
+    def _describe_attention_mask_state(value):
+        if torch.is_tensor(value):
+            return f"tensor{tuple(value.shape)}"
+        if value is None:
+            return "missing"
+        return type(value).__name__
+
     def _find_setclip_start(tok_pairs, crop_start):
         expanded_index = 0
         last_vision_end = None
@@ -405,6 +412,12 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         template_end = _find_template_end(tok_pairs, template_end)
         effective_crop_start, crop_source = _resolve_crop_start(tok_pairs, getattr(self, "crop_start_output", None), template_end)
         attention_mask = extra.get("attention_mask", None)
+        original_attention_mask = attention_mask
+        attention_mask_reason = "orig_encode_missing"
+        if torch.is_tensor(attention_mask):
+            attention_mask_reason = "orig_encode_tensor"
+        elif attention_mask is not None:
+            attention_mask_reason = f"orig_encode_non_tensor:{type(attention_mask).__name__}"
 
         setclip_start = 0
         setclip_source = "disabled"
@@ -414,8 +427,17 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
                 cond, attention_mask = _slice_seq_and_mask(cond, attention_mask, setclip_start)
                 if torch.is_tensor(attention_mask):
                     extra["attention_mask"] = attention_mask
+                    attention_mask_reason = "setclip_tensor_retained"
                 else:
                     extra.pop("attention_mask", None)
+                    if original_attention_mask is None:
+                        attention_mask_reason = "setclip_removed_missing_orig_encode_mask"
+                    elif attention_mask is None:
+                        attention_mask_reason = "setclip_removed_non_tensor_mask"
+                    else:
+                        attention_mask_reason = f"setclip_removed_non_tensor_mask:{type(attention_mask).__name__}"
+        elif torch.is_tensor(attention_mask):
+            attention_mask_reason = "setclip_disabled_tensor_unmodified"
 
         deepstack_hidden_states = _encode_deepstack(self, token_weight_pairs["qwen25_7b"], getattr(self, "crop_start_output", None), template_end)
         if deepstack_hidden_states is not None:
@@ -436,7 +458,9 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         self.crop_start_source = crop_source
         self.setclip_start_source = setclip_source
         _debug_log(
-            "patched_encode task=%s crop_start=%s crop_source=%s visual_inputs=%s setclip=%s setclip_start=%s setclip_source=%s cond_shape=%s attention_mask_shape=%s deepstack_shape=%s",
+            "patched_encode task=%s crop_start=%s crop_source=%s visual_inputs=%s setclip=%s setclip_start=%s "
+            "setclip_source=%s cond_shape=%s attention_mask_shape=%s attention_mask_reason=%s "
+            "orig_attention_mask_state=%s final_attention_mask_state=%s extra_keys=%s deepstack_shape=%s",
             getattr(self, "_hy_task_name", None),
             effective_crop_start,
             crop_source,
@@ -446,6 +470,10 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
             setclip_source,
             _shape_of(cond),
             _shape_of(extra.get("attention_mask")),
+            attention_mask_reason,
+            _describe_attention_mask_state(original_attention_mask),
+            _describe_attention_mask_state(extra.get("attention_mask")),
+            sorted(extra.keys()),
             _shape_of(extra.get("all_stack_text_states")),
         )
         return cond, p, extra
