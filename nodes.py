@@ -1208,6 +1208,11 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             len(generated_text),
             think_visual_count,
         )
+        _debug_log(
+            "think rewrite generated_text task=%s text=%s",
+            task,
+            json.dumps(generated_text, ensure_ascii=False),
+        )
         if len(generated_text) == 0:
             return prompt
         if len(generated_text) > cls.THINK_MAX_REWRITE_CHARS:
@@ -1222,6 +1227,11 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             "think rewrite result task=%s rewritten_chars=%s",
             task,
             len(rewritten),
+        )
+        _debug_log(
+            "think rewrite rewritten_text task=%s text=%s",
+            task,
+            json.dumps(rewritten, ensure_ascii=False),
         )
         return rewritten
 
