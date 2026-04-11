@@ -677,6 +677,28 @@ def test_hy_omniweaving_text_encode_merge_hidden_merges_cond_and_deepstack(monke
     assert torch.equal(extra["pooled_output"], pooled_base)
 
 
+def test_hy_omniweaving_i2v_think_prompt_preserves_first_frame_constraints():
+    prompt = nodes.TextEncodeHunyuanVideo15Omni._build_think_conditioning_prompt("i2v", "A girl turns around")
+
+    assert "preserve the same subject identity, background, layout, lighting, and overall framing" in prompt
+    assert "first-frame anchoring" in prompt
+    assert "camera motion" not in prompt
+    assert "new camera setup" in prompt
+
+
+def test_hy_omniweaving_i2v_merge_hidden_uses_lower_default_keep_tokens():
+    think_encoding = {
+        "cond": torch.ones((1, 90, 2)),
+        "extra": {
+            "all_stack_text_states": torch.ones((3, 1, 90, 2)),
+        },
+    }
+
+    keep_tokens = nodes.TextEncodeHunyuanVideo15Omni._resolve_effective_keep_tokens("i2v", 0, think_encoding)
+
+    assert keep_tokens == 32
+
+
 def test_hy_omniweaving_text_encode_merge_hidden_skips_negative_prompt_like_text(monkeypatch):
     clip = _ClipStub(has_byt5=True)
 

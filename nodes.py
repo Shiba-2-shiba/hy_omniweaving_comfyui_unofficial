@@ -957,7 +957,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
     THINK_MAX_REWRITE_CHARS = 2048
     THINK_MODES = ("legacy_rewrite", "merge_hidden")
     THINK_KEEP_TOKENS_BY_TASK = {
-        "i2v": 80,
+        "i2v": 32,
         "t2v": 112,
         "interpolation": 96,
     }
@@ -1285,9 +1285,10 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
     def _build_think_conditioning_prompt(cls, task: str, prompt: str) -> str:
         if task == "i2v":
             suffix = (
-                "Starting from the provided first frame, keep the same subject and scene continuity. "
-                "Make the temporal progression explicit with motion, pose change, expression change, "
-                "camera motion, and event order. Do not add new objects or visible text."
+                "Starting from the provided first frame, preserve the same subject identity, background, "
+                "layout, lighting, and overall framing. Make the temporal progression explicit with motion, "
+                "pose change, expression change, and event order while keeping strong first-frame anchoring. "
+                "Do not add new objects, new background elements, visible text, or a new camera setup."
             )
         elif task == "interpolation":
             suffix = (
