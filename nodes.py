@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import numbers
 import node_helpers
 import os
 import torch
@@ -953,7 +954,7 @@ class HYOmniWeavingVAELoader(io.ComfyNode):
 
 
 class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
-    THINK_MAX_EFFECTIVE_NEW_TOKENS = 256
+    THINK_MAX_EFFECTIVE_NEW_TOKENS = 1000
     THINK_MAX_REWRITE_CHARS = 2048
     REWRITE_SUPPRESSED_TOKEN_IDS = (
         151644,
@@ -964,7 +965,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
     )
     THINK_MODES = ("legacy_rewrite", "merge_hidden")
     THINK_KEEP_TOKENS_BY_TASK = {
-        "i2v": 32,
+        "i2v": 64,
         "t2v": 112,
         "interpolation": 96,
     }
@@ -1168,26 +1169,64 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         )
 
     @classmethod
-    def _rewrite_prompt_with_think(cls, clip, prompt, task, image_embeds, visual_images, max_new_tokens: int) -> str:
+    def _build_think_rewrite_request(cls, task: str, prompt: str, think_mode: str) -> str:
+        if task == "i2v":
+            if think_mode == "merge_hidden":
+                expand_prefix = "Here is a concise description of the target video starting with the given image: "
+                expand_postfix = (
+                    " Expand only the temporal progression for the video. Focus on motion, pose changes, expression changes, "
+                    "timing, and event order that should evolve from the provided first frame. Preserve the existing subject "
+                    "identity, clothing, background, lighting, framing, and scene layout. Do not restate static appearance or "
+                    "background details unless they directly change over time."
+                )
+            else:
+                expand_prefix = "Here is a concise description of the target video starting with the given image: "
+                expand_postfix = " Please generate a more detailed description based on the provided image and the short description."
+        elif task == "interpolation":
+            if think_mode == "merge_hidden":
+                expand_prefix = "Here is a concise description of how the video transitions from the first image to the second image: "
+                expand_postfix = (
+                    " Expand only the temporal transition. Focus on intermediate motion, transformation steps, timing, and event "
+                    "order needed to connect the boundary frames. Avoid re-describing static appearance details that stay unchanged."
+                )
+            else:
+                expand_prefix = "Here is a concise description of how the video transitions from the first image to the second image: "
+                expand_postfix = " Please generate a more detailed description of the transition, based on the provided images and the short description."
+        else:
+            if think_mode == "merge_hidden":
+                expand_prefix = "Here is a concise description of the target video: "
+                expand_postfix = (
+                    " Expand the temporal progression only. Focus on action beats, motion changes, pacing, and event order while "
+                    "avoiding unnecessary static scene or appearance description."
+                )
+            else:
+                expand_prefix = "Here is a concise description of the target video: "
+                expand_postfix = " Please generate a more detailed description based on the short description."
+        return f"{expand_prefix}{prompt}{expand_postfix}"
+
+    @classmethod
+    def _rewrite_prompt_with_think_parts(
+        cls,
+        clip,
+        prompt,
+        task,
+        image_embeds,
+        visual_images,
+        max_new_tokens: int,
+        think_mode: str = "legacy_rewrite",
+    ) -> dict:
         if not isinstance(prompt, str):
             raise ValueError("Think mode currently requires a single string prompt.")
         if task not in ("t2v", "i2v", "interpolation"):
             raise ValueError("Think mode is currently intended only for t2v, i2v, or interpolation tasks.")
         if max_new_tokens <= 0:
-            return prompt
+            return {
+                "generated_text": "",
+                "rewritten_prompt": prompt,
+            }
         effective_max_new_tokens = min(max_new_tokens, cls.THINK_MAX_EFFECTIVE_NEW_TOKENS)
 
-        if task == "i2v":
-            expand_prefix = "Here is a concise description of the target video starting with the given image: "
-            expand_postfix = " Please generate a more detailed description based on the provided image and the short description."
-        elif task == "interpolation":
-            expand_prefix = "Here is a concise description of how the video transitions from the first image to the second image: "
-            expand_postfix = " Please generate a more detailed description of the transition, based on the provided images and the short description."
-        else:
-            expand_prefix = "Here is a concise description of the target video: "
-            expand_postfix = " Please generate a more detailed description based on the short description."
-
-        think_prompt = f"{expand_prefix}{prompt}{expand_postfix}"
+        think_prompt = cls._build_think_rewrite_request(task, prompt, think_mode)
         think_visual_images = cls._prepare_think_visual_images(visual_images)
         think_visual_count = len(think_visual_images) if len(think_visual_images) > 0 else len(image_embeds)
         think_template = cls._build_think_template(task, think_visual_count)
@@ -1214,14 +1253,20 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             json.dumps(generated_text, ensure_ascii=False),
         )
         if len(generated_text) == 0:
-            return prompt
+            return {
+                "generated_text": "",
+                "rewritten_prompt": prompt,
+            }
         if len(generated_text) > cls.THINK_MAX_REWRITE_CHARS:
             logging.warning(
                 "HYOmniWeavingTextEncode rejected runaway think rewrite for task '%s' because generated text was too long (%s chars).",
                 task,
                 len(generated_text),
             )
-            return prompt
+            return {
+                "generated_text": "",
+                "rewritten_prompt": prompt,
+            }
         rewritten = f"{prompt} Here is a more detailed description. {generated_text}"
         _debug_log(
             "think rewrite result task=%s rewritten_chars=%s",
@@ -1233,7 +1278,23 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             task,
             json.dumps(rewritten, ensure_ascii=False),
         )
-        return rewritten
+        return {
+            "generated_text": generated_text,
+            "rewritten_prompt": rewritten,
+        }
+
+    @classmethod
+    def _rewrite_prompt_with_think(cls, clip, prompt, task, image_embeds, visual_images, max_new_tokens: int) -> str:
+        rewrite = cls._rewrite_prompt_with_think_parts(
+            clip,
+            prompt,
+            task,
+            image_embeds,
+            visual_images,
+            max_new_tokens,
+            think_mode="legacy_rewrite",
+        )
+        return rewrite["rewritten_prompt"]
 
     @staticmethod
     def _parse_deepstack_layers(deepstack_layers: str):
@@ -1384,25 +1445,76 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         index[dim] = slice(value.shape[dim] - keep_tokens, None)
         return value[tuple(index)].contiguous()
 
+    @staticmethod
+    def _expanded_qwen_token_pair_size(tok_pair) -> int:
+        if not isinstance(tok_pair, (list, tuple)) or len(tok_pair) == 0:
+            return 1
+        elem = tok_pair[0]
+        if torch.is_tensor(elem):
+            return int(elem.shape[0]) if elem.ndim > 0 else 1
+        if isinstance(elem, dict):
+            data = elem.get("data")
+            if torch.is_tensor(data) and data.ndim > 0:
+                return int(data.shape[0])
+            return 1
+        return 1
+
+    @classmethod
+    def _think_trailing_template_token_count(cls, tokens) -> int:
+        if not isinstance(tokens, dict):
+            return 0
+        qwen_tokens = tokens.get("qwen25_7b")
+        if not isinstance(qwen_tokens, list) or len(qwen_tokens) == 0 or not isinstance(qwen_tokens[0], list):
+            return 0
+
+        im_start_count = 0
+        total_tokens = 0
+        user_end = None
+        for tok_pair in qwen_tokens[0]:
+            elem = tok_pair[0] if isinstance(tok_pair, (list, tuple)) and len(tok_pair) > 0 else None
+            size = cls._expanded_qwen_token_pair_size(tok_pair)
+            if isinstance(elem, numbers.Integral):
+                token_id = int(elem)
+                if token_id == 151644:
+                    im_start_count += 1
+                elif token_id == 151645 and im_start_count >= 2 and user_end is None:
+                    user_end = total_tokens
+            total_tokens += size
+
+        if user_end is None or user_end >= total_tokens:
+            return 0
+        return total_tokens - user_end
+
+    @classmethod
+    def _trim_think_trailing_template_tokens(cls, value, tokens, dim: int):
+        if not torch.is_tensor(value):
+            return value
+        trailing = cls._think_trailing_template_token_count(tokens)
+        if trailing <= 0 or value.shape[dim] <= trailing:
+            return value
+        index = [slice(None)] * value.ndim
+        index[dim] = slice(0, value.shape[dim] - trailing)
+        return value[tuple(index)].contiguous()
+
     @classmethod
     def _resolve_effective_keep_tokens(cls, task: str, think_keep_tokens: int, think_encoding: dict) -> int:
-        requested = think_keep_tokens if think_keep_tokens > 0 else cls.THINK_KEEP_TOKENS_BY_TASK.get(task, 0)
         lengths = []
-        cond = think_encoding.get("cond")
+        tokens = think_encoding.get("tokens")
+        cond = cls._trim_think_trailing_template_tokens(think_encoding.get("cond"), tokens, dim=1)
         extra = think_encoding.get("extra", {})
         if torch.is_tensor(cond) and cond.ndim >= 2:
             lengths.append(cond.shape[1])
-        deepstack = extra.get("all_stack_text_states")
+        deepstack = cls._trim_think_trailing_template_tokens(extra.get("all_stack_text_states"), tokens, dim=2)
         if torch.is_tensor(deepstack) and deepstack.ndim >= 3:
             lengths.append(deepstack.shape[2])
-        attention_mask = extra.get("attention_mask")
+        attention_mask = cls._trim_think_trailing_template_tokens(extra.get("attention_mask"), tokens, dim=1)
         if torch.is_tensor(attention_mask) and attention_mask.ndim >= 2:
             lengths.append(attention_mask.shape[1])
         if len(lengths) == 0:
-            return max(requested, 0)
-        if requested <= 0:
+            return max(think_keep_tokens, 0)
+        if think_keep_tokens <= 0:
             return min(lengths)
-        return min([requested, *lengths])
+        return min([think_keep_tokens, *lengths])
 
     @classmethod
     def _merge_encoded_conditioning(cls, base_encoding: dict, think_encoding: dict, task: str, think_keep_tokens: int):
@@ -1411,7 +1523,9 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             return base_encoding
 
         base_cond = base_encoding.get("cond")
-        think_cond = cls._tail_tokens(think_encoding.get("cond"), effective_keep_tokens, dim=1)
+        think_tokens = think_encoding.get("tokens")
+        trimmed_think_cond = cls._trim_think_trailing_template_tokens(think_encoding.get("cond"), think_tokens, dim=1)
+        think_cond = cls._tail_tokens(trimmed_think_cond, effective_keep_tokens, dim=1)
         if not torch.is_tensor(base_cond) or not torch.is_tensor(think_cond):
             return base_encoding
 
@@ -1419,27 +1533,46 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         merged_cond = torch.cat([base_cond, think_cond], dim=1)
 
         base_deepstack = merged_extra.get("all_stack_text_states")
-        think_deepstack = cls._tail_tokens(think_encoding.get("extra", {}).get("all_stack_text_states"), effective_keep_tokens, dim=2)
+        trimmed_think_deepstack = cls._trim_think_trailing_template_tokens(
+            think_encoding.get("extra", {}).get("all_stack_text_states"),
+            think_tokens,
+            dim=2,
+        )
+        think_deepstack = cls._tail_tokens(trimmed_think_deepstack, effective_keep_tokens, dim=2)
         if torch.is_tensor(base_deepstack) and torch.is_tensor(think_deepstack):
             merged_extra["all_stack_text_states"] = torch.cat([base_deepstack, think_deepstack], dim=2)
 
         base_attention_mask = merged_extra.get("attention_mask")
-        think_attention_mask = cls._tail_tokens(think_encoding.get("extra", {}).get("attention_mask"), effective_keep_tokens, dim=1)
+        trimmed_think_attention_mask = cls._trim_think_trailing_template_tokens(
+            think_encoding.get("extra", {}).get("attention_mask"),
+            think_tokens,
+            dim=1,
+        )
+        think_attention_mask = cls._tail_tokens(trimmed_think_attention_mask, effective_keep_tokens, dim=1)
         if torch.is_tensor(base_attention_mask) and torch.is_tensor(think_attention_mask):
             merged_extra["attention_mask"] = torch.cat([base_attention_mask, think_attention_mask], dim=1)
 
         merged_extra["pooled_output"] = base_encoding["pooled_output"]
         _debug_log(
-            "think merge task=%s keep_tokens=%s base_cond_shape=%s think_cond_shape=%s merged_cond_shape=%s "
-            "base_deepstack_shape=%s think_deepstack_shape=%s merged_deepstack_shape=%s",
+            "think merge task=%s keep_tokens=%s trim_tokens=%s base_cond_shape=%s think_cond_shape=%s "
+            "trimmed_think_cond_shape=%s merged_cond_shape=%s base_deepstack_shape=%s think_deepstack_shape=%s "
+            "trimmed_think_deepstack_shape=%s merged_deepstack_shape=%s base_attention_mask_shape=%s "
+            "think_attention_mask_shape=%s trimmed_think_attention_mask_shape=%s merged_attention_mask_shape=%s",
             task,
             effective_keep_tokens,
+            cls._think_trailing_template_token_count(think_tokens),
             _shape_of(base_cond),
             _shape_of(think_encoding.get("cond")),
+            _shape_of(trimmed_think_cond),
             _shape_of(merged_cond),
             _shape_of(base_deepstack),
             _shape_of(think_encoding.get("extra", {}).get("all_stack_text_states")),
+            _shape_of(trimmed_think_deepstack),
             _shape_of(merged_extra.get("all_stack_text_states")),
+            _shape_of(base_attention_mask),
+            _shape_of(think_encoding.get("extra", {}).get("attention_mask")),
+            _shape_of(trimmed_think_attention_mask),
+            _shape_of(merged_extra.get("attention_mask")),
         )
         return {
             **base_encoding,
@@ -1585,10 +1718,40 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
                 _debug_log("think merge skipped task=%s prompt_len=%s", task, len(prompt) if isinstance(prompt, str) else None)
                 return io.NodeOutput(cls._conditioning_output(base_encoding))
 
-            think_prompt = cls._build_think_conditioning_prompt(task, prompt)
+            rewrite = cls._rewrite_prompt_with_think_parts(
+                clip,
+                prompt,
+                task,
+                visual_payload["image_embeds"],
+                visual_payload["visual_images"],
+                think_max_new_tokens,
+                think_mode="merge_hidden",
+            )
+            enhanced_prompt = rewrite["rewritten_prompt"]
+            generated_branch_text = rewrite["generated_text"]
+            if len(generated_branch_text) == 0:
+                _debug_log(
+                    "think merge fell back to base prompt task=%s prompt_len=%s",
+                    task,
+                    len(prompt) if isinstance(prompt, str) else None,
+                )
+                return io.NodeOutput(cls._conditioning_output(base_encoding))
+            _debug_log(
+                "think merge enhanced_prompt task=%s chars=%s text=%s",
+                task,
+                len(enhanced_prompt) if isinstance(enhanced_prompt, str) else None,
+                json.dumps(enhanced_prompt, ensure_ascii=False),
+            )
+            _debug_log(
+                "think merge generated_branch_text task=%s chars=%s text=%s",
+                task,
+                len(generated_branch_text) if isinstance(generated_branch_text, str) else None,
+                json.dumps(generated_branch_text, ensure_ascii=False),
+            )
+
             think_encoding = cls._encode_prompt_components(
                 clip,
-                think_prompt,
+                generated_branch_text,
                 task,
                 deepstack_layers,
                 setclip,

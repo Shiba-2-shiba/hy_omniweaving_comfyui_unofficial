@@ -601,7 +601,7 @@ def test_hy_omniweaving_text_encode_think_rejects_runaway_rewrite(monkeypatch):
 
     assert len(clip.tokenize_calls) == 2
     assert clip.tokenize_calls[1][0] == "An anime girl dancing intensely"
-    assert clip.last_generate["max_length"] == 256
+    assert clip.last_generate["max_length"] == 1000
 
 
 def test_hy_omniweaving_text_encode_think_resizes_visual_inputs_for_ar_prompt():
@@ -657,7 +657,7 @@ def test_hy_omniweaving_text_encode_merge_hidden_merges_cond_and_deepstack(monke
 
     def encode_token_weights(tokens):
         text = tokens["tokens"]
-        is_think = "Make the temporal progression explicit" in text
+        is_think = text == "expanded prompt"
         seq = 6 if is_think else 4
         value = 2.0 if is_think else 1.0
         pooled = torch.tensor([[9.0, 9.0]]) if is_think else pooled_base
@@ -689,8 +689,12 @@ def test_hy_omniweaving_text_encode_merge_hidden_merges_cond_and_deepstack(monke
     )
 
     cond, extra = out[0][0]
-    assert len(clip.tokenize_calls) == 2
-    assert not hasattr(clip, "last_generate")
+    assert len(clip.tokenize_calls) == 3
+    assert "Expand the temporal progression only." in clip.tokenize_calls[1][0]
+    assert "avoiding unnecessary static scene or appearance description" in clip.tokenize_calls[1][0]
+    assert clip.last_generate["do_sample"] is False
+    assert clip.last_generate["max_length"] == 128
+    assert clip.tokenize_calls[2][0] == "expanded prompt"
     assert tuple(cond.shape) == (1, 7, 2)
     assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 7, 2)
     assert tuple(extra["attention_mask"].shape) == (1, 7)
@@ -706,7 +710,20 @@ def test_hy_omniweaving_i2v_think_prompt_preserves_first_frame_constraints():
     assert "new camera setup" in prompt
 
 
-def test_hy_omniweaving_i2v_merge_hidden_uses_lower_default_keep_tokens():
+def test_hy_omniweaving_merge_hidden_rewrite_request_focuses_on_temporal_changes():
+    request = nodes.TextEncodeHunyuanVideo15Omni._build_think_rewrite_request(
+        "i2v",
+        "A girl turns around",
+        "merge_hidden",
+    )
+
+    assert "Expand only the temporal progression for the video." in request
+    assert "Preserve the existing subject identity, clothing, background, lighting, framing, and scene layout." in request
+    assert "Do not restate static appearance or background details unless they directly change over time." in request
+    assert "Please generate a more detailed description" not in request
+
+
+def test_hy_omniweaving_merge_hidden_uses_full_generated_branch_by_default():
     think_encoding = {
         "cond": torch.ones((1, 90, 2)),
         "extra": {
@@ -716,7 +733,57 @@ def test_hy_omniweaving_i2v_merge_hidden_uses_lower_default_keep_tokens():
 
     keep_tokens = nodes.TextEncodeHunyuanVideo15Omni._resolve_effective_keep_tokens("i2v", 0, think_encoding)
 
-    assert keep_tokens == 32
+    assert keep_tokens == 90
+
+
+def test_hy_omniweaving_merge_hidden_ignores_trailing_template_control_tokens():
+    base_encoding = {
+        "cond": torch.full((1, 4, 1), 1.0),
+        "pooled_output": torch.zeros((1, 1)),
+        "extra": {
+            "attention_mask": torch.ones((1, 4)),
+            "all_stack_text_states": torch.full((3, 1, 4, 1), 1.0),
+            "pooled_output": torch.zeros((1, 1)),
+        },
+    }
+    think_encoding = {
+        "cond": torch.arange(1, 8, dtype=torch.float32).reshape(1, 7, 1),
+        "pooled_output": torch.ones((1, 1)),
+        "extra": {
+            "attention_mask": torch.ones((1, 7)),
+            "all_stack_text_states": torch.arange(1, 22, dtype=torch.float32).reshape(3, 1, 7, 1),
+        },
+        "tokens": {
+            "qwen25_7b": [[
+                (151644, 1.0),
+                (999, 1.0),
+                (151645, 1.0),
+                (198, 1.0),
+                (151644, 1.0),
+                (872, 1.0),
+                (198, 1.0),
+                (11, 1.0),
+                (12, 1.0),
+                (151645, 1.0),
+                (198, 1.0),
+                (151644, 1.0),
+                (77091, 1.0),
+                (198, 1.0),
+            ]],
+        },
+    }
+
+    merged = nodes.TextEncodeHunyuanVideo15Omni._merge_encoded_conditioning(
+        base_encoding,
+        think_encoding,
+        task="i2v",
+        think_keep_tokens=10,
+    )
+
+    assert tuple(merged["cond"].shape) == (1, 6, 1)
+    assert torch.equal(merged["cond"][0, -2:, 0], torch.tensor([1.0, 2.0]))
+    assert tuple(merged["extra"]["attention_mask"].shape) == (1, 6)
+    assert tuple(merged["extra"]["all_stack_text_states"].shape) == (3, 1, 6, 1)
 
 
 def test_hy_omniweaving_text_encode_merge_hidden_skips_negative_prompt_like_text(monkeypatch):
@@ -756,6 +823,52 @@ def test_hy_omniweaving_text_encode_merge_hidden_skips_negative_prompt_like_text
     cond, extra = out[0][0]
     assert len(clip.tokenize_calls) == 1
     assert not hasattr(clip, "last_generate")
+    assert tuple(cond.shape) == (1, 4, 2)
+    assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 4, 2)
+
+
+def test_hy_omniweaving_text_encode_merge_hidden_skips_duplicate_merge_when_ar_returns_nothing(monkeypatch):
+    clip = _ClipStub(has_byt5=True)
+
+    monkeypatch.setattr(nodes, "ensure_runtime_patches", lambda: None)
+    monkeypatch.setattr(nodes, "ensure_hy_omniweaving_text_encoder_support", lambda clip: None)
+    monkeypatch.setattr(
+        nodes.TextEncodeHunyuanVideo15Omni,
+        "_decode_generated_text",
+        staticmethod(lambda clip, generated, tokens: ""),
+    )
+
+    def encode_token_weights(tokens):
+        return (
+            torch.ones((1, 4, 2)),
+            torch.zeros((1, 2)),
+            {
+                "attention_mask": torch.ones((1, 4)),
+                "all_stack_text_states": torch.ones((3, 1, 4, 2)),
+            },
+        )
+
+    clip.cond_stage_model.encode_token_weights = encode_token_weights
+
+    out = nodes.TextEncodeHunyuanVideo15Omni.execute(
+        clip=clip,
+        prompt="A dancer starts moving",
+        task="t2v",
+        use_visual_inputs=False,
+        max_visual_inputs=8,
+        think=True,
+        think_max_new_tokens=128,
+        think_mode="merge_hidden",
+        think_keep_tokens=3,
+        deepstack_layers="8,16,24",
+        setclip=True,
+        semantic_images=None,
+        clip_vision_output=None,
+    )
+
+    cond, extra = out[0][0]
+    assert len(clip.tokenize_calls) == 2
+    assert clip.last_generate["max_length"] == 128
     assert tuple(cond.shape) == (1, 4, 2)
     assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 4, 2)
 
