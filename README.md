@@ -48,7 +48,7 @@ Current status:
 
 Known limitations:
 
-- `i2v` / `t2v` logs still show a small `cond_tokens` vs `deepstack_tokens` mismatch after crop/setclip. This is a remaining parity-quality issue, not a current execution blocker.
+- The runtime still keeps a warning path for `cond_tokens` vs `deepstack_tokens` mismatches after crop/setclip, but the latest validated `i2v` logs do not show that warning. Treat this as a guarded edge case rather than a currently reproduced blocker.
 - Prompt-following and motion-heavy scenes can still diverge from the original runtime, but the likely causes are now:
   - differences between public rewrite-style inference and the custom `merge_hidden` path
   - AR branch content quality, including static over-description
