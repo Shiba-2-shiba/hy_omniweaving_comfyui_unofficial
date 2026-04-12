@@ -1169,7 +1169,52 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         )
 
     @classmethod
-    def _rewrite_prompt_with_think_parts(cls, clip, prompt, task, image_embeds, visual_images, max_new_tokens: int) -> dict:
+    def _build_think_rewrite_request(cls, task: str, prompt: str, think_mode: str) -> str:
+        if task == "i2v":
+            if think_mode == "merge_hidden":
+                expand_prefix = "Here is a concise description of the target video starting with the given image: "
+                expand_postfix = (
+                    " Expand only the temporal progression for the video. Focus on motion, pose changes, expression changes, "
+                    "timing, and event order that should evolve from the provided first frame. Preserve the existing subject "
+                    "identity, clothing, background, lighting, framing, and scene layout. Do not restate static appearance or "
+                    "background details unless they directly change over time."
+                )
+            else:
+                expand_prefix = "Here is a concise description of the target video starting with the given image: "
+                expand_postfix = " Please generate a more detailed description based on the provided image and the short description."
+        elif task == "interpolation":
+            if think_mode == "merge_hidden":
+                expand_prefix = "Here is a concise description of how the video transitions from the first image to the second image: "
+                expand_postfix = (
+                    " Expand only the temporal transition. Focus on intermediate motion, transformation steps, timing, and event "
+                    "order needed to connect the boundary frames. Avoid re-describing static appearance details that stay unchanged."
+                )
+            else:
+                expand_prefix = "Here is a concise description of how the video transitions from the first image to the second image: "
+                expand_postfix = " Please generate a more detailed description of the transition, based on the provided images and the short description."
+        else:
+            if think_mode == "merge_hidden":
+                expand_prefix = "Here is a concise description of the target video: "
+                expand_postfix = (
+                    " Expand the temporal progression only. Focus on action beats, motion changes, pacing, and event order while "
+                    "avoiding unnecessary static scene or appearance description."
+                )
+            else:
+                expand_prefix = "Here is a concise description of the target video: "
+                expand_postfix = " Please generate a more detailed description based on the short description."
+        return f"{expand_prefix}{prompt}{expand_postfix}"
+
+    @classmethod
+    def _rewrite_prompt_with_think_parts(
+        cls,
+        clip,
+        prompt,
+        task,
+        image_embeds,
+        visual_images,
+        max_new_tokens: int,
+        think_mode: str = "legacy_rewrite",
+    ) -> dict:
         if not isinstance(prompt, str):
             raise ValueError("Think mode currently requires a single string prompt.")
         if task not in ("t2v", "i2v", "interpolation"):
@@ -1181,17 +1226,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             }
         effective_max_new_tokens = min(max_new_tokens, cls.THINK_MAX_EFFECTIVE_NEW_TOKENS)
 
-        if task == "i2v":
-            expand_prefix = "Here is a concise description of the target video starting with the given image: "
-            expand_postfix = " Please generate a more detailed description based on the provided image and the short description."
-        elif task == "interpolation":
-            expand_prefix = "Here is a concise description of how the video transitions from the first image to the second image: "
-            expand_postfix = " Please generate a more detailed description of the transition, based on the provided images and the short description."
-        else:
-            expand_prefix = "Here is a concise description of the target video: "
-            expand_postfix = " Please generate a more detailed description based on the short description."
-
-        think_prompt = f"{expand_prefix}{prompt}{expand_postfix}"
+        think_prompt = cls._build_think_rewrite_request(task, prompt, think_mode)
         think_visual_images = cls._prepare_think_visual_images(visual_images)
         think_visual_count = len(think_visual_images) if len(think_visual_images) > 0 else len(image_embeds)
         think_template = cls._build_think_template(task, think_visual_count)
@@ -1257,6 +1292,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             image_embeds,
             visual_images,
             max_new_tokens,
+            think_mode="legacy_rewrite",
         )
         return rewrite["rewritten_prompt"]
 
@@ -1689,6 +1725,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
                 visual_payload["image_embeds"],
                 visual_payload["visual_images"],
                 think_max_new_tokens,
+                think_mode="merge_hidden",
             )
             enhanced_prompt = rewrite["rewritten_prompt"]
             generated_branch_text = rewrite["generated_text"]

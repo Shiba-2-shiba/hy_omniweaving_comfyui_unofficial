@@ -690,7 +690,8 @@ def test_hy_omniweaving_text_encode_merge_hidden_merges_cond_and_deepstack(monke
 
     cond, extra = out[0][0]
     assert len(clip.tokenize_calls) == 3
-    assert "Please generate a more detailed description" in clip.tokenize_calls[1][0]
+    assert "Expand the temporal progression only." in clip.tokenize_calls[1][0]
+    assert "avoiding unnecessary static scene or appearance description" in clip.tokenize_calls[1][0]
     assert clip.last_generate["do_sample"] is False
     assert clip.last_generate["max_length"] == 128
     assert clip.tokenize_calls[2][0] == "expanded prompt"
@@ -707,6 +708,19 @@ def test_hy_omniweaving_i2v_think_prompt_preserves_first_frame_constraints():
     assert "first-frame anchoring" in prompt
     assert "camera motion" not in prompt
     assert "new camera setup" in prompt
+
+
+def test_hy_omniweaving_merge_hidden_rewrite_request_focuses_on_temporal_changes():
+    request = nodes.TextEncodeHunyuanVideo15Omni._build_think_rewrite_request(
+        "i2v",
+        "A girl turns around",
+        "merge_hidden",
+    )
+
+    assert "Expand only the temporal progression for the video." in request
+    assert "Preserve the existing subject identity, clothing, background, lighting, framing, and scene layout." in request
+    assert "Do not restate static appearance or background details unless they directly change over time." in request
+    assert "Please generate a more detailed description" not in request
 
 
 def test_hy_omniweaving_merge_hidden_uses_full_generated_branch_by_default():
