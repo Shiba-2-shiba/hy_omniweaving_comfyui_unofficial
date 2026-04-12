@@ -48,10 +48,16 @@ Current status:
 
 Known limitations:
 
-- The tested public checkpoints still have `mm_in.linear_2.weight == 0` and `mm_in.linear_2.bias == 0`, so deepstack transport is structurally wired but the connector output is numerically inactive.
 - `i2v` / `t2v` logs still show a small `cond_tokens` vs `deepstack_tokens` mismatch after crop/setclip. This is a remaining parity-quality issue, not a current execution blocker.
 - Prompt-following and motion-heavy scenes can still diverge from the original runtime, especially where OmniWeaving-specific deepstack behavior would matter.
 - `merge_hidden` is still experimental in quality behavior. Even with the AR-based auxiliary branch, early-frame drift can appear when the generated continuation over-describes static appearance or background details.
+
+Current deepstack note:
+
+- The currently tested checkpoints are no longer showing the earlier `mm_in.linear_2 == 0` situation.
+- Recent debug logs show non-zero `source_linear2_norm` / `attached_linear2_norm` values and a non-zero projected norm in the diffusion wrapper.
+- In practice, this means deepstack transport is not just structurally wired anymore; the connector path is now numerically active.
+- Remaining quality issues should therefore be treated as behavior / guidance problems first, not as proof that `mm_in` is still inactive.
 
 Think-mode notes:
 
@@ -103,4 +109,8 @@ Debugging notes:
 - In the current validated `i2v` path, text-side multimodal input still prefers explicit `semantic_images` when they are connected, even if `HY OmniWeaving Redux Vision Encode` also populates `clip_vision_output.mm_projected`.
 - `mm_projected` being `None` is no longer expected in the Redux-backed `i2v` workflow, but it can still appear in fallback/legacy CLIP-Vision paths.
 - `unet unexpected: ['mm_in...']` is currently a diagnostic signal, not by itself a failure, because the stock loader ignores OmniWeaving-only `mm_in.*` keys and the custom loader re-attaches them afterward.
+- If you want to confirm that deepstack is active in a real run, inspect:
+  - `unet loader detected mm_in tensors ... source_linear2_norm=...`
+  - `mm_in source_vs_attach ... attached_linear2_norm=...`
+  - `diffusion wrapper fired ... projected_norm=...`
 - The previous `i2v` runtime crash caused by an invalid `ref_latent` payload has been removed from the current conditioning path.
