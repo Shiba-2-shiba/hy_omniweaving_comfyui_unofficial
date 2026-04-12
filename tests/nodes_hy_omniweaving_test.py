@@ -628,6 +628,138 @@ def test_hy_omniweaving_text_encode_think_resizes_visual_inputs_for_ar_prompt():
     assert tuple(think_images[0].shape[-3:-1]) == (560, 280)
 
 
+def test_hy_omniweaving_rewrite_suppression_sets_and_clears_transformer_tokens():
+    class _GenerateClip(_ClipStub):
+        def __init__(self):
+            super().__init__(has_byt5=True)
+            self.transformer = types.SimpleNamespace()
+            self.cond_stage_model.qwen25_7b = types.SimpleNamespace(transformer=self.transformer)
+
+        def generate(self, tokens, do_sample=False, max_length=256):
+            self.suppressed_during_generate = tuple(getattr(self.transformer, "_hy_suppressed_token_ids", ()))
+            return [151645]
+
+    clip = _GenerateClip()
+
+    generated = nodes.TextEncodeHunyuanVideo15Omni._generate_with_rewrite_suppression(clip, {"tokens": "x"}, 8)
+
+    assert generated == [151645]
+    assert 151653 in clip.suppressed_during_generate
+    assert not hasattr(clip.transformer, "_hy_suppressed_token_ids")
+
+
+def test_hy_omniweaving_text_encode_merge_hidden_merges_cond_and_deepstack(monkeypatch):
+    clip = _ClipStub(has_byt5=True)
+    pooled_base = torch.tensor([[1.0, 2.0]])
+
+    monkeypatch.setattr(nodes, "ensure_runtime_patches", lambda: None)
+    monkeypatch.setattr(nodes, "ensure_hy_omniweaving_text_encoder_support", lambda clip: None)
+
+    def encode_token_weights(tokens):
+        text = tokens["tokens"]
+        is_think = "Make the temporal progression explicit" in text
+        seq = 6 if is_think else 4
+        value = 2.0 if is_think else 1.0
+        pooled = torch.tensor([[9.0, 9.0]]) if is_think else pooled_base
+        return (
+            torch.full((1, seq, 2), value),
+            pooled,
+            {
+                "attention_mask": torch.ones((1, seq)),
+                "all_stack_text_states": torch.full((3, 1, seq, 2), value),
+            },
+        )
+
+    clip.cond_stage_model.encode_token_weights = encode_token_weights
+
+    out = nodes.TextEncodeHunyuanVideo15Omni.execute(
+        clip=clip,
+        prompt="A dancer starts moving",
+        task="t2v",
+        use_visual_inputs=False,
+        max_visual_inputs=8,
+        think=True,
+        think_max_new_tokens=128,
+        think_mode="merge_hidden",
+        think_keep_tokens=3,
+        deepstack_layers="8,16,24",
+        setclip=True,
+        semantic_images=None,
+        clip_vision_output=None,
+    )
+
+    cond, extra = out[0][0]
+    assert len(clip.tokenize_calls) == 2
+    assert not hasattr(clip, "last_generate")
+    assert tuple(cond.shape) == (1, 7, 2)
+    assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 7, 2)
+    assert tuple(extra["attention_mask"].shape) == (1, 7)
+    assert torch.equal(extra["pooled_output"], pooled_base)
+
+
+def test_hy_omniweaving_i2v_think_prompt_preserves_first_frame_constraints():
+    prompt = nodes.TextEncodeHunyuanVideo15Omni._build_think_conditioning_prompt("i2v", "A girl turns around")
+
+    assert "preserve the same subject identity, background, layout, lighting, and overall framing" in prompt
+    assert "first-frame anchoring" in prompt
+    assert "camera motion" not in prompt
+    assert "new camera setup" in prompt
+
+
+def test_hy_omniweaving_i2v_merge_hidden_uses_lower_default_keep_tokens():
+    think_encoding = {
+        "cond": torch.ones((1, 90, 2)),
+        "extra": {
+            "all_stack_text_states": torch.ones((3, 1, 90, 2)),
+        },
+    }
+
+    keep_tokens = nodes.TextEncodeHunyuanVideo15Omni._resolve_effective_keep_tokens("i2v", 0, think_encoding)
+
+    assert keep_tokens == 32
+
+
+def test_hy_omniweaving_text_encode_merge_hidden_skips_negative_prompt_like_text(monkeypatch):
+    clip = _ClipStub(has_byt5=True)
+
+    monkeypatch.setattr(nodes, "ensure_runtime_patches", lambda: None)
+    monkeypatch.setattr(nodes, "ensure_hy_omniweaving_text_encoder_support", lambda clip: None)
+
+    def encode_token_weights(tokens):
+        return (
+            torch.ones((1, 4, 2)),
+            torch.zeros((1, 2)),
+            {
+                "attention_mask": torch.ones((1, 4)),
+                "all_stack_text_states": torch.ones((3, 1, 4, 2)),
+            },
+        )
+
+    clip.cond_stage_model.encode_token_weights = encode_token_weights
+
+    out = nodes.TextEncodeHunyuanVideo15Omni.execute(
+        clip=clip,
+        prompt="low quality, blurry artifacts, watermark, bad anatomy",
+        task="t2v",
+        use_visual_inputs=False,
+        max_visual_inputs=8,
+        think=True,
+        think_max_new_tokens=128,
+        think_mode="merge_hidden",
+        think_keep_tokens=3,
+        deepstack_layers="8,16,24",
+        setclip=True,
+        semantic_images=None,
+        clip_vision_output=None,
+    )
+
+    cond, extra = out[0][0]
+    assert len(clip.tokenize_calls) == 1
+    assert not hasattr(clip, "last_generate")
+    assert tuple(cond.shape) == (1, 4, 2)
+    assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 4, 2)
+
+
 def test_decode_generated_text_trims_prompt_prefix_only_when_it_matches():
     clip = _ClipStub(has_byt5=True)
     generated = torch.tensor([[101, 102, 201, 202]])
@@ -946,6 +1078,61 @@ def test_ensure_runtime_patches_is_idempotent(monkeypatch):
     assert runtime_patches.ensure_runtime_patches() is True
     assert runtime_patches.ensure_runtime_patches() is False
     assert calls == ["think", "vae"]
+
+
+def test_patch_qwen25_think_generation_uses_lm_head_weight_for_logits(monkeypatch):
+    import comfy.text_encoders.llama as llama
+
+    class _BaseGenerate:
+        def generate(self, *args, **kwargs):
+            return []
+
+    monkeypatch.setattr(llama, "BaseGenerate", _BaseGenerate)
+    monkeypatch.setattr(llama, "Qwen25_7BVLI_Config", type("Qwen25_7BVLI_Config", (), {}))
+
+    runtime_patches._patch_qwen25_think_generation()
+
+    embed_tokens = types.SimpleNamespace(
+        weight=torch.nn.Parameter(torch.tensor([[1.0, 0.0], [0.0, 1.0]])),
+        comfy_cast_weights=False,
+    )
+    lm_head = types.SimpleNamespace(
+        weight=torch.nn.Parameter(torch.tensor([[0.0, 2.0], [3.0, 0.0]])),
+        comfy_cast_weights=False,
+    )
+    generator = llama.BaseGenerate()
+    generator.model = types.SimpleNamespace(embed_tokens=embed_tokens, lm_head=lm_head)
+
+    logits = generator.logits(torch.tensor([[[1.0, 2.0]]], dtype=torch.float32))
+
+    assert tuple(logits.shape) == (1, 1, 2)
+    assert torch.equal(logits[0, 0], torch.tensor([4.0, 3.0]))
+
+
+def test_patch_qwen25_think_generation_adds_qwen_lm_head(monkeypatch):
+    import comfy.text_encoders.llama as llama
+
+    class _BaseGenerate:
+        def generate(self, *args, **kwargs):
+            return []
+
+    class _FakeQwen25_7BVLI:
+        def __init__(self, config_dict, dtype, device, operations):
+            self.model = types.SimpleNamespace(
+                config=types.SimpleNamespace(hidden_size=3, vocab_size=5, lm_head=False)
+            )
+
+    monkeypatch.setattr(llama, "BaseGenerate", _BaseGenerate)
+    monkeypatch.setattr(llama, "Qwen25_7BVLI", _FakeQwen25_7BVLI, raising=False)
+    monkeypatch.setattr(llama, "Qwen25_7BVLI_Config", type("Qwen25_7BVLI_Config", (), {}))
+
+    runtime_patches._patch_qwen25_think_generation()
+
+    qwen = llama.Qwen25_7BVLI({}, torch.float32, "cpu", types.SimpleNamespace(Linear=torch.nn.Linear))
+
+    assert hasattr(qwen.model, "lm_head")
+    assert tuple(qwen.model.lm_head.weight.shape) == (5, 3)
+    assert qwen.model.config.lm_head is True
 
 
 def test_convert_split_hy_omniweaving_attention_qkv_weight_and_bias():
@@ -1360,6 +1547,37 @@ def test_hy_omniweaving_text_encoder_support_applies_setclip_to_cond_and_deepsta
     assert tuple(cond.shape) == (1, 4, 2)
     assert "attention_mask" not in extra
     assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 4, 2)
+
+
+def test_hy_omniweaving_text_encoder_support_logs_why_attention_mask_is_missing(monkeypatch, caplog):
+    clip = _ClipStub(has_byt5=True)
+
+    def encode_token_weights(tokens):
+        return (
+            torch.arange(1 * 7 * 2, dtype=torch.float32).reshape(1, 7, 2),
+            torch.zeros((1, 2)),
+            {},
+        )
+
+    def qwen_encode_token_weights(token_weight_pairs):
+        qwen_out = torch.ones((1, 3, 9, 2))
+        qwen_extra = {"attention_mask": torch.ones((1, 9))}
+        return qwen_out, None, qwen_extra
+
+    clip.cond_stage_model.encode_token_weights = encode_token_weights
+    clip.cond_stage_model.qwen25_7b.encode_token_weights = qwen_encode_token_weights
+    runtime_patches.ensure_hy_omniweaving_text_encoder_support(clip)
+    clip.cond_stage_model.set_clip_options({"deepstack": [8, 16], "setclip": True, "crop_start": 2, "task_name": "i2v"})
+
+    monkeypatch.setenv("HY_OMNIWEAVING_DEBUG", "1")
+    with caplog.at_level("INFO"):
+        clip.cond_stage_model.encode_token_weights(
+            {"qwen25_7b": [[(151644, 1.0), (151644, 1.0), (11, 1.0), (12, 1.0), (151653, 1.0), (21, 1.0), (22, 1.0), (23, 1.0), (24, 1.0)]]}
+        )
+
+    assert "attention_mask_reason=setclip_removed_missing_orig_encode_mask" in caplog.text
+    assert "orig_attention_mask_state=missing" in caplog.text
+    assert "final_attention_mask_state=missing" in caplog.text
 
 
 def test_ensure_hy_omniweaving_text_encoder_support_is_idempotent():

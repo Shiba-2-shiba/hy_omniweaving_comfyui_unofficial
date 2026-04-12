@@ -955,6 +955,31 @@ class HYOmniWeavingVAELoader(io.ComfyNode):
 class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
     THINK_MAX_EFFECTIVE_NEW_TOKENS = 256
     THINK_MAX_REWRITE_CHARS = 2048
+    REWRITE_SUPPRESSED_TOKEN_IDS = (
+        151644,
+        151646, 151647, 151648, 151649, 151650, 151651,
+        151652, 151653, 151654, 151655, 151656,
+        151657, 151658, 151659, 151660, 151661, 151662, 151663, 151664, 151665, 151666,
+        151667, 151668,
+    )
+    THINK_MODES = ("legacy_rewrite", "merge_hidden")
+    THINK_KEEP_TOKENS_BY_TASK = {
+        "i2v": 32,
+        "t2v": 112,
+        "interpolation": 96,
+    }
+    NEGATIVE_PROMPT_HINTS = (
+        "low quality",
+        "bad anatomy",
+        "blur",
+        "blurry",
+        "artifacts",
+        "watermark",
+        "worst quality",
+        "deformed",
+        "jpeg artifacts",
+        "text",
+    )
     TASK_SPECS = {
         "t2v": {
             "prompt_mode": 1,
@@ -1003,6 +1028,8 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
                 io.Int.Input("max_visual_inputs", default=8, min=1, max=64, advanced=True),
                 io.Boolean.Input("think", default=False, advanced=True),
                 io.Int.Input("think_max_new_tokens", default=1000, min=1, max=4096, advanced=True),
+                io.Combo.Input("think_mode", options=list(cls.THINK_MODES), default="legacy_rewrite", advanced=True),
+                io.Int.Input("think_keep_tokens", default=0, min=0, max=2048, advanced=True),
                 io.String.Input("deepstack_layers", default="8,16,24", advanced=True),
                 io.Boolean.Input("setclip", default=True, advanced=True),
                 io.ClipVisionOutput.Input("clip_vision_output", optional=True),
@@ -1088,6 +1115,33 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         count = min(images.shape[0], max_visual_inputs)
         return [images[i:i + 1, :, :, :3] for i in range(count)]
 
+    @classmethod
+    def _resolve_visual_payload(cls, task, use_visual_inputs, max_visual_inputs, reference_images=None, semantic_images=None, clip_vision_output=None):
+        visual_images = []
+        image_embeds = []
+        visual_source = "none"
+        if use_visual_inputs:
+            visual_inputs = semantic_images if semantic_images is not None else reference_images
+            visual_images = cls._extract_visual_images(visual_inputs, max_visual_inputs)
+            if len(visual_images) > 0:
+                visual_source = "semantic_images" if semantic_images is not None else "reference_images"
+            else:
+                image_embeds = cls._extract_image_embeds(clip_vision_output, max_visual_inputs)
+                if len(image_embeds) > 0:
+                    visual_source = "clip_vision_output.mm_projected"
+                elif task in ("i2v", "interpolation", "reference2v", "tiv2v"):
+                    logging.warning(
+                        "HYOmniWeavingTextEncode has no usable text-side visual inputs for task '%s'. "
+                        "Connect HY OmniWeaving Image Prep output to reference_images for parity-sensitive runs.",
+                        task,
+                    )
+        return {
+            "visual_images": visual_images,
+            "image_embeds": image_embeds,
+            "visual_source": visual_source,
+            "visual_input_count": len(visual_images) if len(visual_images) > 0 else len(image_embeds),
+        }
+
     @staticmethod
     def _require_full_text_path(clip):
         if _clip_has_byt5_branch(clip):
@@ -1145,7 +1199,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             visual_images=think_visual_images if len(think_visual_images) > 0 else None,
         )
 
-        generated = clip.generate(tokens, do_sample=False, max_length=effective_max_new_tokens)
+        generated = cls._generate_with_rewrite_suppression(clip, tokens, effective_max_new_tokens)
         generated_text = cls._decode_generated_text(clip, generated, tokens)
         _debug_log(
             "think rewrite task=%s original_chars=%s generated_chars=%s visual_inputs=%s",
@@ -1153,6 +1207,11 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             len(prompt),
             len(generated_text),
             think_visual_count,
+        )
+        _debug_log(
+            "think rewrite generated_text task=%s text=%s",
+            task,
+            json.dumps(generated_text, ensure_ascii=False),
         )
         if len(generated_text) == 0:
             return prompt
@@ -1169,12 +1228,19 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             task,
             len(rewritten),
         )
+        _debug_log(
+            "think rewrite rewritten_text task=%s text=%s",
+            task,
+            json.dumps(rewritten, ensure_ascii=False),
+        )
         return rewritten
 
     @staticmethod
     def _parse_deepstack_layers(deepstack_layers: str):
         if deepstack_layers is None:
             return []
+        if isinstance(deepstack_layers, (list, tuple)):
+            return [int(item) for item in deepstack_layers]
         values = []
         for item in deepstack_layers.split(","):
             item = item.strip()
@@ -1233,6 +1299,161 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             return clip.decode(decode_input).strip()
 
     @staticmethod
+    def _rewrite_generation_target(clip):
+        cond_stage_model = getattr(clip, "cond_stage_model", None)
+        clip_name = getattr(cond_stage_model, "clip", "qwen25_7b")
+        clip_model = getattr(cond_stage_model, clip_name, None)
+        if clip_model is None:
+            return None
+        return getattr(clip_model, "transformer", clip_model)
+
+    @classmethod
+    def _generate_with_rewrite_suppression(cls, clip, tokens, max_new_tokens: int):
+        target = cls._rewrite_generation_target(clip)
+        previous = None
+        had_previous = False
+        if target is not None:
+            had_previous = hasattr(target, "_hy_suppressed_token_ids")
+            previous = getattr(target, "_hy_suppressed_token_ids", None)
+            target._hy_suppressed_token_ids = cls.REWRITE_SUPPRESSED_TOKEN_IDS
+            _debug_log(
+                "rewrite suppression enabled token_count=%s first_ids=%s target=%s",
+                len(cls.REWRITE_SUPPRESSED_TOKEN_IDS),
+                cls.REWRITE_SUPPRESSED_TOKEN_IDS[:8],
+                type(target).__name__,
+            )
+        try:
+            return clip.generate(tokens, do_sample=False, max_length=max_new_tokens)
+        finally:
+            if target is not None:
+                if had_previous:
+                    target._hy_suppressed_token_ids = previous
+                elif hasattr(target, "_hy_suppressed_token_ids"):
+                    delattr(target, "_hy_suppressed_token_ids")
+
+    @classmethod
+    def _build_think_conditioning_prompt(cls, task: str, prompt: str) -> str:
+        if task == "i2v":
+            suffix = (
+                "Starting from the provided first frame, preserve the same subject identity, background, "
+                "layout, lighting, and overall framing. Make the temporal progression explicit with motion, "
+                "pose change, expression change, and event order while keeping strong first-frame anchoring. "
+                "Do not add new objects, new background elements, visible text, or a new camera setup."
+            )
+        elif task == "interpolation":
+            suffix = (
+                "Explain the transition between the boundary frames with explicit intermediate motion, "
+                "camera movement, and temporal continuity, without adding new objects."
+            )
+        else:
+            suffix = (
+                "Make the temporal progression explicit while preserving the same subject, action, "
+                "mood, count, and event order."
+            )
+        return f"{prompt.rstrip()}\n{suffix}"
+
+    @classmethod
+    def _is_negative_prompt_like(cls, prompt) -> bool:
+        if not isinstance(prompt, str):
+            return False
+        normalized = prompt.strip().lower()
+        if len(normalized) == 0:
+            return False
+        if normalized.startswith("negative prompt:"):
+            return True
+        hit_count = sum(1 for hint in cls.NEGATIVE_PROMPT_HINTS if hint in normalized)
+        return hit_count >= 2
+
+    @classmethod
+    def _should_skip_think_merge(cls, prompt, task) -> bool:
+        if not isinstance(prompt, str):
+            return True
+        if task not in cls.THINK_KEEP_TOKENS_BY_TASK:
+            return True
+        if len(prompt.strip()) == 0:
+            return True
+        return cls._is_negative_prompt_like(prompt)
+
+    @staticmethod
+    def _tail_tokens(value, keep_tokens: int, dim: int):
+        if not torch.is_tensor(value):
+            return value
+        if keep_tokens <= 0 or value.shape[dim] <= keep_tokens:
+            return value
+        index = [slice(None)] * value.ndim
+        index[dim] = slice(value.shape[dim] - keep_tokens, None)
+        return value[tuple(index)].contiguous()
+
+    @classmethod
+    def _resolve_effective_keep_tokens(cls, task: str, think_keep_tokens: int, think_encoding: dict) -> int:
+        requested = think_keep_tokens if think_keep_tokens > 0 else cls.THINK_KEEP_TOKENS_BY_TASK.get(task, 0)
+        lengths = []
+        cond = think_encoding.get("cond")
+        extra = think_encoding.get("extra", {})
+        if torch.is_tensor(cond) and cond.ndim >= 2:
+            lengths.append(cond.shape[1])
+        deepstack = extra.get("all_stack_text_states")
+        if torch.is_tensor(deepstack) and deepstack.ndim >= 3:
+            lengths.append(deepstack.shape[2])
+        attention_mask = extra.get("attention_mask")
+        if torch.is_tensor(attention_mask) and attention_mask.ndim >= 2:
+            lengths.append(attention_mask.shape[1])
+        if len(lengths) == 0:
+            return max(requested, 0)
+        if requested <= 0:
+            return min(lengths)
+        return min([requested, *lengths])
+
+    @classmethod
+    def _merge_encoded_conditioning(cls, base_encoding: dict, think_encoding: dict, task: str, think_keep_tokens: int):
+        effective_keep_tokens = cls._resolve_effective_keep_tokens(task, think_keep_tokens, think_encoding)
+        if effective_keep_tokens <= 0:
+            return base_encoding
+
+        base_cond = base_encoding.get("cond")
+        think_cond = cls._tail_tokens(think_encoding.get("cond"), effective_keep_tokens, dim=1)
+        if not torch.is_tensor(base_cond) or not torch.is_tensor(think_cond):
+            return base_encoding
+
+        merged_extra = dict(base_encoding.get("extra", {}))
+        merged_cond = torch.cat([base_cond, think_cond], dim=1)
+
+        base_deepstack = merged_extra.get("all_stack_text_states")
+        think_deepstack = cls._tail_tokens(think_encoding.get("extra", {}).get("all_stack_text_states"), effective_keep_tokens, dim=2)
+        if torch.is_tensor(base_deepstack) and torch.is_tensor(think_deepstack):
+            merged_extra["all_stack_text_states"] = torch.cat([base_deepstack, think_deepstack], dim=2)
+
+        base_attention_mask = merged_extra.get("attention_mask")
+        think_attention_mask = cls._tail_tokens(think_encoding.get("extra", {}).get("attention_mask"), effective_keep_tokens, dim=1)
+        if torch.is_tensor(base_attention_mask) and torch.is_tensor(think_attention_mask):
+            merged_extra["attention_mask"] = torch.cat([base_attention_mask, think_attention_mask], dim=1)
+
+        merged_extra["pooled_output"] = base_encoding["pooled_output"]
+        _debug_log(
+            "think merge task=%s keep_tokens=%s base_cond_shape=%s think_cond_shape=%s merged_cond_shape=%s "
+            "base_deepstack_shape=%s think_deepstack_shape=%s merged_deepstack_shape=%s",
+            task,
+            effective_keep_tokens,
+            _shape_of(base_cond),
+            _shape_of(think_encoding.get("cond")),
+            _shape_of(merged_cond),
+            _shape_of(base_deepstack),
+            _shape_of(think_encoding.get("extra", {}).get("all_stack_text_states")),
+            _shape_of(merged_extra.get("all_stack_text_states")),
+        )
+        return {
+            **base_encoding,
+            "cond": merged_cond,
+            "pooled_output": base_encoding["pooled_output"],
+            "extra": merged_extra,
+            "think_tokens_kept": effective_keep_tokens,
+        }
+
+    @classmethod
+    def _conditioning_output(cls, encoded_components: dict):
+        return [[encoded_components["cond"], encoded_components["extra"]]]
+
+    @staticmethod
     def _encode_with_parity_options(clip, tokens, deepstack_layers, setclip, crop_start: int | None, task: str, visual_input_count: int = 0):
         clip.cond_stage_model.reset_clip_options()
         clip.load_model(tokens)
@@ -1262,54 +1483,152 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             _shape_of(pooled_dict.get("all_stack_text_states")),
             _shape_of(pooled_dict.get("attention_mask")),
         )
-        return [[cond, pooled_dict]]
+        return {
+            "cond": cond,
+            "pooled_output": pooled,
+            "extra": pooled_dict,
+        }
 
     @classmethod
-    def execute(cls, clip, prompt, task, use_visual_inputs, max_visual_inputs, think, think_max_new_tokens, deepstack_layers, setclip, reference_images=None, semantic_images=None, clip_vision_output=None) -> io.NodeOutput:
+    def _encode_prompt_components(cls, clip, prompt, task, deepstack_layers, setclip, image_embeds, visual_images, visual_source):
+        visual_input_count = len(visual_images) if len(visual_images) > 0 else len(image_embeds)
+        template = cls._build_template(task, visual_input_count, add_generation_prompt=True)
+        tokens = cls._tokenize_with_template(
+            clip,
+            prompt,
+            template,
+            image_embeds,
+            visual_images=visual_images if len(visual_images) > 0 else None,
+        )
+        crop_start = cls._task_crop_start(task)
+        encoded = cls._encode_with_parity_options(
+            clip,
+            tokens,
+            cls._parse_deepstack_layers(deepstack_layers),
+            setclip,
+            crop_start,
+            task,
+            visual_input_count,
+        )
+        encoded.update(
+            {
+                "tokens": tokens,
+                "prompt": prompt,
+                "crop_start": crop_start,
+                "visual_source": visual_source,
+                "visual_input_count": visual_input_count,
+            }
+        )
+        return encoded
+
+    @classmethod
+    def execute(
+        cls,
+        clip,
+        prompt,
+        task,
+        use_visual_inputs,
+        max_visual_inputs,
+        think,
+        think_max_new_tokens,
+        deepstack_layers,
+        setclip,
+        reference_images=None,
+        semantic_images=None,
+        clip_vision_output=None,
+        think_mode="legacy_rewrite",
+        think_keep_tokens=0,
+    ) -> io.NodeOutput:
         ensure_runtime_patches()
         ensure_hy_omniweaving_text_encoder_support(clip)
         cls._require_full_text_path(clip)
         cls._require_visual_inputs(task, use_visual_inputs, clip_vision_output, reference_images, semantic_images)
+        if think_mode not in cls.THINK_MODES:
+            raise ValueError(f"Unsupported think_mode '{think_mode}'. Expected one of {cls.THINK_MODES}.")
         vision_shapes = _clip_vision_shapes(clip_vision_output)
-        visual_inputs = semantic_images if semantic_images is not None else reference_images
-        visual_images = cls._extract_visual_images(visual_inputs, max_visual_inputs) if use_visual_inputs else []
-        image_embeds = []
-        visual_source = "none"
-        if len(visual_images) > 0:
-            visual_source = "semantic_images" if semantic_images is not None else "reference_images"
-        elif use_visual_inputs:
-            image_embeds = cls._extract_image_embeds(clip_vision_output, max_visual_inputs)
-            if len(image_embeds) > 0:
-                visual_source = "clip_vision_output.mm_projected"
-            elif task in ("i2v", "interpolation", "reference2v", "tiv2v"):
-                logging.warning(
-                    "HYOmniWeavingTextEncode has no usable text-side visual inputs for task '%s'. "
-                    "Connect HY OmniWeaving Image Prep output to reference_images for parity-sensitive runs.",
-                    task,
-                )
+        visual_payload = cls._resolve_visual_payload(
+            task,
+            use_visual_inputs,
+            max_visual_inputs,
+            reference_images=reference_images,
+            semantic_images=semantic_images,
+            clip_vision_output=clip_vision_output,
+        )
         _debug_log(
-            "text encode task=%s prompt_mode=%s crop_start=%s image_embeds=%s visual_images=%s visual_source=%s think=%s deepstack=%s setclip=%s clip_vision=%s",
+            "text encode task=%s prompt_mode=%s crop_start=%s image_embeds=%s visual_images=%s visual_source=%s think=%s think_mode=%s "
+            "think_keep_tokens=%s deepstack=%s setclip=%s clip_vision=%s",
             task,
             cls._task_prompt_mode(task),
             cls._task_crop_start(task),
-            len(image_embeds),
-            len(visual_images),
-            visual_source,
+            len(visual_payload["image_embeds"]),
+            len(visual_payload["visual_images"]),
+            visual_payload["visual_source"],
             think,
+            think_mode,
+            think_keep_tokens,
             deepstack_layers,
             setclip,
             vision_shapes,
         )
+        if think and think_mode == "merge_hidden":
+            base_encoding = cls._encode_prompt_components(
+                clip,
+                prompt,
+                task,
+                deepstack_layers,
+                setclip,
+                visual_payload["image_embeds"],
+                visual_payload["visual_images"],
+                visual_payload["visual_source"],
+            )
+            if cls._should_skip_think_merge(prompt, task):
+                _debug_log("think merge skipped task=%s prompt_len=%s", task, len(prompt) if isinstance(prompt, str) else None)
+                return io.NodeOutput(cls._conditioning_output(base_encoding))
+
+            think_prompt = cls._build_think_conditioning_prompt(task, prompt)
+            think_encoding = cls._encode_prompt_components(
+                clip,
+                think_prompt,
+                task,
+                deepstack_layers,
+                setclip,
+                visual_payload["image_embeds"],
+                visual_payload["visual_images"],
+                visual_payload["visual_source"],
+            )
+            merged_encoding = cls._merge_encoded_conditioning(base_encoding, think_encoding, task, think_keep_tokens)
+            _debug_log(
+                "think merge metadata task=%s visual_source=%s crop_start=%s setclip=%s base_tokens=%s think_tokens_raw=%s think_tokens_kept=%s",
+                task,
+                merged_encoding["visual_source"],
+                merged_encoding["crop_start"],
+                setclip,
+                _shape_of(base_encoding["cond"]),
+                _shape_of(think_encoding["cond"]),
+                merged_encoding.get("think_tokens_kept"),
+            )
+            return io.NodeOutput(cls._conditioning_output(merged_encoding))
+
         if think:
-            prompt = cls._rewrite_prompt_with_think(clip, prompt, task, image_embeds, visual_images, think_max_new_tokens)
-        template = cls._build_template(task, len(image_embeds), add_generation_prompt=True)
-        if len(visual_images) > 0:
-            template = cls._build_template(task, len(visual_images), add_generation_prompt=True)
-        tokens = cls._tokenize_with_template(clip, prompt, template, image_embeds, visual_images=visual_images if len(visual_images) > 0 else None)
-        deepstack = cls._parse_deepstack_layers(deepstack_layers)
-        crop_start = cls._task_crop_start(task)
-        visual_input_count = len(visual_images) if len(visual_images) > 0 else len(image_embeds)
-        return io.NodeOutput(cls._encode_with_parity_options(clip, tokens, deepstack, setclip, crop_start, task, visual_input_count))
+            prompt = cls._rewrite_prompt_with_think(
+                clip,
+                prompt,
+                task,
+                visual_payload["image_embeds"],
+                visual_payload["visual_images"],
+                think_max_new_tokens,
+            )
+        encoded = cls._encode_prompt_components(
+            clip,
+            prompt,
+            task,
+            deepstack_layers,
+            setclip,
+            visual_payload["image_embeds"],
+            visual_payload["visual_images"],
+            visual_payload["visual_source"],
+        )
+        return io.NodeOutput(cls._conditioning_output(encoded))
 
 
 class HunyuanClipVisionOutputConcat(io.ComfyNode):
