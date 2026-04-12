@@ -657,7 +657,7 @@ def test_hy_omniweaving_text_encode_merge_hidden_merges_cond_and_deepstack(monke
 
     def encode_token_weights(tokens):
         text = tokens["tokens"]
-        is_think = "Here is a more detailed description. expanded prompt" in text
+        is_think = text == "expanded prompt"
         seq = 6 if is_think else 4
         value = 2.0 if is_think else 1.0
         pooled = torch.tensor([[9.0, 9.0]]) if is_think else pooled_base
@@ -693,7 +693,7 @@ def test_hy_omniweaving_text_encode_merge_hidden_merges_cond_and_deepstack(monke
     assert "Please generate a more detailed description" in clip.tokenize_calls[1][0]
     assert clip.last_generate["do_sample"] is False
     assert clip.last_generate["max_length"] == 128
-    assert "Here is a more detailed description. expanded prompt" in clip.tokenize_calls[2][0]
+    assert clip.tokenize_calls[2][0] == "expanded prompt"
     assert tuple(cond.shape) == (1, 7, 2)
     assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 7, 2)
     assert tuple(extra["attention_mask"].shape) == (1, 7)

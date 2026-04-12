@@ -1169,13 +1169,16 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         )
 
     @classmethod
-    def _rewrite_prompt_with_think(cls, clip, prompt, task, image_embeds, visual_images, max_new_tokens: int) -> str:
+    def _rewrite_prompt_with_think_parts(cls, clip, prompt, task, image_embeds, visual_images, max_new_tokens: int) -> dict:
         if not isinstance(prompt, str):
             raise ValueError("Think mode currently requires a single string prompt.")
         if task not in ("t2v", "i2v", "interpolation"):
             raise ValueError("Think mode is currently intended only for t2v, i2v, or interpolation tasks.")
         if max_new_tokens <= 0:
-            return prompt
+            return {
+                "generated_text": "",
+                "rewritten_prompt": prompt,
+            }
         effective_max_new_tokens = min(max_new_tokens, cls.THINK_MAX_EFFECTIVE_NEW_TOKENS)
 
         if task == "i2v":
@@ -1215,14 +1218,20 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             json.dumps(generated_text, ensure_ascii=False),
         )
         if len(generated_text) == 0:
-            return prompt
+            return {
+                "generated_text": "",
+                "rewritten_prompt": prompt,
+            }
         if len(generated_text) > cls.THINK_MAX_REWRITE_CHARS:
             logging.warning(
                 "HYOmniWeavingTextEncode rejected runaway think rewrite for task '%s' because generated text was too long (%s chars).",
                 task,
                 len(generated_text),
             )
-            return prompt
+            return {
+                "generated_text": "",
+                "rewritten_prompt": prompt,
+            }
         rewritten = f"{prompt} Here is a more detailed description. {generated_text}"
         _debug_log(
             "think rewrite result task=%s rewritten_chars=%s",
@@ -1234,7 +1243,22 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             task,
             json.dumps(rewritten, ensure_ascii=False),
         )
-        return rewritten
+        return {
+            "generated_text": generated_text,
+            "rewritten_prompt": rewritten,
+        }
+
+    @classmethod
+    def _rewrite_prompt_with_think(cls, clip, prompt, task, image_embeds, visual_images, max_new_tokens: int) -> str:
+        rewrite = cls._rewrite_prompt_with_think_parts(
+            clip,
+            prompt,
+            task,
+            image_embeds,
+            visual_images,
+            max_new_tokens,
+        )
+        return rewrite["rewritten_prompt"]
 
     @staticmethod
     def _parse_deepstack_layers(deepstack_layers: str):
@@ -1659,7 +1683,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
                 _debug_log("think merge skipped task=%s prompt_len=%s", task, len(prompt) if isinstance(prompt, str) else None)
                 return io.NodeOutput(cls._conditioning_output(base_encoding))
 
-            think_prompt = cls._rewrite_prompt_with_think(
+            rewrite = cls._rewrite_prompt_with_think_parts(
                 clip,
                 prompt,
                 task,
@@ -1667,7 +1691,9 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
                 visual_payload["visual_images"],
                 think_max_new_tokens,
             )
-            if think_prompt == prompt:
+            enhanced_prompt = rewrite["rewritten_prompt"]
+            generated_branch_text = rewrite["generated_text"]
+            if len(generated_branch_text) == 0:
                 _debug_log(
                     "think merge fell back to base prompt task=%s prompt_len=%s",
                     task,
@@ -1677,13 +1703,19 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             _debug_log(
                 "think merge enhanced_prompt task=%s chars=%s text=%s",
                 task,
-                len(think_prompt) if isinstance(think_prompt, str) else None,
-                json.dumps(think_prompt, ensure_ascii=False),
+                len(enhanced_prompt) if isinstance(enhanced_prompt, str) else None,
+                json.dumps(enhanced_prompt, ensure_ascii=False),
+            )
+            _debug_log(
+                "think merge generated_branch_text task=%s chars=%s text=%s",
+                task,
+                len(generated_branch_text) if isinstance(generated_branch_text, str) else None,
+                json.dumps(generated_branch_text, ensure_ascii=False),
             )
 
             think_encoding = cls._encode_prompt_components(
                 clip,
-                think_prompt,
+                generated_branch_text,
                 task,
                 deepstack_layers,
                 setclip,
