@@ -49,7 +49,10 @@ Current status:
 Known limitations:
 
 - `i2v` / `t2v` logs still show a small `cond_tokens` vs `deepstack_tokens` mismatch after crop/setclip. This is a remaining parity-quality issue, not a current execution blocker.
-- Prompt-following and motion-heavy scenes can still diverge from the original runtime, especially where OmniWeaving-specific deepstack behavior would matter.
+- Prompt-following and motion-heavy scenes can still diverge from the original runtime, but the likely causes are now:
+  - differences between public rewrite-style inference and the custom `merge_hidden` path
+  - AR branch content quality, including static over-description
+  - early-frame drift while the model reconciles the source image with the auxiliary hidden branch
 - `merge_hidden` is still experimental in quality behavior. Even with the AR-based auxiliary branch, early-frame drift can appear when the generated continuation over-describes static appearance or background details.
 
 Current deepstack note:
@@ -58,6 +61,7 @@ Current deepstack note:
 - Recent debug logs show non-zero `source_linear2_norm` / `attached_linear2_norm` values and a non-zero projected norm in the diffusion wrapper.
 - In practice, this means deepstack transport is not just structurally wired anymore; the connector path is now numerically active.
 - Remaining quality issues should therefore be treated as behavior / guidance problems first, not as proof that `mm_in` is still inactive.
+- Any remaining divergence from the original runtime should therefore be attributed more to prompting, branch content, and implementation-style differences than to an inactive deepstack connector.
 
 Think-mode notes:
 
