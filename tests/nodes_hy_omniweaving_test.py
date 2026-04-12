@@ -709,7 +709,7 @@ def test_hy_omniweaving_i2v_think_prompt_preserves_first_frame_constraints():
     assert "new camera setup" in prompt
 
 
-def test_hy_omniweaving_i2v_merge_hidden_uses_lower_default_keep_tokens():
+def test_hy_omniweaving_merge_hidden_uses_full_generated_branch_by_default():
     think_encoding = {
         "cond": torch.ones((1, 90, 2)),
         "extra": {
@@ -719,7 +719,7 @@ def test_hy_omniweaving_i2v_merge_hidden_uses_lower_default_keep_tokens():
 
     keep_tokens = nodes.TextEncodeHunyuanVideo15Omni._resolve_effective_keep_tokens("i2v", 0, think_encoding)
 
-    assert keep_tokens == 64
+    assert keep_tokens == 90
 
 
 def test_hy_omniweaving_merge_hidden_ignores_trailing_template_control_tokens():

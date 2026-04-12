@@ -1462,7 +1462,6 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
 
     @classmethod
     def _resolve_effective_keep_tokens(cls, task: str, think_keep_tokens: int, think_encoding: dict) -> int:
-        requested = think_keep_tokens if think_keep_tokens > 0 else cls.THINK_KEEP_TOKENS_BY_TASK.get(task, 0)
         lengths = []
         tokens = think_encoding.get("tokens")
         cond = cls._trim_think_trailing_template_tokens(think_encoding.get("cond"), tokens, dim=1)
@@ -1476,10 +1475,10 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         if torch.is_tensor(attention_mask) and attention_mask.ndim >= 2:
             lengths.append(attention_mask.shape[1])
         if len(lengths) == 0:
-            return max(requested, 0)
-        if requested <= 0:
+            return max(think_keep_tokens, 0)
+        if think_keep_tokens <= 0:
             return min(lengths)
-        return min([requested, *lengths])
+        return min([think_keep_tokens, *lengths])
 
     @classmethod
     def _merge_encoded_conditioning(cls, base_encoding: dict, think_encoding: dict, task: str, think_keep_tokens: int):
