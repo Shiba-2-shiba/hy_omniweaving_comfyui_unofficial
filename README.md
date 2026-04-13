@@ -43,6 +43,53 @@ ComfyUI.
 - `HY OmniWeaving Redux Vision Encode` populates `mm_projected` and exposes
   the local SigLIP + Redux path through `clip_vision_output`.
 
+## Required inference files
+
+Place the required model files under your own ComfyUI installation.
+The exact ComfyUI root directory differs by environment, so the paths below use
+`<ComfyUI root>` as a placeholder.
+
+Expected local layout:
+
+- `<ComfyUI root>/models/diffusion_models/hy_omniweaving_hunyuanvideo15_transformer_fp8_e4m3fn_patched.safetensors`
+- `<ComfyUI root>/models/text_encoders/qwen_2.5_vl_7b_finetuned_model.safetensors`
+- `<ComfyUI root>/models/text_encoders/byt5_small_glyphxl_fp16.safetensors`
+- `<ComfyUI root>/models/clip_vision/image_encoder.safetensors`
+- `<ComfyUI root>/models/clip_vision/image_embedder.safetensors`
+- `<ComfyUI root>/models/vae/hunyuanvideo15_vae_fp32.safetensors`
+
+Reference download mapping:
+
+```text
+https://huggingface.co/Shiba-2-shiba/HY-OmniWeaving_HunyuanVideo_1.5_FP8_Patched/resolve/main/hy_omniweaving_hunyuanvideo15_transformer_fp8_e4m3fn_patched.safetensors?download=true
+  -> <ComfyUI root>/models/diffusion_models/hy_omniweaving_hunyuanvideo15_transformer_fp8_e4m3fn_patched.safetensors
+
+https://huggingface.co/tencent/HY-OmniWeaving/resolve/main/text_encoder/ckpt/text_encoder_model.safetensors?download=true
+  -> <ComfyUI root>/models/text_encoders/qwen_2.5_vl_7b_finetuned_model.safetensors
+
+https://huggingface.co/Comfy-Org/HunyuanVideo_1.5_repackaged/resolve/main/split_files/text_encoders/byt5_small_glyphxl_fp16.safetensors?download=true
+  -> <ComfyUI root>/models/text_encoders/byt5_small_glyphxl_fp16.safetensors
+
+https://huggingface.co/Runware/Flex-Redux/resolve/main/image_encoder/model.safetensors?download=true
+  -> <ComfyUI root>/models/clip_vision/image_encoder.safetensors
+
+https://huggingface.co/Runware/Flex-Redux/resolve/main/image_embedder/diffusion_pytorch_model.safetensors?download=true
+  -> <ComfyUI root>/models/clip_vision/image_embedder.safetensors
+
+https://huggingface.co/vafipas663/HY-OmniWeaving_repackaged/resolve/main/split_files/vae/hunyuanvideo15_vae_fp32.safetensors?download=true
+  -> <ComfyUI root>/models/vae/hunyuanvideo15_vae_fp32.safetensors
+```
+
+Notes:
+
+- The filenames above match the names used in the currently validated workflow.
+- The text-encoder loader expects the OmniWeaving-tuned Qwen checkpoint plus
+  the ByT5 checkpoint to both be present under `models/text_encoders`.
+- The Redux vision node expects both `image_encoder.safetensors` and
+  `image_embedder.safetensors` under `models/clip_vision`.
+- If your local filenames differ, ComfyUI can still list them, but the
+  validated workflow and project notes assume the filenames shown above.
+
 ## Runtime patch status
 
 - deepstack `mm_in` is attached loader-side after model load
