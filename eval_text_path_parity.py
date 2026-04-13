@@ -39,6 +39,59 @@ def _load_visual_image(path: str):
     return tensor.unsqueeze(0)
 
 
+def _resolve_processor_root(value: str, comfy_root: Path):
+    raw = Path(value).expanduser()
+    candidates = []
+
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.extend(
+            [
+                raw,
+                (Path.cwd() / raw),
+                (REPO_ROOT / raw),
+                (WORK_ROOT / raw),
+                (comfy_root / raw),
+                (comfy_root.parent / raw),
+            ]
+        )
+
+    # Add a few high-probability defaults for hosted notebooks / Comfy checkouts.
+    candidates.extend(
+        [
+            raw,
+            DEFAULT_PROCESSOR_ROOT,
+            (comfy_root / "Qwen2.5-VL-7B-Instruct"),
+            (comfy_root.parent / "Qwen2.5-VL-7B-Instruct"),
+            Path("/notebooks/Qwen2.5-VL-7B-Instruct"),
+            Path("/workspace/Qwen2.5-VL-7B-Instruct"),
+        ]
+    )
+
+    seen = set()
+    deduped = []
+    for candidate in candidates:
+        candidate = candidate.resolve(strict=False)
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+
+    for candidate in deduped:
+        if candidate.is_dir():
+            return candidate
+
+    checked = "\n".join(f"- {p}" for p in deduped)
+    raise FileNotFoundError(
+        "Could not find a local Qwen2.5-VL processor directory.\n"
+        f"Checked:\n{checked}\n"
+        "Pass --processor-root with the directory that contains files like "
+        "`tokenizer_config.json`, `chat_template.json`, and `preprocessor_config.json`."
+    )
+
+
 def _import_nodes(comfy_root: Path):
     sys.path.insert(0, str(comfy_root))
     sys.path.insert(0, str(REPO_ROOT))
@@ -114,7 +167,9 @@ def _processor_summary(processor_root: Path, messages):
 def main():
     _configure_stdout()
     args = _parse_args()
-    nodes = _import_nodes(Path(args.comfy_root).resolve())
+    comfy_root = Path(args.comfy_root).resolve()
+    nodes = _import_nodes(comfy_root)
+    processor_root = _resolve_processor_root(args.processor_root, comfy_root)
 
     loaded_images = [_load_visual_image(path) for path in args.image]
     stacked_images = torch.cat(loaded_images, dim=0) if len(loaded_images) > 0 else None
@@ -134,6 +189,7 @@ def main():
     result = {
         "task": args.task,
         "prompt": args.prompt,
+        "processor_root": str(processor_root),
         "local_spec": {
             "prompt_mode": spec.prompt_mode,
             "crop_start": spec.crop_start,
@@ -146,7 +202,7 @@ def main():
             "visual_shapes": [tuple(v.shape) for v in spec.ordered_visuals],
         },
         "source_like_processor": _processor_summary(
-            Path(args.processor_root),
+            processor_root,
             _source_like_messages(args.task, args.prompt, pil_images),
         ),
     }
