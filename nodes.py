@@ -48,6 +48,26 @@ def _shape_of(value):
         return tuple(value.shape)
     return None
 
+def _mask_summary(value):
+    if not torch.is_tensor(value):
+        return {
+            "shape": None,
+            "dtype": getattr(value, "dtype", None),
+            "nonzero": None,
+            "all_ones": None,
+            "min": None,
+            "max": None,
+        }
+    value_float = value.float()
+    return {
+        "shape": tuple(value.shape),
+        "dtype": value.dtype,
+        "nonzero": int(torch.count_nonzero(value).item()),
+        "all_ones": bool(torch.all(value == 1).item()),
+        "min": float(value_float.min().item()),
+        "max": float(value_float.max().item()),
+    }
+
 
 def _norm_of(value):
     if torch.is_tensor(value):
@@ -1966,9 +1986,11 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             and not torch.is_tensor(byt5_cond)
         ):
             _debug_log(
-                "text encode final attention_mask dropped task=%s reason=dense_full_coverage main_path_mask_shape=%s",
+                "text encode final attention_mask dropped task=%s reason=dense_full_coverage main_path_mask_shape=%s mask_summary=%s dropped_as_dense=%s",
                 task,
                 _shape_of(attention_mask),
+                _mask_summary(attention_mask),
+                True,
             )
             extra.pop("attention_mask", None)
             attention_mask = None

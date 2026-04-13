@@ -37,6 +37,26 @@ def _shape_of(value):
         return tuple(value.shape)
     return None
 
+def _mask_summary(value):
+    if not torch.is_tensor(value):
+        return {
+            "shape": None,
+            "dtype": getattr(value, "dtype", None),
+            "nonzero": None,
+            "all_ones": None,
+            "min": None,
+            "max": None,
+        }
+    value_float = value.float()
+    return {
+        "shape": tuple(value.shape),
+        "dtype": value.dtype,
+        "nonzero": int(torch.count_nonzero(value).item()),
+        "all_ones": bool(torch.all(value == 1).item()),
+        "min": float(value_float.min().item()),
+        "max": float(value_float.max().item()),
+    }
+
 
 def _norm_of(value):
     if torch.is_tensor(value):
@@ -647,6 +667,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         setclip_token_positions, image_metadata_positions = _collect_setclip_token_positions(tok_pairs, effective_crop_start)
         attention_mask = extra.get("attention_mask", None)
         original_attention_mask = attention_mask
+        original_mask_summary = _mask_summary(original_attention_mask)
         attention_mask_reason = "orig_encode_missing"
         if torch.is_tensor(attention_mask):
             attention_mask_reason = "orig_encode_tensor"
@@ -675,6 +696,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
 
         deepstack_hidden_states = _encode_deepstack(self, token_weight_pairs["qwen25_7b"], getattr(self, "crop_start_output", None), template_end)
         qwen_attention_mask = getattr(self, "_hy_last_qwen_attention_mask", None)
+        qwen_mask_summary = _mask_summary(qwen_attention_mask)
         if (
             getattr(self, "setclip_output", False)
             and
@@ -697,6 +719,13 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
                 _shape_of(attention_mask),
                 _callable_debug_name(orig_encode),
                 getattr(self, "_hy_last_qwen_encode_source", "unset"),
+            )
+            _debug_log(
+                "attention_mask reconstructed summary task=%s orig_mask=%s qwen_mask=%s reconstructed_mask=%s",
+                getattr(self, "_hy_task_name", None),
+                original_mask_summary,
+                qwen_mask_summary,
+                _mask_summary(attention_mask),
             )
         if deepstack_hidden_states is not None:
             extra["all_stack_text_states"] = deepstack_hidden_states
@@ -737,6 +766,14 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
                 getattr(self, "_hy_last_qwen_extra_keys", []),
                 qwen_attention_mask_state,
             )
+        _debug_log(
+            "attention_mask summary task=%s reason=%s orig_mask=%s qwen_mask=%s final_mask=%s",
+            getattr(self, "_hy_task_name", None),
+            attention_mask_reason,
+            original_mask_summary,
+            qwen_mask_summary,
+            _mask_summary(extra.get("attention_mask")),
+        )
 
         self.crop_start_source = crop_source
         self.setclip_start_source = setclip_source
