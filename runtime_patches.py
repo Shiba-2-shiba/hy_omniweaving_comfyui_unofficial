@@ -223,6 +223,44 @@ def _ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model):
     return True
 
 
+def _ensure_hy_omniweaving_forward_orig_txt_mask_debug_support(diffusion_model):
+    forward_orig = getattr(diffusion_model, "forward_orig", None)
+    if forward_orig is None:
+        return False
+    if getattr(diffusion_model, "_hy_omniweaving_forward_orig_txt_mask_debug_patched", False):
+        return False
+
+    def patched_forward_orig(self, *args, **kwargs):
+        txt_mask = None
+        if len(args) >= 5:
+            txt_mask = args[4]
+        elif "txt_mask" in kwargs:
+            txt_mask = kwargs.get("txt_mask")
+
+        txt_mask_shape = _shape_of(txt_mask)
+        txt_mask_dtype = getattr(txt_mask, "dtype", None)
+        txt_mask_is_floating = bool(torch.is_floating_point(txt_mask)) if torch.is_tensor(txt_mask) else None
+        txt_mask_nonzero = int(torch.count_nonzero(txt_mask).item()) if torch.is_tensor(txt_mask) else None
+        txt_mask_min = float(txt_mask.float().min().item()) if torch.is_tensor(txt_mask) else None
+        txt_mask_max = float(txt_mask.float().max().item()) if torch.is_tensor(txt_mask) else None
+        _debug_log(
+            "forward_orig txt_mask shape=%s dtype=%s is_floating=%s will_apply_non_floating_conversion=%s nonzero=%s min=%s max=%s",
+            txt_mask_shape,
+            txt_mask_dtype,
+            txt_mask_is_floating,
+            bool(torch.is_tensor(txt_mask) and not torch.is_floating_point(txt_mask)),
+            txt_mask_nonzero,
+            txt_mask_min,
+            txt_mask_max,
+        )
+        return forward_orig(*args, **kwargs)
+
+    diffusion_model.forward_orig = types.MethodType(patched_forward_orig, diffusion_model)
+    diffusion_model._hy_omniweaving_forward_orig_txt_mask_debug_patched = True
+    logging.info("HY-OmniWeaving attached instance-local forward_orig txt_mask debug support.")
+    return True
+
+
 def ensure_hy_omniweaving_deepstack_support(model_patcher, sd: dict | None = None, mm_in_sd: dict | None = None):
     if mm_in_sd is None:
         mm_in_sd = extract_hy_omniweaving_mm_in_state_dict(sd or {})
@@ -240,6 +278,7 @@ def ensure_hy_omniweaving_deepstack_support(model_patcher, sd: dict | None = Non
     if diffusion_model is None:
         return False
     _ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model)
+    _ensure_hy_omniweaving_forward_orig_txt_mask_debug_support(diffusion_model)
     if getattr(diffusion_model, "mm_in", None) is not None:
         return True
 

@@ -2198,6 +2198,39 @@ def test_ensure_hy_omniweaving_txt_mask_alignment_support_trims_non_prefix_misma
     assert torch.equal(recorded["mask"], mask[:, -4:])
 
 
+def test_ensure_hy_omniweaving_forward_orig_txt_mask_debug_support_preserves_call(monkeypatch, caplog):
+    recorded = {}
+
+    class _DiffusionModel:
+        def forward_orig(self, *args, **kwargs):
+            recorded["args"] = args
+            recorded["kwargs"] = kwargs
+            return "ok"
+
+    diffusion_model = _DiffusionModel()
+
+    patched = runtime_patches._ensure_hy_omniweaving_forward_orig_txt_mask_debug_support(diffusion_model)
+    assert patched is True
+
+    txt_mask = torch.tensor([[1, 1, 0, 0]], dtype=torch.int64)
+    monkeypatch.setenv("HY_OMNIWEAVING_DEBUG", "1")
+    with caplog.at_level("INFO"):
+        out = diffusion_model.forward_orig(
+            torch.zeros((1, 1)),
+            torch.zeros((1, 1)),
+            torch.zeros((1, 1)),
+            torch.zeros((1, 1)),
+            txt_mask,
+            torch.tensor([1.0]),
+        )
+
+    assert out == "ok"
+    assert recorded["args"][4] is txt_mask
+    assert "forward_orig txt_mask shape=(1, 4)" in caplog.text
+    assert "is_floating=False" in caplog.text
+    assert "will_apply_non_floating_conversion=True" in caplog.text
+
+
 def test_hy_omniweaving_diffusion_wrapper_injects_dit_patch():
     class _Executor:
         def __init__(self):
