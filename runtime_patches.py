@@ -148,6 +148,16 @@ def _ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model):
 
     original_forward = txt_in.forward
 
+    def _can_trim_expanded_prefix(mask, target_length: int):
+        if not torch.is_tensor(mask) or mask.ndim < 2:
+            return False
+        if target_length <= 0 or mask.shape[-1] <= target_length:
+            return False
+        prefix = mask[..., : mask.shape[-1] - target_length]
+        if prefix.numel() == 0:
+            return False
+        return bool(torch.all(prefix == 1).item())
+
     def patched_forward(self, x, *args, **kwargs):
         mask = None
         if len(args) >= 2:
@@ -162,6 +172,7 @@ def _ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model):
             and torch.is_tensor(x)
             and x.ndim >= 2
             and mask.shape[-1] > x.shape[1]
+            and _can_trim_expanded_prefix(mask, x.shape[1])
         ):
             effective_mask = mask[..., -x.shape[1]:]
             _debug_log(
@@ -169,6 +180,18 @@ def _ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model):
                 _shape_of(x),
                 _shape_of(mask),
                 _shape_of(effective_mask),
+            )
+        elif (
+            torch.is_tensor(mask)
+            and mask.ndim >= 2
+            and torch.is_tensor(x)
+            and x.ndim >= 2
+            and mask.shape[-1] > x.shape[1]
+        ):
+            _debug_log(
+                "txt_in mask alignment skipped x_shape=%s original_mask_shape=%s reason=non_prefix_or_non_ones_extra",
+                _shape_of(x),
+                _shape_of(mask),
             )
 
         if len(args) >= 2:
@@ -372,7 +395,11 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
             return 1
         return 1
 
-    def _resolve_crop_start(tok_pairs, explicit_crop_start, template_end):
+    def _resolve_crop_start(tok_pairs, explicit_crop_start, template_end, prepared_meta=None):
+        if isinstance(prepared_meta, dict):
+            prepared_crop_start = prepared_meta.get("crop_start", None)
+            if prepared_crop_start is not None and int(prepared_crop_start) >= 0:
+                return max(0, int(prepared_crop_start)), "prepared_meta"
         crop_start = explicit_crop_start
         source = "explicit"
         if crop_start is None or int(crop_start) < 0:
@@ -397,7 +424,9 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
             return "missing"
         return type(value).__name__
 
-    def _find_setclip_start(tok_pairs, crop_start):
+    def _find_setclip_start(tok_pairs, crop_start, prepared_meta=None):
+        if isinstance(prepared_meta, dict) and bool(prepared_meta.get("used_fallback_text_only", False)):
+            return 0, "prepared_text_only"
         expanded_index = 0
         last_vision_end = None
         last_image_end = None
@@ -437,7 +466,8 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
             return None
 
         tok_pairs = token_weight_pairs_qwen[0]
-        effective_crop_start, crop_source = _resolve_crop_start(tok_pairs, crop_start, template_end)
+        prepared_meta = getattr(self, "_hy_prepared_input_meta", None)
+        effective_crop_start, crop_source = _resolve_crop_start(tok_pairs, crop_start, template_end, prepared_meta=prepared_meta)
         attention_mask = qwen_extra.get("attention_mask", None)
         qwen_out, attention_mask = _slice_seq_and_mask(qwen_out, attention_mask, effective_crop_start)
         self._hy_last_qwen_attention_mask_state = _describe_attention_mask_state(attention_mask)
@@ -445,7 +475,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         setclip_start = 0
         setclip_source = "disabled"
         if getattr(self, "setclip_output", False):
-            setclip_start, setclip_source = _find_setclip_start(tok_pairs, effective_crop_start)
+            setclip_start, setclip_source = _find_setclip_start(tok_pairs, effective_crop_start, prepared_meta=prepared_meta)
             if setclip_start > 0:
                 qwen_out, attention_mask = _slice_seq_and_mask(qwen_out, attention_mask, setclip_start)
                 self._hy_last_qwen_attention_mask_state = _describe_attention_mask_state(attention_mask)
@@ -487,7 +517,8 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         cond, p, extra = orig_encode(token_weight_pairs)
         orig_extra_keys = sorted(extra.keys()) if isinstance(extra, dict) else []
         template_end = _find_template_end(tok_pairs, template_end)
-        effective_crop_start, crop_source = _resolve_crop_start(tok_pairs, getattr(self, "crop_start_output", None), template_end)
+        prepared_meta = getattr(self, "_hy_prepared_input_meta", None)
+        effective_crop_start, crop_source = _resolve_crop_start(tok_pairs, getattr(self, "crop_start_output", None), template_end, prepared_meta=prepared_meta)
         attention_mask = extra.get("attention_mask", None)
         original_attention_mask = attention_mask
         attention_mask_reason = "orig_encode_missing"
@@ -499,7 +530,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         setclip_start = 0
         setclip_source = "disabled"
         if self.setclip_output:
-            setclip_start, setclip_source = _find_setclip_start(tok_pairs, effective_crop_start)
+            setclip_start, setclip_source = _find_setclip_start(tok_pairs, effective_crop_start, prepared_meta=prepared_meta)
             if setclip_start > 0:
                 cond, attention_mask = _slice_seq_and_mask(cond, attention_mask, setclip_start)
                 if torch.is_tensor(attention_mask):
@@ -608,7 +639,17 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         self.crop_start_source = "explicit" if crop_start is not None else "unset"
         self._hy_task_name = options.get("task_name", getattr(self, "_hy_task_name", None))
         self._hy_visual_input_count = options.get("visual_input_count", getattr(self, "_hy_visual_input_count", None))
+        prepared_meta = options.get("prepared_meta", getattr(self, "_hy_prepared_input_meta", None))
+        self._hy_prepared_input_meta = dict(prepared_meta) if isinstance(prepared_meta, dict) else None
         self.setclip_start_source = "pending" if self.setclip_output else "disabled"
+        _debug_log(
+            "patched_set task=%s crop_start=%s visual_inputs=%s setclip=%s prepared_meta=%s",
+            self._hy_task_name,
+            self.crop_start_output,
+            self._hy_visual_input_count,
+            self.setclip_output,
+            self._hy_prepared_input_meta,
+        )
 
     def patched_reset(self):
         orig_reset()
@@ -618,6 +659,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         self.crop_start_source = "unset"
         self._hy_task_name = None
         self._hy_visual_input_count = None
+        self._hy_prepared_input_meta = None
         self.setclip_start_source = "unset"
         self._hy_last_qwen_attention_mask_state = "unset"
         self._hy_last_qwen_extra_keys = []
@@ -630,6 +672,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
     cond_stage_model.crop_start_source = "unset"
     cond_stage_model._hy_task_name = None
     cond_stage_model._hy_visual_input_count = None
+    cond_stage_model._hy_prepared_input_meta = None
     cond_stage_model.setclip_start_source = "unset"
     cond_stage_model._hy_last_qwen_attention_mask_state = "unset"
     cond_stage_model._hy_last_qwen_extra_keys = []

@@ -4,6 +4,7 @@ import math
 import numbers
 import node_helpers
 import os
+from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -75,6 +76,22 @@ def _clip_vision_shapes(clip_vision_output):
 def _clip_has_byt5_branch(clip) -> bool:
     cond_stage_model = getattr(clip, "cond_stage_model", None)
     return getattr(cond_stage_model, "byt5_small", None) is not None
+
+
+@dataclass
+class LocalPreparedInputSpec:
+    task: str
+    prompt_mode: int
+    crop_start: int
+    user_text: str
+    template: str
+    ordered_visuals: list
+    ordered_roles: list[str]
+    token_budget_extra: int
+    visual_input_count: int
+    add_generation_prompt: bool = True
+    used_fallback_text_only: bool = False
+    meta: dict = field(default_factory=dict)
 
 
 def _text_encoder_options():
@@ -954,6 +971,10 @@ class HYOmniWeavingVAELoader(io.ComfyNode):
 
 
 class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
+    TEXT_PATH_MAX_SIDE = 560
+    TOKEN_PER_IMAGE = 400
+    TOKEN_BUDGET_IMAGE_VIDEO_OVERHEAD = 32
+    VISION_TEMPLATE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>\n"
     THINK_MAX_EFFECTIVE_NEW_TOKENS = 1000
     THINK_MAX_REWRITE_CHARS = 2048
     REWRITE_SUPPRESSED_TOKEN_IDS = (
@@ -1059,6 +1080,307 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         return TextEncodeHunyuanVideo15Omni._task_spec(task)["crop_start"]
 
     @classmethod
+    def _task_name_for_prompt_mode(cls, prompt_mode: int) -> str:
+        for task_name, spec in cls.TASK_SPECS.items():
+            if spec["prompt_mode"] == prompt_mode:
+                return task_name
+        return "t2v"
+
+    @staticmethod
+    def _normalize_prompt_text(prompt) -> str:
+        if isinstance(prompt, str) and len(prompt) > 0:
+            return prompt
+        return " "
+
+    @staticmethod
+    def _visual_count(images) -> int:
+        if torch.is_tensor(images) and images.ndim >= 1:
+            return int(images.shape[0])
+        if isinstance(images, (list, tuple)):
+            return len(images)
+        return 0
+
+    @classmethod
+    def _resolve_local_prompt_mode(cls, task: str, visual_image_count: int, video_frame_count: int) -> tuple[int, int, bool]:
+        if task == "t2v":
+            return 1, cls._task_crop_start("t2v"), False
+        if task == "i2v":
+            if visual_image_count > 0:
+                return 2, cls._task_crop_start("i2v"), False
+            return 1, cls._task_crop_start("t2v"), True
+        if task == "reference2v":
+            if visual_image_count > 0:
+                return 3, cls._task_crop_start("reference2v"), False
+            return 1, cls._task_crop_start("t2v"), True
+        if task == "interpolation":
+            if visual_image_count >= 2:
+                return 4, cls._task_crop_start("interpolation"), False
+            return 1, cls._task_crop_start("t2v"), True
+        if task == "editing":
+            if video_frame_count > 0:
+                return 5, cls._task_crop_start("editing"), False
+            return 1, cls._task_crop_start("t2v"), True
+        if task == "tiv2v":
+            if visual_image_count > 0 and video_frame_count > 0:
+                return 6, cls._task_crop_start("tiv2v"), False
+            if video_frame_count > 0:
+                return 5, cls._task_crop_start("editing"), False
+            return 1, cls._task_crop_start("t2v"), True
+        return 1, cls._task_crop_start("t2v"), True
+
+    @classmethod
+    def _token_budget_extra(cls, prompt_mode: int, visual_image_count: int, video_frame_count: int, token_per_image: int | None = None) -> int:
+        if token_per_image is None:
+            token_per_image = cls.TOKEN_PER_IMAGE
+        effective_task = cls._task_name_for_prompt_mode(prompt_mode)
+        if effective_task == "t2v":
+            return 0
+        if effective_task == "i2v":
+            return token_per_image
+        if effective_task in ("reference2v", "interpolation"):
+            return max(token_per_image, token_per_image * max(1, visual_image_count))
+        if effective_task == "editing":
+            return token_per_image * (video_frame_count // 2)
+        if effective_task == "tiv2v":
+            return token_per_image * (video_frame_count // 2) + token_per_image + cls.TOKEN_BUDGET_IMAGE_VIDEO_OVERHEAD
+        return 0
+
+    @staticmethod
+    def _thumbnail_visual_for_text_path(image: torch.Tensor, max_side: int = 560):
+        if image.ndim != 4:
+            return image
+        _, height, width, channels = image.shape
+        image = image[:, :, :, :3]
+        if channels < 1 or max(height, width) <= max_side:
+            return image.contiguous()
+
+        scale = max_side / max(height, width)
+        resized_height = max(1, int(round(height * scale)))
+        resized_width = max(1, int(round(width * scale)))
+        resized = F.interpolate(
+            image.movedim(-1, 1),
+            size=(resized_height, resized_width),
+            mode="bilinear",
+            align_corners=False,
+        ).movedim(1, -1)
+        return resized.contiguous()
+
+    @classmethod
+    def _prepare_text_path_visuals(cls, images, max_visual_inputs: int, max_side: int | None = None):
+        if max_side is None:
+            max_side = cls.TEXT_PATH_MAX_SIDE
+        visual_images = cls._extract_visual_images(images, max_visual_inputs)
+        return [cls._thumbnail_visual_for_text_path(image, max_side=max_side) for image in visual_images]
+
+    @classmethod
+    def _build_template_from_local_spec(cls, spec: LocalPreparedInputSpec) -> str:
+        effective_task = cls._task_name_for_prompt_mode(spec.prompt_mode)
+        system_prompt = cls._task_system_prompt(effective_task)
+        user_chunks = []
+
+        if effective_task == "t2v":
+            user_chunks.append("{}")
+        elif effective_task == "i2v":
+            user_chunks.append(cls.VISION_TEMPLATE_TOKEN)
+            user_chunks.append("{}")
+        elif effective_task in ("reference2v", "interpolation", "editing"):
+            for _ in spec.ordered_roles:
+                user_chunks.append(cls.VISION_TEMPLATE_TOKEN)
+            user_chunks.append("{}")
+        elif effective_task == "tiv2v":
+            image_roles = sum(1 for role in spec.ordered_roles if role == "image")
+            video_roles = sum(1 for role in spec.ordered_roles if role == "video_frame")
+            if image_roles > 0:
+                user_chunks.append("This is the reference image:\n")
+                for _ in range(image_roles):
+                    user_chunks.append(cls.VISION_TEMPLATE_TOKEN)
+            if video_roles > 0:
+                user_chunks.append("This is the input video:\n")
+                for _ in range(video_roles):
+                    user_chunks.append(cls.VISION_TEMPLATE_TOKEN)
+            user_chunks.append("{}")
+        else:
+            user_chunks.append("{}")
+
+        template = (
+            "<|im_start|>system\n"
+            f"{system_prompt}"
+            "<|im_end|>\n"
+            "<|im_start|>user\n"
+            + "".join(user_chunks) +
+            "<|im_end|>\n"
+        )
+        if spec.add_generation_prompt:
+            template += "<|im_start|>assistant\n"
+        return template
+
+    @classmethod
+    def _prepare_input_local_spec_from_visuals(
+        cls,
+        task: str,
+        prompt: str,
+        visual_images: list,
+        add_generation_prompt: bool = True,
+        token_per_image: int | None = None,
+        visual_source: str = "none",
+    ) -> LocalPreparedInputSpec:
+        if token_per_image is None:
+            token_per_image = cls.TOKEN_PER_IMAGE
+
+        prompt_text = cls._normalize_prompt_text(prompt)
+        visual_image_count = len(visual_images)
+        prompt_mode, crop_start, used_fallback_text_only = cls._resolve_local_prompt_mode(
+            task,
+            visual_image_count,
+            0,
+        )
+        effective_task = cls._task_name_for_prompt_mode(prompt_mode)
+
+        ordered_visuals = []
+        ordered_roles = []
+        if effective_task in ("i2v", "reference2v", "interpolation"):
+            ordered_visuals = list(visual_images)
+            ordered_roles = ["image"] * len(visual_images)
+
+        spec = LocalPreparedInputSpec(
+            task=task,
+            prompt_mode=prompt_mode,
+            crop_start=crop_start,
+            user_text=prompt_text,
+            template="",
+            ordered_visuals=ordered_visuals,
+            ordered_roles=ordered_roles,
+            token_budget_extra=cls._token_budget_extra(
+                prompt_mode,
+                visual_image_count=len([role for role in ordered_roles if role == "image"]),
+                video_frame_count=0,
+                token_per_image=token_per_image,
+            ),
+            visual_input_count=len(ordered_visuals),
+            add_generation_prompt=add_generation_prompt,
+            used_fallback_text_only=used_fallback_text_only,
+            meta={
+                "effective_task": effective_task,
+                "visual_source": visual_source if len(ordered_visuals) > 0 else "none",
+                "image_visual_count": len([role for role in ordered_roles if role == "image"]),
+                "video_frame_count": 0,
+                "token_per_image": token_per_image,
+            },
+        )
+        spec.template = cls._build_template_from_local_spec(spec)
+        _debug_log(
+            "prepared input spec task=%s effective_task=%s prompt_mode=%s crop_start=%s visual_count=%s roles=%s "
+            "fallback_text_only=%s token_budget_extra=%s visual_source=%s template_chars=%s",
+            task,
+            spec.meta.get("effective_task"),
+            spec.prompt_mode,
+            spec.crop_start,
+            spec.visual_input_count,
+            spec.ordered_roles,
+            spec.used_fallback_text_only,
+            spec.token_budget_extra,
+            spec.meta.get("visual_source"),
+            len(spec.template),
+        )
+        return spec
+
+    @classmethod
+    def _prepare_input_local_spec(
+        cls,
+        task: str,
+        prompt: str,
+        reference_images=None,
+        semantic_images=None,
+        video_frames=None,
+        use_visual_inputs: bool = True,
+        max_visual_inputs: int = 8,
+        token_per_image: int | None = None,
+        add_generation_prompt: bool = True,
+    ) -> LocalPreparedInputSpec:
+        if token_per_image is None:
+            token_per_image = cls.TOKEN_PER_IMAGE
+
+        prompt_text = cls._normalize_prompt_text(prompt)
+        image_source = None
+        visual_images = []
+        video_visuals = []
+        if use_visual_inputs:
+            image_source = semantic_images if semantic_images is not None else reference_images
+            visual_images = cls._prepare_text_path_visuals(image_source, max_visual_inputs=max_visual_inputs)
+            video_visuals = cls._prepare_text_path_visuals(video_frames, max_visual_inputs=max_visual_inputs)
+
+        visual_image_count = len(visual_images)
+        video_frame_count = len(video_visuals)
+        prompt_mode, crop_start, used_fallback_text_only = cls._resolve_local_prompt_mode(
+            task,
+            visual_image_count,
+            video_frame_count,
+        )
+        effective_task = cls._task_name_for_prompt_mode(prompt_mode)
+
+        ordered_visuals = []
+        ordered_roles = []
+        if effective_task == "i2v":
+            ordered_visuals = visual_images
+            ordered_roles = ["image"] * len(visual_images)
+        elif effective_task in ("reference2v", "interpolation"):
+            ordered_visuals = visual_images
+            ordered_roles = ["image"] * len(visual_images)
+        elif effective_task == "editing":
+            ordered_visuals = video_visuals
+            ordered_roles = ["video_frame"] * len(video_visuals)
+        elif effective_task == "tiv2v":
+            ordered_visuals = visual_images + video_visuals
+            ordered_roles = (["image"] * len(visual_images)) + (["video_frame"] * len(video_visuals))
+
+        spec = LocalPreparedInputSpec(
+            task=task,
+            prompt_mode=prompt_mode,
+            crop_start=crop_start,
+            user_text=prompt_text,
+            template="",
+            ordered_visuals=ordered_visuals,
+            ordered_roles=ordered_roles,
+            token_budget_extra=cls._token_budget_extra(
+                prompt_mode,
+                visual_image_count=len([role for role in ordered_roles if role == "image"]),
+                video_frame_count=len([role for role in ordered_roles if role == "video_frame"]),
+                token_per_image=token_per_image,
+            ),
+            visual_input_count=len(ordered_visuals),
+            add_generation_prompt=add_generation_prompt,
+            used_fallback_text_only=used_fallback_text_only,
+            meta={
+                "effective_task": effective_task,
+                "visual_source": (
+                    "semantic_images" if semantic_images is not None and visual_image_count > 0
+                    else "reference_images" if reference_images is not None and visual_image_count > 0
+                    else "video_frames" if video_frame_count > 0
+                    else "none"
+                ),
+                "image_visual_count": len([role for role in ordered_roles if role == "image"]),
+                "video_frame_count": len([role for role in ordered_roles if role == "video_frame"]),
+                "token_per_image": token_per_image,
+            },
+        )
+        spec.template = cls._build_template_from_local_spec(spec)
+        _debug_log(
+            "prepared input spec task=%s effective_task=%s prompt_mode=%s crop_start=%s visual_count=%s roles=%s "
+            "fallback_text_only=%s token_budget_extra=%s visual_source=%s template_chars=%s",
+            task,
+            spec.meta.get("effective_task"),
+            spec.prompt_mode,
+            spec.crop_start,
+            spec.visual_input_count,
+            spec.ordered_roles,
+            spec.used_fallback_text_only,
+            spec.token_budget_extra,
+            spec.meta.get("visual_source"),
+            len(spec.template),
+        )
+        return spec
+
+    @classmethod
     def _build_template(cls, task: str, image_count: int, add_generation_prompt: bool = False) -> str:
         system_prompt = cls._task_system_prompt(task)
         visual_tokens = "<|vision_start|><|image_pad|><|vision_end|>\n" * image_count
@@ -1088,6 +1410,28 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             if len(image_embeds) > 0:
                 embeds = torch.stack(image_embeds, dim=0)
             return clip.tokenize(text, llama_template=template, image_embeds=embeds, image_interleave=1)
+
+    @classmethod
+    def _tokenize_with_local_spec(cls, clip, spec: LocalPreparedInputSpec):
+        _debug_log(
+            "tokenize with prepared spec task=%s effective_task=%s prompt_mode=%s crop_start=%s visual_count=%s roles=%s "
+            "fallback_text_only=%s visual_source=%s",
+            spec.task,
+            spec.meta.get("effective_task"),
+            spec.prompt_mode,
+            spec.crop_start,
+            spec.visual_input_count,
+            spec.ordered_roles,
+            spec.used_fallback_text_only,
+            spec.meta.get("visual_source"),
+        )
+        return cls._tokenize_with_template(
+            clip,
+            spec.user_text,
+            spec.template,
+            [],
+            visual_images=spec.ordered_visuals if len(spec.ordered_visuals) > 0 else None,
+        )
 
     @staticmethod
     def _extract_image_embeds(clip_vision_output, max_visual_inputs: int):
@@ -1123,7 +1467,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         visual_source = "none"
         if use_visual_inputs:
             visual_inputs = semantic_images if semantic_images is not None else reference_images
-            visual_images = cls._extract_visual_images(visual_inputs, max_visual_inputs)
+            visual_images = cls._prepare_text_path_visuals(visual_inputs, max_visual_inputs)
             if len(visual_images) > 0:
                 visual_source = "semantic_images" if semantic_images is not None else "reference_images"
             else:
@@ -1142,6 +1486,16 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             "visual_source": visual_source,
             "visual_input_count": len(visual_images) if len(visual_images) > 0 else len(image_embeds),
         }
+
+    @classmethod
+    def _should_use_local_prepared_spec(cls, task: str, visual_images, image_embeds) -> bool:
+        if task not in ("t2v", "i2v", "reference2v", "interpolation"):
+            return False
+        if task == "t2v":
+            return True
+        if len(visual_images) > 0:
+            return True
+        return len(image_embeds) == 0
 
     @staticmethod
     def _require_full_text_path(clip):
@@ -1229,14 +1583,24 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         think_prompt = cls._build_think_rewrite_request(task, prompt, think_mode)
         think_visual_images = cls._prepare_think_visual_images(visual_images)
         think_visual_count = len(think_visual_images) if len(think_visual_images) > 0 else len(image_embeds)
-        think_template = cls._build_think_template(task, think_visual_count)
-        tokens = cls._tokenize_with_template(
-            clip,
-            think_prompt,
-            think_template,
-            image_embeds,
-            visual_images=think_visual_images if len(think_visual_images) > 0 else None,
-        )
+        if cls._should_use_local_prepared_spec(task, think_visual_images, image_embeds):
+            think_spec = cls._prepare_input_local_spec_from_visuals(
+                task,
+                think_prompt,
+                think_visual_images,
+                add_generation_prompt=True,
+                visual_source="think_visuals",
+            )
+            tokens = cls._tokenize_with_local_spec(clip, think_spec)
+        else:
+            think_template = cls._build_think_template(task, think_visual_count)
+            tokens = cls._tokenize_with_template(
+                clip,
+                think_prompt,
+                think_template,
+                image_embeds,
+                visual_images=think_visual_images if len(think_visual_images) > 0 else None,
+            )
 
         generated = cls._generate_with_rewrite_suppression(clip, tokens, effective_max_new_tokens)
         generated_text = cls._decode_generated_text(clip, generated, tokens)
@@ -1312,22 +1676,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
 
     @staticmethod
     def _resize_visual_for_think(image: torch.Tensor, max_side: int = 560):
-        if image.ndim != 4:
-            return image
-        _, height, width, channels = image.shape
-        if channels < 1 or max(height, width) <= max_side:
-            return image[:, :, :, :3]
-
-        scale = max_side / max(height, width)
-        resized_height = max(1, int(round(height * scale)))
-        resized_width = max(1, int(round(width * scale)))
-        resized = F.interpolate(
-            image[:, :, :, :3].movedim(-1, 1),
-            size=(resized_height, resized_width),
-            mode="bilinear",
-            align_corners=False,
-        ).movedim(1, -1)
-        return resized
+        return TextEncodeHunyuanVideo15Omni._thumbnail_visual_for_text_path(image, max_side=max_side)
 
     @classmethod
     def _prepare_think_visual_images(cls, visual_images):
@@ -1611,6 +1960,13 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         clip_vision_prefix_len = 0
         if torch.is_tensor(clip_vision_states) and clip_vision_states.ndim >= 2:
             clip_vision_prefix_len = int(clip_vision_states.shape[1])
+        if encoded_components.get("task") == "t2v":
+            if clip_vision_prefix_len > 0:
+                _debug_log(
+                    "text encode final attention_mask expansion skipped task=t2v clip_vision_prefix=%s reason=text_only_conditioning",
+                    _shape_of(clip_vision_states),
+                )
+            clip_vision_prefix_len = 0
 
         expanded_attention_mask = attention_mask
         if byt5_prefix_len > 0:
@@ -1634,7 +1990,23 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         }
 
     @staticmethod
-    def _encode_with_parity_options(clip, tokens, deepstack_layers, setclip, crop_start: int | None, task: str, visual_input_count: int = 0):
+    def _prepared_meta_from_spec(prepared_spec: LocalPreparedInputSpec | None):
+        if prepared_spec is None:
+            return None
+        return {
+            "task": prepared_spec.task,
+            "prompt_mode": prepared_spec.prompt_mode,
+            "crop_start": prepared_spec.crop_start,
+            "visual_input_count": prepared_spec.visual_input_count,
+            "ordered_roles": list(prepared_spec.ordered_roles),
+            "used_fallback_text_only": prepared_spec.used_fallback_text_only,
+            "token_budget_extra": prepared_spec.token_budget_extra,
+            "effective_task": prepared_spec.meta.get("effective_task"),
+            "visual_source": prepared_spec.meta.get("visual_source"),
+        }
+
+    @staticmethod
+    def _encode_with_parity_options(clip, tokens, deepstack_layers, setclip, crop_start: int | None, task: str, visual_input_count: int = 0, prepared_meta=None):
         clip.cond_stage_model.reset_clip_options()
         clip.load_model(tokens)
         clip.cond_stage_model.set_clip_options(
@@ -1645,6 +2017,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
                 "crop_start": crop_start,
                 "task_name": task,
                 "visual_input_count": visual_input_count,
+                "prepared_meta": prepared_meta,
             }
         )
         encoded = clip.cond_stage_model.encode_token_weights(tokens)
@@ -1673,16 +2046,46 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
 
     @classmethod
     def _encode_prompt_components(cls, clip, prompt, task, deepstack_layers, setclip, image_embeds, visual_images, visual_source):
-        visual_input_count = len(visual_images) if len(visual_images) > 0 else len(image_embeds)
-        template = cls._build_template(task, visual_input_count, add_generation_prompt=True)
-        tokens = cls._tokenize_with_template(
-            clip,
-            prompt,
-            template,
-            image_embeds,
-            visual_images=visual_images if len(visual_images) > 0 else None,
-        )
-        crop_start = cls._task_crop_start(task)
+        prepared_spec = None
+        if cls._should_use_local_prepared_spec(task, visual_images, image_embeds):
+            prepared_spec = cls._prepare_input_local_spec_from_visuals(
+                task,
+                prompt,
+                visual_images,
+                add_generation_prompt=True,
+                visual_source=visual_source,
+            )
+            tokens = cls._tokenize_with_local_spec(clip, prepared_spec)
+            crop_start = prepared_spec.crop_start
+            visual_input_count = prepared_spec.visual_input_count
+            _debug_log(
+                "encode prompt path task=%s mode=prepared_spec effective_task=%s crop_start=%s visual_count=%s visual_source=%s fallback_text_only=%s",
+                task,
+                prepared_spec.meta.get("effective_task"),
+                crop_start,
+                visual_input_count,
+                visual_source,
+                prepared_spec.used_fallback_text_only,
+            )
+        else:
+            visual_input_count = len(visual_images) if len(visual_images) > 0 else len(image_embeds)
+            template = cls._build_template(task, visual_input_count, add_generation_prompt=True)
+            tokens = cls._tokenize_with_template(
+                clip,
+                prompt,
+                template,
+                image_embeds,
+                visual_images=visual_images if len(visual_images) > 0 else None,
+            )
+            crop_start = cls._task_crop_start(task)
+            _debug_log(
+                "encode prompt path task=%s mode=legacy_template crop_start=%s visual_count=%s visual_source=%s image_embeds=%s",
+                task,
+                crop_start,
+                visual_input_count,
+                visual_source,
+                len(image_embeds),
+            )
         encoded = cls._encode_with_parity_options(
             clip,
             tokens,
@@ -1691,6 +2094,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             crop_start,
             task,
             visual_input_count,
+            prepared_meta=cls._prepared_meta_from_spec(prepared_spec),
         )
         encoded.update(
             {
@@ -1699,6 +2103,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
                 "crop_start": crop_start,
                 "visual_source": visual_source,
                 "visual_input_count": visual_input_count,
+                "prepared_spec": prepared_spec,
             }
         )
         return encoded
