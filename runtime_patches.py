@@ -156,18 +156,30 @@ def _ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model):
                 "prefix_non_one_count": None,
                 "prefix_min": None,
                 "prefix_max": None,
+                "suffix_shape": None,
+                "suffix_nonzero_count": None,
+                "suffix_min": None,
+                "suffix_max": None,
             }
         extra_tokens = max(0, int(mask.shape[-1] - target_length))
         if extra_tokens <= 0:
+            suffix = mask
+            suffix_float = suffix.float()
             return {
                 "extra_tokens": 0,
                 "prefix_shape": None,
                 "prefix_non_one_count": 0,
                 "prefix_min": None,
                 "prefix_max": None,
+                "suffix_shape": _shape_of(suffix),
+                "suffix_nonzero_count": int(torch.count_nonzero(suffix).item()),
+                "suffix_min": float(suffix_float.min().item()),
+                "suffix_max": float(suffix_float.max().item()),
             }
         prefix = mask[..., :extra_tokens]
+        suffix = mask[..., -target_length:]
         prefix_float = prefix.float()
+        suffix_float = suffix.float()
         prefix_non_one_count = int(torch.count_nonzero(prefix != 1).item())
         return {
             "extra_tokens": extra_tokens,
@@ -175,6 +187,10 @@ def _ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model):
             "prefix_non_one_count": prefix_non_one_count,
             "prefix_min": float(prefix_float.min().item()),
             "prefix_max": float(prefix_float.max().item()),
+            "suffix_shape": _shape_of(suffix),
+            "suffix_nonzero_count": int(torch.count_nonzero(suffix).item()),
+            "suffix_min": float(suffix_float.min().item()),
+            "suffix_max": float(suffix_float.max().item()),
         }
 
     def patched_forward(self, x, *args, **kwargs):
@@ -196,7 +212,8 @@ def _ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model):
             effective_mask = mask[..., -x.shape[1]:]
             _debug_log(
                 "txt_in mask alignment x_shape=%s original_mask_shape=%s effective_mask_shape=%s extra_tokens=%s "
-                "prefix_shape=%s prefix_non_one_count=%s prefix_min=%s prefix_max=%s",
+                "prefix_shape=%s prefix_non_one_count=%s prefix_min=%s prefix_max=%s "
+                "suffix_shape=%s suffix_nonzero_count=%s suffix_min=%s suffix_max=%s",
                 _shape_of(x),
                 _shape_of(mask),
                 _shape_of(effective_mask),
@@ -205,6 +222,10 @@ def _ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model):
                 prefix_stats["prefix_non_one_count"],
                 prefix_stats["prefix_min"],
                 prefix_stats["prefix_max"],
+                prefix_stats["suffix_shape"],
+                prefix_stats["suffix_nonzero_count"],
+                prefix_stats["suffix_min"],
+                prefix_stats["suffix_max"],
             )
 
         if len(args) >= 2:
@@ -231,11 +252,14 @@ def _ensure_hy_omniweaving_forward_orig_txt_mask_debug_support(diffusion_model):
         return False
 
     def patched_forward_orig(self, *args, **kwargs):
+        context = args[2] if len(args) >= 3 else kwargs.get("context")
         txt_mask = None
         if len(args) >= 5:
             txt_mask = args[4]
         elif "txt_mask" in kwargs:
             txt_mask = kwargs.get("txt_mask")
+        txt_byt5 = args[7] if len(args) >= 8 else kwargs.get("txt_byt5")
+        clip_fea = args[8] if len(args) >= 9 else kwargs.get("clip_fea")
 
         txt_mask_shape = _shape_of(txt_mask)
         txt_mask_dtype = getattr(txt_mask, "dtype", None)
@@ -243,8 +267,26 @@ def _ensure_hy_omniweaving_forward_orig_txt_mask_debug_support(diffusion_model):
         txt_mask_nonzero = int(torch.count_nonzero(txt_mask).item()) if torch.is_tensor(txt_mask) else None
         txt_mask_min = float(txt_mask.float().min().item()) if torch.is_tensor(txt_mask) else None
         txt_mask_max = float(txt_mask.float().max().item()) if torch.is_tensor(txt_mask) else None
+        context_shape = _shape_of(context)
+        clip_fea_shape = _shape_of(clip_fea)
+        txt_byt5_shape = _shape_of(txt_byt5)
+        context_len = int(context.shape[1]) if torch.is_tensor(context) and context.ndim >= 2 else None
+        clip_fea_len = int(clip_fea.shape[1]) if torch.is_tensor(clip_fea) and clip_fea.ndim >= 2 else 0
+        txt_byt5_len = int(txt_byt5.shape[1]) if torch.is_tensor(txt_byt5) and txt_byt5.ndim >= 2 else 0
+        expected_pre_clip_txt_in_len = context_len
+        expected_post_concat_txt_len = None if context_len is None else context_len + clip_fea_len + txt_byt5_len
+        txt_mask_len = int(txt_mask.shape[-1]) if torch.is_tensor(txt_mask) and txt_mask.ndim >= 2 else None
+        appears_preexpanded_for_clip = (
+            txt_mask_len is not None
+            and expected_pre_clip_txt_in_len is not None
+            and expected_post_concat_txt_len is not None
+            and txt_mask_len == expected_post_concat_txt_len
+            and clip_fea_len > 0
+        )
         _debug_log(
-            "forward_orig txt_mask shape=%s dtype=%s is_floating=%s will_apply_non_floating_conversion=%s nonzero=%s min=%s max=%s",
+            "forward_orig txt_mask shape=%s dtype=%s is_floating=%s will_apply_non_floating_conversion=%s nonzero=%s min=%s max=%s "
+            "context_shape=%s txt_byt5_shape=%s clip_fea_shape=%s expected_txt_in_len=%s expected_post_concat_txt_len=%s "
+            "txt_mask_len=%s appears_preexpanded_for_clip=%s",
             txt_mask_shape,
             txt_mask_dtype,
             txt_mask_is_floating,
@@ -252,6 +294,13 @@ def _ensure_hy_omniweaving_forward_orig_txt_mask_debug_support(diffusion_model):
             txt_mask_nonzero,
             txt_mask_min,
             txt_mask_max,
+            context_shape,
+            txt_byt5_shape,
+            clip_fea_shape,
+            expected_pre_clip_txt_in_len,
+            expected_post_concat_txt_len,
+            txt_mask_len,
+            appears_preexpanded_for_clip,
         )
         return forward_orig(*args, **kwargs)
 

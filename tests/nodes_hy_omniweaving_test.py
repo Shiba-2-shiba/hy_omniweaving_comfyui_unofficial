@@ -2213,15 +2213,21 @@ def test_ensure_hy_omniweaving_forward_orig_txt_mask_debug_support_preserves_cal
     assert patched is True
 
     txt_mask = torch.tensor([[1, 1, 0, 0]], dtype=torch.int64)
+    context = torch.zeros((1, 4, 8))
+    txt_byt5 = torch.zeros((1, 2, 8))
+    clip_fea = torch.zeros((1, 3, 8))
     monkeypatch.setenv("HY_OMNIWEAVING_DEBUG", "1")
     with caplog.at_level("INFO"):
         out = diffusion_model.forward_orig(
             torch.zeros((1, 1)),
             torch.zeros((1, 1)),
-            torch.zeros((1, 1)),
+            context,
             torch.zeros((1, 1)),
             txt_mask,
             torch.tensor([1.0]),
+            torch.zeros((1, 1)),
+            txt_byt5,
+            clip_fea,
         )
 
     assert out == "ok"
@@ -2229,6 +2235,8 @@ def test_ensure_hy_omniweaving_forward_orig_txt_mask_debug_support_preserves_cal
     assert "forward_orig txt_mask shape=(1, 4)" in caplog.text
     assert "is_floating=False" in caplog.text
     assert "will_apply_non_floating_conversion=True" in caplog.text
+    assert "expected_txt_in_len=4" in caplog.text
+    assert "expected_post_concat_txt_len=9" in caplog.text
 
 
 def test_hy_omniweaving_diffusion_wrapper_injects_dit_patch():
