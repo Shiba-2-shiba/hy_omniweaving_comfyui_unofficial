@@ -1,6 +1,6 @@
 # Text Encode Refactor Tasks
 
-Last updated: 2026-04-14
+Last updated: 2026-04-15
 
 ## Scope
 
@@ -96,7 +96,25 @@ Definition of done:
 
 - remaining late mask correction is intentional, minimal, and documented
 
-### Stage 5. Fix clip-vision mask ordering
+### Stage 5. Reduce dense reconstructed-mask transport
+
+- [ ] Detect when the main-path reconstructed mask is effectively dense /
+  full-coverage.
+- [ ] Skip or remove dense no-op masks where they do not carry real token
+  selectivity.
+- [ ] Add runtime diagnostics for:
+  - [ ] mask nonzero count
+  - [ ] mask all-ones / full-coverage summary
+  - [ ] whether a dense mask was dropped on the main path
+- [ ] Add regression coverage for dense-mask omission on safe cases.
+- [ ] Verify on real `i2v` runtime logs that sampling remains stable.
+
+Definition of done:
+
+- main-path `i2v` no longer carries obviously redundant full-coverage masks
+  unless there is a proven reason
+
+### Stage 6. Fix clip-vision mask ordering
 
 - [ ] Remove `clip_vision` mask pre-expansion before `txt_in` on the main
   `i2v` path.
@@ -113,7 +131,7 @@ Definition of done:
 
 - main-path `i2v` no longer carries post-concat-length text masks into `txt_in`
 
-### Stage 6. Resolve remaining `attention_mask` / `setclip` gaps
+### Stage 7. Resolve remaining `attention_mask` / `setclip` gaps
 
 - [ ] Reduce or eliminate `attention_mask_reason=reconstructed_from_qwen_branch`
   on the main `i2v` path.
@@ -128,7 +146,7 @@ Definition of done:
 - main-path `i2v` is no longer primarily driven by runtime mask reconstruction
   and heuristic setclip discovery
 
-### Stage 7. Add explicit video-frames support
+### Stage 8. Add explicit video-frames support
 
 - [ ] Decide the text-side contract for `video_frames`.
 - [ ] Add `video_frames` input to `HYOmniWeavingTextEncode` if needed.
@@ -155,7 +173,7 @@ Important but later:
 
 - Stage 2 for `reference2v` and `interpolation`
 - Stage 4
-- Stage 7
+- Stage 8
 
 ## Task Ownership Hints
 
@@ -192,6 +210,7 @@ The refactor is ready for completion review when:
 
 - `i2v` and `t2v` both run through prepared-input ownership
 - crop/setclip ownership is spec-driven rather than mostly heuristic
+- main-path dense no-op mask transport is reduced
 - `txt_in` receives text-length masks again on the main `i2v` path
 - `attention_mask` and `setclip` behavior are not primarily patch-reconstructed
   heuristics on the main `i2v` path

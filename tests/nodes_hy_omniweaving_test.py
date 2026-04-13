@@ -1018,6 +1018,46 @@ def test_hy_omniweaving_finalized_attention_mask_expands_for_clip_vision_prefix(
     assert torch.equal(finalized["extra"]["attention_mask"][:, 1024:], torch.ones((1, 6)))
 
 
+def test_hy_omniweaving_finalized_attention_mask_drops_dense_i2v_mask_before_clip_vision_expansion():
+    encoded = {
+        "task": "i2v",
+        "cond": torch.zeros((1, 6, 2)),
+        "extra": {
+            "attention_mask": torch.ones((1, 6)),
+            "pooled_output": torch.zeros((1, 1)),
+        },
+    }
+    clip_vision_output = types.SimpleNamespace(last_hidden_state=torch.zeros((1, 1024, 1152)))
+
+    finalized = nodes.TextEncodeHunyuanVideo15Omni._finalize_encoded_components(
+        encoded,
+        clip_vision_output=clip_vision_output,
+    )
+
+    assert "attention_mask" not in finalized["extra"]
+
+
+def test_hy_omniweaving_finalized_attention_mask_keeps_sparse_i2v_mask():
+    encoded = {
+        "task": "i2v",
+        "cond": torch.zeros((1, 4, 2)),
+        "extra": {
+            "attention_mask": torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
+            "pooled_output": torch.zeros((1, 1)),
+        },
+    }
+    clip_vision_output = types.SimpleNamespace(last_hidden_state=torch.zeros((1, 1024, 1152)))
+
+    finalized = nodes.TextEncodeHunyuanVideo15Omni._finalize_encoded_components(
+        encoded,
+        clip_vision_output=clip_vision_output,
+    )
+
+    assert tuple(finalized["extra"]["attention_mask"].shape) == (1, 1028)
+    assert torch.equal(finalized["extra"]["attention_mask"][:, :1024], torch.ones((1, 1024)))
+    assert torch.equal(finalized["extra"]["attention_mask"][:, 1024:], torch.tensor([[1.0, 1.0, 0.0, 0.0]]))
+
+
 def test_hy_omniweaving_finalized_attention_mask_skips_clip_vision_prefix_for_t2v():
     encoded = {
         "task": "t2v",

@@ -1948,11 +1948,30 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         )
         return torch.cat([prefix, attention_mask], dim=1)
 
+    @staticmethod
+    def _attention_mask_is_dense_full_coverage(attention_mask):
+        if not torch.is_tensor(attention_mask) or attention_mask.ndim < 2:
+            return False
+        return bool(torch.all(attention_mask == 1).item())
+
     @classmethod
     def _finalize_encoded_components(cls, encoded_components: dict, clip_vision_output=None):
         extra = dict(encoded_components.get("extra", {}))
         attention_mask = extra.get("attention_mask")
         byt5_cond = extra.get("conditioning_byt5small")
+        task = encoded_components.get("task")
+        if (
+            task == "i2v"
+            and cls._attention_mask_is_dense_full_coverage(attention_mask)
+            and not torch.is_tensor(byt5_cond)
+        ):
+            _debug_log(
+                "text encode final attention_mask dropped task=%s reason=dense_full_coverage main_path_mask_shape=%s",
+                task,
+                _shape_of(attention_mask),
+            )
+            extra.pop("attention_mask", None)
+            attention_mask = None
         byt5_prefix_len = 0
         if torch.is_tensor(byt5_cond) and byt5_cond.ndim >= 2:
             byt5_prefix_len = int(byt5_cond.shape[1])
@@ -2098,6 +2117,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         )
         encoded.update(
             {
+                "task": task,
                 "tokens": tokens,
                 "prompt": prompt,
                 "crop_start": crop_start,
