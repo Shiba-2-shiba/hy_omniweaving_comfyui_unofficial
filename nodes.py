@@ -1587,6 +1587,53 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         return [[encoded_components["cond"], encoded_components["extra"]]]
 
     @staticmethod
+    def _prepend_attention_mask_prefix(attention_mask, prefix_len: int):
+        if not torch.is_tensor(attention_mask):
+            return attention_mask
+        if prefix_len <= 0:
+            return attention_mask
+        prefix = torch.ones(
+            (attention_mask.shape[0], prefix_len),
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
+        return torch.cat([prefix, attention_mask], dim=1)
+
+    @classmethod
+    def _finalize_encoded_components(cls, encoded_components: dict, clip_vision_output=None):
+        extra = dict(encoded_components.get("extra", {}))
+        attention_mask = extra.get("attention_mask")
+        byt5_cond = extra.get("conditioning_byt5small")
+        byt5_prefix_len = 0
+        if torch.is_tensor(byt5_cond) and byt5_cond.ndim >= 2:
+            byt5_prefix_len = int(byt5_cond.shape[1])
+        clip_vision_states = getattr(clip_vision_output, "last_hidden_state", None)
+        clip_vision_prefix_len = 0
+        if torch.is_tensor(clip_vision_states) and clip_vision_states.ndim >= 2:
+            clip_vision_prefix_len = int(clip_vision_states.shape[1])
+
+        expanded_attention_mask = attention_mask
+        if byt5_prefix_len > 0:
+            expanded_attention_mask = cls._prepend_attention_mask_prefix(expanded_attention_mask, byt5_prefix_len)
+        if clip_vision_prefix_len > 0:
+            expanded_attention_mask = cls._prepend_attention_mask_prefix(expanded_attention_mask, clip_vision_prefix_len)
+        if torch.is_tensor(expanded_attention_mask) and expanded_attention_mask is not attention_mask:
+            extra["attention_mask"] = expanded_attention_mask
+            _debug_log(
+                "text encode final attention_mask expansion cond_shape=%s clip_vision_prefix=%s byt5_prefix=%s "
+                "original_attention_mask_shape=%s expanded_attention_mask_shape=%s",
+                _shape_of(encoded_components.get("cond")),
+                _shape_of(clip_vision_states),
+                _shape_of(byt5_cond),
+                _shape_of(attention_mask),
+                _shape_of(expanded_attention_mask),
+            )
+        return {
+            **encoded_components,
+            "extra": extra,
+        }
+
+    @staticmethod
     def _encode_with_parity_options(clip, tokens, deepstack_layers, setclip, crop_start: int | None, task: str, visual_input_count: int = 0):
         clip.cond_stage_model.reset_clip_options()
         clip.load_model(tokens)
@@ -1607,7 +1654,8 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             pooled_dict.update(encoded[2])
         clip.add_hooks_to_dict(pooled_dict)
         _debug_log(
-            "text encode output task=%s crop_start=%s visual_input_count=%s cond_shape=%s pooled_keys=%s all_stack_text_states_shape=%s attention_mask_shape=%s",
+            "text encode output task=%s crop_start=%s visual_input_count=%s cond_shape=%s pooled_keys=%s "
+            "all_stack_text_states_shape=%s attention_mask_shape=%s conditioning_byt5small_shape=%s",
             task,
             crop_start,
             visual_input_count,
@@ -1615,6 +1663,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             sorted(pooled_dict.keys()),
             _shape_of(pooled_dict.get("all_stack_text_states")),
             _shape_of(pooled_dict.get("attention_mask")),
+            _shape_of(pooled_dict.get("conditioning_byt5small")),
         )
         return {
             "cond": cond,
@@ -1716,6 +1765,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             )
             if cls._should_skip_think_merge(prompt, task):
                 _debug_log("think merge skipped task=%s prompt_len=%s", task, len(prompt) if isinstance(prompt, str) else None)
+                base_encoding = cls._finalize_encoded_components(base_encoding, clip_vision_output=clip_vision_output)
                 return io.NodeOutput(cls._conditioning_output(base_encoding))
 
             rewrite = cls._rewrite_prompt_with_think_parts(
@@ -1735,6 +1785,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
                     task,
                     len(prompt) if isinstance(prompt, str) else None,
                 )
+                base_encoding = cls._finalize_encoded_components(base_encoding, clip_vision_output=clip_vision_output)
                 return io.NodeOutput(cls._conditioning_output(base_encoding))
             _debug_log(
                 "think merge enhanced_prompt task=%s chars=%s text=%s",
@@ -1770,6 +1821,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
                 _shape_of(think_encoding["cond"]),
                 merged_encoding.get("think_tokens_kept"),
             )
+            merged_encoding = cls._finalize_encoded_components(merged_encoding, clip_vision_output=clip_vision_output)
             return io.NodeOutput(cls._conditioning_output(merged_encoding))
 
         if think:
@@ -1791,6 +1843,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             visual_payload["visual_images"],
             visual_payload["visual_source"],
         )
+        encoded = cls._finalize_encoded_components(encoded, clip_vision_output=clip_vision_output)
         return io.NodeOutput(cls._conditioning_output(encoded))
 
 

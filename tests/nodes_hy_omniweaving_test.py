@@ -781,6 +781,48 @@ def test_hy_omniweaving_merge_hidden_keeps_leading_generated_tokens():
     )
 
 
+def test_hy_omniweaving_finalized_attention_mask_expands_for_clip_vision_prefix():
+    encoded = {
+        "cond": torch.zeros((1, 6, 2)),
+        "extra": {
+            "attention_mask": torch.ones((1, 6)),
+            "pooled_output": torch.zeros((1, 1)),
+        },
+    }
+    clip_vision_output = types.SimpleNamespace(last_hidden_state=torch.zeros((1, 1024, 1152)))
+
+    finalized = nodes.TextEncodeHunyuanVideo15Omni._finalize_encoded_components(
+        encoded,
+        clip_vision_output=clip_vision_output,
+    )
+
+    assert tuple(finalized["extra"]["attention_mask"].shape) == (1, 1030)
+    assert torch.equal(finalized["extra"]["attention_mask"][:, :1024], torch.ones((1, 1024)))
+    assert torch.equal(finalized["extra"]["attention_mask"][:, 1024:], torch.ones((1, 6)))
+
+
+def test_hy_omniweaving_finalized_attention_mask_expands_for_clip_vision_and_byt5_prefixes():
+    encoded = {
+        "cond": torch.zeros((1, 6, 2)),
+        "extra": {
+            "attention_mask": torch.ones((1, 6)),
+            "conditioning_byt5small": torch.zeros((1, 12, 1472)),
+            "pooled_output": torch.zeros((1, 1)),
+        },
+    }
+    clip_vision_output = types.SimpleNamespace(last_hidden_state=torch.zeros((1, 1024, 1152)))
+
+    finalized = nodes.TextEncodeHunyuanVideo15Omni._finalize_encoded_components(
+        encoded,
+        clip_vision_output=clip_vision_output,
+    )
+
+    assert tuple(finalized["extra"]["attention_mask"].shape) == (1, 1042)
+    assert torch.equal(finalized["extra"]["attention_mask"][:, :1024], torch.ones((1, 1024)))
+    assert torch.equal(finalized["extra"]["attention_mask"][:, 1024:1036], torch.ones((1, 12)))
+    assert torch.equal(finalized["extra"]["attention_mask"][:, 1036:], torch.ones((1, 6)))
+
+
 def test_hy_omniweaving_merge_hidden_ignores_trailing_template_control_tokens():
     base_encoding = {
         "cond": torch.full((1, 4, 1), 1.0),
