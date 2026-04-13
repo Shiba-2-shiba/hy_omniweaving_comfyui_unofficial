@@ -1436,13 +1436,13 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         return cls._is_negative_prompt_like(prompt)
 
     @staticmethod
-    def _tail_tokens(value, keep_tokens: int, dim: int):
+    def _head_tokens(value, keep_tokens: int, dim: int):
         if not torch.is_tensor(value):
             return value
         if keep_tokens <= 0 or value.shape[dim] <= keep_tokens:
             return value
         index = [slice(None)] * value.ndim
-        index[dim] = slice(value.shape[dim] - keep_tokens, None)
+        index[dim] = slice(0, keep_tokens)
         return value[tuple(index)].contiguous()
 
     @staticmethod
@@ -1513,7 +1513,10 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         if len(lengths) == 0:
             return max(think_keep_tokens, 0)
         if think_keep_tokens <= 0:
-            return min(lengths)
+            default_keep_tokens = cls.THINK_KEEP_TOKENS_BY_TASK.get(task)
+            if default_keep_tokens is None:
+                return min(lengths)
+            return min(default_keep_tokens, *lengths)
         return min([think_keep_tokens, *lengths])
 
     @classmethod
@@ -1525,7 +1528,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         base_cond = base_encoding.get("cond")
         think_tokens = think_encoding.get("tokens")
         trimmed_think_cond = cls._trim_think_trailing_template_tokens(think_encoding.get("cond"), think_tokens, dim=1)
-        think_cond = cls._tail_tokens(trimmed_think_cond, effective_keep_tokens, dim=1)
+        think_cond = cls._head_tokens(trimmed_think_cond, effective_keep_tokens, dim=1)
         if not torch.is_tensor(base_cond) or not torch.is_tensor(think_cond):
             return base_encoding
 
@@ -1538,7 +1541,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             think_tokens,
             dim=2,
         )
-        think_deepstack = cls._tail_tokens(trimmed_think_deepstack, effective_keep_tokens, dim=2)
+        think_deepstack = cls._head_tokens(trimmed_think_deepstack, effective_keep_tokens, dim=2)
         if torch.is_tensor(base_deepstack) and torch.is_tensor(think_deepstack):
             merged_extra["all_stack_text_states"] = torch.cat([base_deepstack, think_deepstack], dim=2)
 
@@ -1548,7 +1551,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
             think_tokens,
             dim=1,
         )
-        think_attention_mask = cls._tail_tokens(trimmed_think_attention_mask, effective_keep_tokens, dim=1)
+        think_attention_mask = cls._head_tokens(trimmed_think_attention_mask, effective_keep_tokens, dim=1)
         if torch.is_tensor(base_attention_mask) and torch.is_tensor(think_attention_mask):
             merged_extra["attention_mask"] = torch.cat([base_attention_mask, think_attention_mask], dim=1)
 

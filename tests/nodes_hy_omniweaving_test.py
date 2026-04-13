@@ -723,7 +723,7 @@ def test_hy_omniweaving_merge_hidden_rewrite_request_focuses_on_temporal_changes
     assert "Please generate a more detailed description" not in request
 
 
-def test_hy_omniweaving_merge_hidden_uses_full_generated_branch_by_default():
+def test_hy_omniweaving_merge_hidden_uses_task_default_generated_branch_cap():
     think_encoding = {
         "cond": torch.ones((1, 90, 2)),
         "extra": {
@@ -733,7 +733,52 @@ def test_hy_omniweaving_merge_hidden_uses_full_generated_branch_by_default():
 
     keep_tokens = nodes.TextEncodeHunyuanVideo15Omni._resolve_effective_keep_tokens("i2v", 0, think_encoding)
 
-    assert keep_tokens == 90
+    assert keep_tokens == 64
+
+
+def test_hy_omniweaving_merge_hidden_keeps_leading_generated_tokens():
+    base_encoding = {
+        "cond": torch.full((1, 2, 1), 1.0),
+        "pooled_output": torch.zeros((1, 1)),
+        "extra": {
+            "all_stack_text_states": torch.full((3, 1, 2, 1), 1.0),
+            "attention_mask": torch.ones((1, 2)),
+            "pooled_output": torch.zeros((1, 1)),
+        },
+    }
+    think_encoding = {
+        "cond": torch.tensor([[[10.0], [20.0], [30.0], [40.0]]]),
+        "extra": {
+            "all_stack_text_states": torch.tensor(
+                [
+                    [[[10.0], [20.0], [30.0], [40.0]]],
+                    [[[11.0], [21.0], [31.0], [41.0]]],
+                    [[[12.0], [22.0], [32.0], [42.0]]],
+                ]
+            ),
+            "attention_mask": torch.tensor([[1.0, 1.0, 1.0, 1.0]]),
+        },
+        "tokens": {"qwen25_7b": [[(101, 1.0), (102, 1.0), (103, 1.0), (104, 1.0)]]},
+    }
+
+    merged = nodes.TextEncodeHunyuanVideo15Omni._merge_encoded_conditioning(
+        base_encoding,
+        think_encoding,
+        task="i2v",
+        think_keep_tokens=2,
+    )
+
+    assert torch.equal(merged["cond"], torch.tensor([[[1.0], [1.0], [10.0], [20.0]]]))
+    assert torch.equal(
+        merged["extra"]["all_stack_text_states"],
+        torch.tensor(
+            [
+                [[[1.0], [1.0], [10.0], [20.0]]],
+                [[[1.0], [1.0], [11.0], [21.0]]],
+                [[[1.0], [1.0], [12.0], [22.0]]],
+            ]
+        ),
+    )
 
 
 def test_hy_omniweaving_merge_hidden_ignores_trailing_template_control_tokens():
@@ -1691,6 +1736,11 @@ def test_hy_omniweaving_text_encoder_support_logs_why_attention_mask_is_missing(
     assert "attention_mask_reason=setclip_removed_missing_orig_encode_mask" in caplog.text
     assert "orig_attention_mask_state=missing" in caplog.text
     assert "final_attention_mask_state=missing" in caplog.text
+    assert "cond_stage_model_class=SimpleNamespace" in caplog.text
+    assert "orig_encode=nodes_hy_omniweaving_test.test_hy_omniweaving_text_encoder_support_logs_why_attention_mask_is_missing.<locals>.encode_token_weights" in caplog.text
+    assert "qwen_encode=nodes_hy_omniweaving_test.test_hy_omniweaving_text_encoder_support_logs_why_attention_mask_is_missing.<locals>.qwen_encode_token_weights" in caplog.text
+    assert "qwen_attention_mask_state=tensor(1, 4)" in caplog.text
+    assert "inference=orig_encode returned no usable attention_mask before runtime-patch setclip handling" in caplog.text
 
 
 def test_ensure_hy_omniweaving_text_encoder_support_is_idempotent():

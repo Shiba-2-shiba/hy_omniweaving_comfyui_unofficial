@@ -44,6 +44,18 @@ def _norm_of(value):
     return None
 
 
+def _callable_debug_name(value):
+    if value is None:
+        return "None"
+    func = getattr(value, "__func__", value)
+    module = getattr(func, "__module__", None) or "<unknown>"
+    qualname = getattr(func, "__qualname__", getattr(func, "__name__", type(func).__name__))
+    bound_self = getattr(value, "__self__", None)
+    if bound_self is not None:
+        return f"{module}.{qualname} bound_to={type(bound_self).__name__}"
+    return f"{module}.{qualname}"
+
+
 def _is_effectively_zero(value):
     return torch.is_tensor(value) and bool(torch.count_nonzero(value).item() == 0)
 
@@ -362,18 +374,22 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         if len(deepstack_layers) == 0:
             return None
         qwen_model = getattr(self, self.clip)
+        self._hy_last_qwen_encode_source = _callable_debug_name(getattr(qwen_model, "encode_token_weights", None))
         qwen_model.reset_clip_options()
         qwen_model.set_clip_options({"layer": deepstack_layers})
         qwen_out, _, qwen_extra = qwen_model.encode_token_weights(token_weight_pairs_qwen)
         qwen_model.reset_clip_options()
+        self._hy_last_qwen_extra_keys = sorted(qwen_extra.keys()) if isinstance(qwen_extra, dict) else []
 
         if qwen_out.ndim != 4:
+            self._hy_last_qwen_attention_mask_state = "unexpected_qwen_out_rank"
             return None
 
         tok_pairs = token_weight_pairs_qwen[0]
         effective_crop_start, crop_source = _resolve_crop_start(tok_pairs, crop_start, template_end)
         attention_mask = qwen_extra.get("attention_mask", None)
         qwen_out, attention_mask = _slice_seq_and_mask(qwen_out, attention_mask, effective_crop_start)
+        self._hy_last_qwen_attention_mask_state = _describe_attention_mask_state(attention_mask)
 
         setclip_start = 0
         setclip_source = "disabled"
@@ -381,12 +397,17 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
             setclip_start, setclip_source = _find_setclip_start(tok_pairs, effective_crop_start)
             if setclip_start > 0:
                 qwen_out, attention_mask = _slice_seq_and_mask(qwen_out, attention_mask, setclip_start)
+                self._hy_last_qwen_attention_mask_state = _describe_attention_mask_state(attention_mask)
 
         if torch.is_tensor(attention_mask):
             qwen_out = qwen_out * attention_mask.unsqueeze(1).unsqueeze(-1)
         _debug_log(
-            "deepstack encode task=%s crop_start=%s crop_source=%s setclip=%s setclip_start=%s setclip_source=%s qwen_out_shape=%s attention_mask_shape=%s",
+            "deepstack encode task=%s qwen_class=%s qwen_encode=%s qwen_extra_keys=%s crop_start=%s crop_source=%s "
+            "setclip=%s setclip_start=%s setclip_source=%s qwen_out_shape=%s attention_mask_shape=%s attention_mask_state=%s",
             getattr(self, "_hy_task_name", None),
+            type(qwen_model).__name__,
+            self._hy_last_qwen_encode_source,
+            self._hy_last_qwen_extra_keys,
             effective_crop_start,
             crop_source,
             getattr(self, "setclip_output", False),
@@ -394,6 +415,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
             setclip_source,
             _shape_of(qwen_out),
             _shape_of(attention_mask),
+            self._hy_last_qwen_attention_mask_state,
         )
         return qwen_out.permute(1, 0, 2, 3).contiguous()
 
@@ -409,6 +431,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
                 template_end = 36
 
         cond, p, extra = orig_encode(token_weight_pairs)
+        orig_extra_keys = sorted(extra.keys()) if isinstance(extra, dict) else []
         template_end = _find_template_end(tok_pairs, template_end)
         effective_crop_start, crop_source = _resolve_crop_start(tok_pairs, getattr(self, "crop_start_output", None), template_end)
         attention_mask = extra.get("attention_mask", None)
@@ -454,14 +477,31 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
                         effective_crop_start,
                         setclip_start,
                     )
+        qwen_attention_mask_state = getattr(self, "_hy_last_qwen_attention_mask_state", "unset")
+        if attention_mask_reason.startswith("setclip_removed") and qwen_attention_mask_state.startswith("tensor"):
+            _debug_log(
+                "attention_mask drop analysis task=%s cond_stage_model_class=%s orig_encode=%s orig_extra_keys=%s "
+                "qwen_encode=%s qwen_extra_keys=%s qwen_attention_mask_state=%s "
+                "inference=orig_encode returned no usable attention_mask before runtime-patch setclip handling",
+                getattr(self, "_hy_task_name", None),
+                type(self).__name__,
+                _callable_debug_name(orig_encode),
+                orig_extra_keys,
+                getattr(self, "_hy_last_qwen_encode_source", "unset"),
+                getattr(self, "_hy_last_qwen_extra_keys", []),
+                qwen_attention_mask_state,
+            )
 
         self.crop_start_source = crop_source
         self.setclip_start_source = setclip_source
         _debug_log(
-            "patched_encode task=%s crop_start=%s crop_source=%s visual_inputs=%s setclip=%s setclip_start=%s "
-            "setclip_source=%s cond_shape=%s attention_mask_shape=%s attention_mask_reason=%s "
+            "patched_encode task=%s cond_stage_model_class=%s orig_encode=%s orig_extra_keys=%s crop_start=%s crop_source=%s "
+            "visual_inputs=%s setclip=%s setclip_start=%s setclip_source=%s cond_shape=%s attention_mask_shape=%s attention_mask_reason=%s "
             "orig_attention_mask_state=%s final_attention_mask_state=%s extra_keys=%s deepstack_shape=%s",
             getattr(self, "_hy_task_name", None),
+            type(self).__name__,
+            _callable_debug_name(orig_encode),
+            orig_extra_keys,
             effective_crop_start,
             crop_source,
             getattr(self, "_hy_visual_input_count", None),
@@ -501,6 +541,9 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         self._hy_task_name = None
         self._hy_visual_input_count = None
         self.setclip_start_source = "unset"
+        self._hy_last_qwen_attention_mask_state = "unset"
+        self._hy_last_qwen_extra_keys = []
+        self._hy_last_qwen_encode_source = "unset"
 
     cond_stage_model.deepstack_layers = []
     cond_stage_model.setclip_output = False
@@ -509,12 +552,22 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
     cond_stage_model._hy_task_name = None
     cond_stage_model._hy_visual_input_count = None
     cond_stage_model.setclip_start_source = "unset"
+    cond_stage_model._hy_last_qwen_attention_mask_state = "unset"
+    cond_stage_model._hy_last_qwen_extra_keys = []
+    cond_stage_model._hy_last_qwen_encode_source = "unset"
     cond_stage_model.encode_token_weights = types.MethodType(patched_encode, cond_stage_model)
     cond_stage_model.set_clip_options = types.MethodType(patched_set, cond_stage_model)
     cond_stage_model.reset_clip_options = types.MethodType(patched_reset, cond_stage_model)
     cond_stage_model._encode_deepstack = types.MethodType(_encode_deepstack, cond_stage_model)
     cond_stage_model._hy_omniweaving_text_encoder_patched = True
-    logging.info("HY-OmniWeaving attached instance-local text-encoder support for deepstack/setclip.")
+    logging.info(
+        "HY-OmniWeaving attached instance-local text-encoder support for deepstack/setclip. "
+        "cond_stage_model_class=%s orig_encode=%s qwen_class=%s qwen_encode=%s",
+        type(cond_stage_model).__name__,
+        _callable_debug_name(orig_encode),
+        type(getattr(cond_stage_model, getattr(cond_stage_model, "clip", "qwen25_7b"), None)).__name__,
+        _callable_debug_name(getattr(getattr(cond_stage_model, getattr(cond_stage_model, "clip", "qwen25_7b"), None), "encode_token_weights", None)),
+    )
     return True
 
 
