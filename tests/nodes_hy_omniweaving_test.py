@@ -723,7 +723,7 @@ def test_hy_omniweaving_merge_hidden_rewrite_request_focuses_on_temporal_changes
     assert "Please generate a more detailed description" not in request
 
 
-def test_hy_omniweaving_merge_hidden_uses_task_default_generated_branch_cap():
+def test_hy_omniweaving_merge_hidden_uses_full_generated_branch_by_default():
     think_encoding = {
         "cond": torch.ones((1, 90, 2)),
         "extra": {
@@ -733,7 +733,7 @@ def test_hy_omniweaving_merge_hidden_uses_task_default_generated_branch_cap():
 
     keep_tokens = nodes.TextEncodeHunyuanVideo15Omni._resolve_effective_keep_tokens("i2v", 0, think_encoding)
 
-    assert keep_tokens == 64
+    assert keep_tokens == 90
 
 
 def test_hy_omniweaving_merge_hidden_keeps_leading_generated_tokens():
@@ -1703,11 +1703,12 @@ def test_hy_omniweaving_text_encoder_support_applies_setclip_to_cond_and_deepsta
     )
 
     assert tuple(cond.shape) == (1, 4, 2)
-    assert "attention_mask" not in extra
+    assert tuple(extra["attention_mask"].shape) == (1, 4)
+    assert torch.equal(extra["attention_mask"], torch.ones((1, 4)))
     assert tuple(extra["all_stack_text_states"].shape) == (3, 1, 4, 2)
 
 
-def test_hy_omniweaving_text_encoder_support_logs_why_attention_mask_is_missing(monkeypatch, caplog):
+def test_hy_omniweaving_text_encoder_support_logs_attention_mask_reconstruction(monkeypatch, caplog):
     clip = _ClipStub(has_byt5=True)
 
     def encode_token_weights(tokens):
@@ -1733,14 +1734,14 @@ def test_hy_omniweaving_text_encoder_support_logs_why_attention_mask_is_missing(
             {"qwen25_7b": [[(151644, 1.0), (151644, 1.0), (11, 1.0), (12, 1.0), (151653, 1.0), (21, 1.0), (22, 1.0), (23, 1.0), (24, 1.0)]]}
         )
 
-    assert "attention_mask_reason=setclip_removed_missing_orig_encode_mask" in caplog.text
+    assert "attention_mask_reason=reconstructed_from_qwen_branch" in caplog.text
     assert "orig_attention_mask_state=missing" in caplog.text
-    assert "final_attention_mask_state=missing" in caplog.text
+    assert "final_attention_mask_state=tensor(1, 4)" in caplog.text
     assert "cond_stage_model_class=SimpleNamespace" in caplog.text
-    assert "orig_encode=nodes_hy_omniweaving_test.test_hy_omniweaving_text_encoder_support_logs_why_attention_mask_is_missing.<locals>.encode_token_weights" in caplog.text
-    assert "qwen_encode=nodes_hy_omniweaving_test.test_hy_omniweaving_text_encoder_support_logs_why_attention_mask_is_missing.<locals>.qwen_encode_token_weights" in caplog.text
-    assert "qwen_attention_mask_state=tensor(1, 4)" in caplog.text
-    assert "inference=orig_encode returned no usable attention_mask before runtime-patch setclip handling" in caplog.text
+    assert "orig_encode=nodes_hy_omniweaving_test.test_hy_omniweaving_text_encoder_support_logs_attention_mask_reconstruction.<locals>.encode_token_weights" in caplog.text
+    assert "qwen_encode=nodes_hy_omniweaving_test.test_hy_omniweaving_text_encoder_support_logs_attention_mask_reconstruction.<locals>.qwen_encode_token_weights" in caplog.text
+    assert "attention_mask_state=tensor(1, 4)" in caplog.text
+    assert "attention_mask reconstructed task=i2v cond_stage_model_class=SimpleNamespace source=qwen_branch shape=(1, 4)" in caplog.text
 
 
 def test_ensure_hy_omniweaving_text_encoder_support_is_idempotent():

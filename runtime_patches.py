@@ -372,6 +372,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
     def _encode_deepstack(self, token_weight_pairs_qwen, crop_start, template_end):
         deepstack_layers = list(getattr(self, "deepstack_layers", []))
         if len(deepstack_layers) == 0:
+            self._hy_last_qwen_attention_mask = None
             return None
         qwen_model = getattr(self, self.clip)
         self._hy_last_qwen_encode_source = _callable_debug_name(getattr(qwen_model, "encode_token_weights", None))
@@ -383,6 +384,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
 
         if qwen_out.ndim != 4:
             self._hy_last_qwen_attention_mask_state = "unexpected_qwen_out_rank"
+            self._hy_last_qwen_attention_mask = None
             return None
 
         tok_pairs = token_weight_pairs_qwen[0]
@@ -401,6 +403,9 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
 
         if torch.is_tensor(attention_mask):
             qwen_out = qwen_out * attention_mask.unsqueeze(1).unsqueeze(-1)
+            self._hy_last_qwen_attention_mask = attention_mask.clone()
+        else:
+            self._hy_last_qwen_attention_mask = None
         _debug_log(
             "deepstack encode task=%s qwen_class=%s qwen_encode=%s qwen_extra_keys=%s crop_start=%s crop_source=%s "
             "setclip=%s setclip_start=%s setclip_source=%s qwen_out_shape=%s attention_mask_shape=%s attention_mask_state=%s",
@@ -463,6 +468,30 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
             attention_mask_reason = "setclip_disabled_tensor_unmodified"
 
         deepstack_hidden_states = _encode_deepstack(self, token_weight_pairs["qwen25_7b"], getattr(self, "crop_start_output", None), template_end)
+        qwen_attention_mask = getattr(self, "_hy_last_qwen_attention_mask", None)
+        if (
+            getattr(self, "setclip_output", False)
+            and
+            not torch.is_tensor(attention_mask)
+            and torch.is_tensor(qwen_attention_mask)
+            and torch.is_tensor(cond)
+            and cond.ndim >= 2
+            and qwen_attention_mask.ndim == 2
+            and qwen_attention_mask.shape[0] == cond.shape[0]
+            and qwen_attention_mask.shape[1] == cond.shape[1]
+        ):
+            attention_mask = qwen_attention_mask.to(device=cond.device)
+            extra["attention_mask"] = attention_mask
+            attention_mask_reason = "reconstructed_from_qwen_branch"
+            _debug_log(
+                "attention_mask reconstructed task=%s cond_stage_model_class=%s source=qwen_branch shape=%s "
+                "orig_encode=%s qwen_encode=%s",
+                getattr(self, "_hy_task_name", None),
+                type(self).__name__,
+                _shape_of(attention_mask),
+                _callable_debug_name(orig_encode),
+                getattr(self, "_hy_last_qwen_encode_source", "unset"),
+            )
         if deepstack_hidden_states is not None:
             extra["all_stack_text_states"] = deepstack_hidden_states
             if torch.is_tensor(cond) and cond.ndim >= 2 and deepstack_hidden_states.ndim >= 3:
@@ -544,6 +573,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         self._hy_last_qwen_attention_mask_state = "unset"
         self._hy_last_qwen_extra_keys = []
         self._hy_last_qwen_encode_source = "unset"
+        self._hy_last_qwen_attention_mask = None
 
     cond_stage_model.deepstack_layers = []
     cond_stage_model.setclip_output = False
@@ -555,6 +585,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
     cond_stage_model._hy_last_qwen_attention_mask_state = "unset"
     cond_stage_model._hy_last_qwen_extra_keys = []
     cond_stage_model._hy_last_qwen_encode_source = "unset"
+    cond_stage_model._hy_last_qwen_attention_mask = None
     cond_stage_model.encode_token_weights = types.MethodType(patched_encode, cond_stage_model)
     cond_stage_model.set_clip_options = types.MethodType(patched_set, cond_stage_model)
     cond_stage_model.reset_clip_options = types.MethodType(patched_reset, cond_stage_model)

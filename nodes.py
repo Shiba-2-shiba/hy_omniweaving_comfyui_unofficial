@@ -1513,10 +1513,7 @@ class TextEncodeHunyuanVideo15Omni(io.ComfyNode):
         if len(lengths) == 0:
             return max(think_keep_tokens, 0)
         if think_keep_tokens <= 0:
-            default_keep_tokens = cls.THINK_KEEP_TOKENS_BY_TASK.get(task)
-            if default_keep_tokens is None:
-                return min(lengths)
-            return min(default_keep_tokens, *lengths)
+            return min(lengths)
         return min([think_keep_tokens, *lengths])
 
     @classmethod
