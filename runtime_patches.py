@@ -525,27 +525,40 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
             return "missing"
         return type(value).__name__
 
-    def _find_setclip_start(tok_pairs, crop_start, prepared_meta=None):
-        if isinstance(prepared_meta, dict) and bool(prepared_meta.get("used_fallback_text_only", False)):
-            return 0, "prepared_text_only"
+    def _collect_setclip_token_positions(tok_pairs, crop_start):
         expanded_index = 0
-        last_vision_end = None
-        last_image_end = None
+        token_positions = []
+        image_metadata_positions = []
         for tok_pair in tok_pairs:
             elem = tok_pair[0]
             elem_size = _expanded_tok_pair_size(tok_pair)
             start = expanded_index
             end = start + elem_size
             if isinstance(elem, numbers.Integral) and int(elem) == 151653 and end > crop_start:
-                last_vision_end = end
+                token_positions.append(end)
             elif isinstance(elem, dict) and elem.get("original_type") == "image" and end > crop_start:
-                last_image_end = end
+                image_metadata_positions.append(end)
             expanded_index = end
+        return token_positions, image_metadata_positions
+
+    def _find_setclip_start(tok_pairs, crop_start, prepared_meta=None):
+        if isinstance(prepared_meta, dict) and bool(prepared_meta.get("used_fallback_text_only", False)):
+            return 0, "prepared_text_only"
+        token_positions, image_metadata_positions = _collect_setclip_token_positions(tok_pairs, crop_start)
+        last_vision_end = token_positions[-1] if len(token_positions) > 0 else None
+        last_image_end = image_metadata_positions[-1] if len(image_metadata_positions) > 0 else None
+        prepared_roles = prepared_meta.get("ordered_roles", None) if isinstance(prepared_meta, dict) else None
 
         if last_vision_end is not None:
-            return max(0, last_vision_end - crop_start), "vision_end_token"
+            source = "vision_end_token"
+            if prepared_roles:
+                source = f"prepared_roles+{source}"
+            return max(0, last_vision_end - crop_start), source
         if last_image_end is not None:
-            return max(0, last_image_end - crop_start), "image_metadata"
+            source = "image_metadata"
+            if prepared_roles:
+                source = f"prepared_roles+{source}"
+            return max(0, last_image_end - crop_start), source
         return 0, "none"
 
     def _encode_deepstack(self, token_weight_pairs_qwen, crop_start, template_end):
@@ -569,6 +582,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         tok_pairs = token_weight_pairs_qwen[0]
         prepared_meta = getattr(self, "_hy_prepared_input_meta", None)
         effective_crop_start, crop_source = _resolve_crop_start(tok_pairs, crop_start, template_end, prepared_meta=prepared_meta)
+        setclip_token_positions, image_metadata_positions = _collect_setclip_token_positions(tok_pairs, effective_crop_start)
         attention_mask = qwen_extra.get("attention_mask", None)
         qwen_out, attention_mask = _slice_seq_and_mask(qwen_out, attention_mask, effective_crop_start)
         self._hy_last_qwen_attention_mask_state = _describe_attention_mask_state(attention_mask)
@@ -586,6 +600,16 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
             self._hy_last_qwen_attention_mask = attention_mask.clone()
         else:
             self._hy_last_qwen_attention_mask = None
+        _debug_log(
+            "setclip token positions task=%s crop_start=%s ordered_roles=%s token_positions=%s image_metadata_positions=%s chosen=%s chosen_source=%s",
+            getattr(self, "_hy_task_name", None),
+            effective_crop_start,
+            prepared_meta.get("ordered_roles", None) if isinstance(prepared_meta, dict) else None,
+            setclip_token_positions,
+            image_metadata_positions,
+            setclip_start,
+            setclip_source,
+        )
         _debug_log(
             "deepstack encode task=%s qwen_class=%s qwen_encode=%s qwen_extra_keys=%s crop_start=%s crop_source=%s "
             "setclip=%s setclip_start=%s setclip_source=%s qwen_out_shape=%s attention_mask_shape=%s attention_mask_state=%s",
@@ -620,6 +644,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         template_end = _find_template_end(tok_pairs, template_end)
         prepared_meta = getattr(self, "_hy_prepared_input_meta", None)
         effective_crop_start, crop_source = _resolve_crop_start(tok_pairs, getattr(self, "crop_start_output", None), template_end, prepared_meta=prepared_meta)
+        setclip_token_positions, image_metadata_positions = _collect_setclip_token_positions(tok_pairs, effective_crop_start)
         attention_mask = extra.get("attention_mask", None)
         original_attention_mask = attention_mask
         attention_mask_reason = "orig_encode_missing"
@@ -678,6 +703,17 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
             if torch.is_tensor(cond) and cond.ndim >= 2 and deepstack_hidden_states.ndim >= 3:
                 cond_tokens = cond.shape[1]
                 deepstack_tokens = deepstack_hidden_states.shape[2]
+                mask_tokens = attention_mask.shape[1] if torch.is_tensor(attention_mask) and attention_mask.ndim >= 2 else None
+                _debug_log(
+                    "token alignment task=%s cond_tokens=%s deepstack_tokens=%s mask_tokens=%s crop_start=%s setclip_start=%s ordered_roles=%s",
+                    getattr(self, "_hy_task_name", None),
+                    cond_tokens,
+                    deepstack_tokens,
+                    mask_tokens,
+                    effective_crop_start,
+                    setclip_start,
+                    prepared_meta.get("ordered_roles", None) if isinstance(prepared_meta, dict) else None,
+                )
                 if cond_tokens != deepstack_tokens:
                     logging.warning(
                         "HY-OmniWeaving token-length mismatch after crop/setclip: task=%s cond_tokens=%s deepstack_tokens=%s crop_start=%s setclip_start=%s",
@@ -725,6 +761,15 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
             _describe_attention_mask_state(extra.get("attention_mask")),
             sorted(extra.keys()),
             _shape_of(extra.get("all_stack_text_states")),
+        )
+        _debug_log(
+            "patched_encode setclip detail task=%s ordered_roles=%s token_positions=%s image_metadata_positions=%s chosen=%s chosen_source=%s",
+            getattr(self, "_hy_task_name", None),
+            prepared_meta.get("ordered_roles", None) if isinstance(prepared_meta, dict) else None,
+            setclip_token_positions,
+            image_metadata_positions,
+            setclip_start,
+            setclip_source,
         )
         return cond, p, extra
 
