@@ -2176,7 +2176,7 @@ def test_ensure_hy_omniweaving_txt_mask_alignment_support_uses_trailing_text_mas
     assert torch.equal(recorded["mask"], mask[:, -1140:])
 
 
-def test_ensure_hy_omniweaving_txt_mask_alignment_support_keeps_non_prefix_mismatch():
+def test_ensure_hy_omniweaving_txt_mask_alignment_support_trims_non_prefix_mismatch_for_runtime_safety():
     recorded = {}
 
     class _TxtIn:
@@ -2194,8 +2194,8 @@ def test_ensure_hy_omniweaving_txt_mask_alignment_support_keeps_non_prefix_misma
     mask = torch.tensor([[0.0, 2.0, 3.0, 4.0, 5.0, 6.0]])
     diffusion_model.txt_in.forward(x, torch.tensor([1.0]), mask, transformer_options={})
 
-    assert recorded["mask_shape"] == (1, 6)
-    assert torch.equal(recorded["mask"], mask)
+    assert recorded["mask_shape"] == (1, 4)
+    assert torch.equal(recorded["mask"], mask[:, -4:])
 
 
 def test_hy_omniweaving_diffusion_wrapper_injects_dit_patch():

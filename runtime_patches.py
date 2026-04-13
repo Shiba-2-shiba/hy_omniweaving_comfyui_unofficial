@@ -148,15 +148,34 @@ def _ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model):
 
     original_forward = txt_in.forward
 
-    def _can_trim_expanded_prefix(mask, target_length: int):
+    def _mask_prefix_debug_stats(mask, target_length: int):
         if not torch.is_tensor(mask) or mask.ndim < 2:
-            return False
-        if target_length <= 0 or mask.shape[-1] <= target_length:
-            return False
-        prefix = mask[..., : mask.shape[-1] - target_length]
-        if prefix.numel() == 0:
-            return False
-        return bool(torch.all(prefix == 1).item())
+            return {
+                "extra_tokens": 0,
+                "prefix_shape": None,
+                "prefix_non_one_count": None,
+                "prefix_min": None,
+                "prefix_max": None,
+            }
+        extra_tokens = max(0, int(mask.shape[-1] - target_length))
+        if extra_tokens <= 0:
+            return {
+                "extra_tokens": 0,
+                "prefix_shape": None,
+                "prefix_non_one_count": 0,
+                "prefix_min": None,
+                "prefix_max": None,
+            }
+        prefix = mask[..., :extra_tokens]
+        prefix_float = prefix.float()
+        prefix_non_one_count = int(torch.count_nonzero(prefix != 1).item())
+        return {
+            "extra_tokens": extra_tokens,
+            "prefix_shape": _shape_of(prefix),
+            "prefix_non_one_count": prefix_non_one_count,
+            "prefix_min": float(prefix_float.min().item()),
+            "prefix_max": float(prefix_float.max().item()),
+        }
 
     def patched_forward(self, x, *args, **kwargs):
         mask = None
@@ -172,26 +191,20 @@ def _ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model):
             and torch.is_tensor(x)
             and x.ndim >= 2
             and mask.shape[-1] > x.shape[1]
-            and _can_trim_expanded_prefix(mask, x.shape[1])
         ):
+            prefix_stats = _mask_prefix_debug_stats(mask, x.shape[1])
             effective_mask = mask[..., -x.shape[1]:]
             _debug_log(
-                "txt_in mask alignment x_shape=%s original_mask_shape=%s effective_mask_shape=%s",
+                "txt_in mask alignment x_shape=%s original_mask_shape=%s effective_mask_shape=%s extra_tokens=%s "
+                "prefix_shape=%s prefix_non_one_count=%s prefix_min=%s prefix_max=%s",
                 _shape_of(x),
                 _shape_of(mask),
                 _shape_of(effective_mask),
-            )
-        elif (
-            torch.is_tensor(mask)
-            and mask.ndim >= 2
-            and torch.is_tensor(x)
-            and x.ndim >= 2
-            and mask.shape[-1] > x.shape[1]
-        ):
-            _debug_log(
-                "txt_in mask alignment skipped x_shape=%s original_mask_shape=%s reason=non_prefix_or_non_ones_extra",
-                _shape_of(x),
-                _shape_of(mask),
+                prefix_stats["extra_tokens"],
+                prefix_stats["prefix_shape"],
+                prefix_stats["prefix_non_one_count"],
+                prefix_stats["prefix_min"],
+                prefix_stats["prefix_max"],
             )
 
         if len(args) >= 2:
