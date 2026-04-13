@@ -139,6 +139,54 @@ def _ensure_hy_omniweaving_extra_conds_support(model):
     return True
 
 
+def _ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model):
+    txt_in = getattr(diffusion_model, "txt_in", None)
+    if txt_in is None:
+        return False
+    if getattr(txt_in, "_hy_omniweaving_mask_alignment_patched", False):
+        return False
+
+    original_forward = txt_in.forward
+
+    def patched_forward(self, x, *args, **kwargs):
+        mask = None
+        if len(args) >= 2:
+            mask = args[1]
+        elif "mask" in kwargs:
+            mask = kwargs.get("mask")
+
+        effective_mask = mask
+        if (
+            torch.is_tensor(mask)
+            and mask.ndim >= 2
+            and torch.is_tensor(x)
+            and x.ndim >= 2
+            and mask.shape[-1] > x.shape[1]
+        ):
+            effective_mask = mask[..., -x.shape[1]:]
+            _debug_log(
+                "txt_in mask alignment x_shape=%s original_mask_shape=%s effective_mask_shape=%s",
+                _shape_of(x),
+                _shape_of(mask),
+                _shape_of(effective_mask),
+            )
+
+        if len(args) >= 2:
+            args = list(args)
+            args[1] = effective_mask
+            args = tuple(args)
+        elif "mask" in kwargs:
+            kwargs = kwargs.copy()
+            kwargs["mask"] = effective_mask
+
+        return original_forward(x, *args, **kwargs)
+
+    txt_in.forward = types.MethodType(patched_forward, txt_in)
+    txt_in._hy_omniweaving_mask_alignment_patched = True
+    logging.info("HY-OmniWeaving attached instance-local txt_in mask alignment support.")
+    return True
+
+
 def ensure_hy_omniweaving_deepstack_support(model_patcher, sd: dict | None = None, mm_in_sd: dict | None = None):
     if mm_in_sd is None:
         mm_in_sd = extract_hy_omniweaving_mm_in_state_dict(sd or {})
@@ -155,6 +203,7 @@ def ensure_hy_omniweaving_deepstack_support(model_patcher, sd: dict | None = Non
     diffusion_model = getattr(model, "diffusion_model", None)
     if diffusion_model is None:
         return False
+    _ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model)
     if getattr(diffusion_model, "mm_in", None) is not None:
         return True
 

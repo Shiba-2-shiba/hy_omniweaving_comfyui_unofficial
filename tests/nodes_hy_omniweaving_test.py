@@ -1793,6 +1793,31 @@ def test_ensure_hy_omniweaving_text_encoder_support_is_idempotent():
     assert runtime_patches.ensure_hy_omniweaving_text_encoder_support(clip) is False
 
 
+def test_ensure_hy_omniweaving_txt_mask_alignment_support_uses_trailing_text_mask():
+    recorded = {}
+
+    class _TxtIn:
+        def forward(self, x, timesteps, mask, transformer_options=None):
+            recorded["x_shape"] = tuple(x.shape)
+            recorded["mask_shape"] = tuple(mask.shape) if torch.is_tensor(mask) else None
+            recorded["mask"] = mask.clone() if torch.is_tensor(mask) else mask
+            return x
+
+    diffusion_model = types.SimpleNamespace(txt_in=_TxtIn())
+
+    patched = runtime_patches._ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model)
+    assert patched is True
+
+    x = torch.zeros((1, 1140, 3584))
+    mask = torch.arange(2164, dtype=torch.float32).reshape(1, 2164)
+    out = diffusion_model.txt_in.forward(x, torch.tensor([1.0]), mask, transformer_options={})
+
+    assert out is x
+    assert recorded["x_shape"] == (1, 1140, 3584)
+    assert recorded["mask_shape"] == (1, 1140)
+    assert torch.equal(recorded["mask"], mask[:, -1140:])
+
+
 def test_hy_omniweaving_diffusion_wrapper_injects_dit_patch():
     class _Executor:
         def __init__(self):
