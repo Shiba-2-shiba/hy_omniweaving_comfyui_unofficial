@@ -66,11 +66,31 @@ def _source_like_messages(task: str, prompt: str, pil_images):
 
 def _processor_summary(processor_root: Path, messages):
     from transformers import AutoProcessor
-    from qwen_vl_utils import process_vision_info
+    try:
+        from qwen_vl_utils import process_vision_info  # type: ignore
+    except ImportError:
+        process_vision_info = None
 
     processor = AutoProcessor.from_pretrained(str(processor_root))
     texts = [processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in messages]
-    image_inputs, video_inputs = process_vision_info(messages)
+    if process_vision_info is not None:
+        image_inputs, video_inputs = process_vision_info(messages)
+    else:
+        image_inputs = []
+        video_inputs = None
+        for msg in messages:
+            conversation = msg[1] if isinstance(msg, list) and len(msg) > 1 else msg
+            content = conversation.get("content", []) if isinstance(conversation, dict) else []
+            for item in content:
+                if item.get("type") == "image":
+                    image_inputs.append(item.get("image"))
+                elif item.get("type") == "video":
+                    raise RuntimeError(
+                        "qwen_vl_utils is required for video-based parity comparison. "
+                        "Install it or restrict the script to image/text tasks."
+                    )
+        if len(image_inputs) == 0:
+            image_inputs = None
     inputs = processor(
         text=texts,
         images=image_inputs,
