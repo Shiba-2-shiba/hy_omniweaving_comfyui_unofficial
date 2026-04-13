@@ -10,6 +10,7 @@ from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parent
 WORK_ROOT = REPO_ROOT.parent
+DEFAULT_COMFY_ROOT = REPO_ROOT.parents[1]
 DEFAULT_PROCESSOR_ROOT = WORK_ROOT / "Qwen2.5-VL-7B-Instruct"
 
 
@@ -22,6 +23,7 @@ def _parse_args():
     parser = argparse.ArgumentParser(
         description="Compare current HY-OmniWeaving prepared-spec text inputs against source-like processor inputs."
     )
+    parser.add_argument("--comfy-root", default=str(DEFAULT_COMFY_ROOT), help="Path to the active ComfyUI checkout.")
     parser.add_argument("--processor-root", default=str(DEFAULT_PROCESSOR_ROOT), help="Path to Qwen2.5-VL processor assets.")
     parser.add_argument("--prompt", required=True, help="Prompt to compare.")
     parser.add_argument("--task", choices=["t2v", "i2v", "reference2v", "interpolation"], default="i2v")
@@ -37,8 +39,11 @@ def _load_visual_image(path: str):
     return tensor.unsqueeze(0)
 
 
-def _import_nodes():
+def _import_nodes(comfy_root: Path):
+    sys.path.insert(0, str(comfy_root))
     sys.path.insert(0, str(REPO_ROOT))
+    import comfy.options
+    comfy.options.enable_args_parsing(False)
     import nodes
     return nodes
 
@@ -89,7 +94,7 @@ def _processor_summary(processor_root: Path, messages):
 def main():
     _configure_stdout()
     args = _parse_args()
-    nodes = _import_nodes()
+    nodes = _import_nodes(Path(args.comfy_root).resolve())
 
     loaded_images = [_load_visual_image(path) for path in args.image]
     stacked_images = torch.cat(loaded_images, dim=0) if len(loaded_images) > 0 else None
