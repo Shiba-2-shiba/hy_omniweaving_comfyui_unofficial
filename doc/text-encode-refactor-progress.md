@@ -1,6 +1,6 @@
 # Text Encode Refactor Progress
 
-Last updated: 2026-04-13
+Last updated: 2026-04-14
 
 ## Objective
 
@@ -10,7 +10,7 @@ finetuned `safetensors` model path.
 
 ## Current Status
 
-Status: Stage 4 complete, next scope decision pending
+Status: replanning after runtime mask-order diagnosis
 
 Current focus:
 
@@ -35,7 +35,9 @@ Current focus:
 | 2 | Non-video task migration | Completed | `t2v` / `i2v` / `reference2v` / `interpolation` now tokenize through prepared-input ownership on the main path |
 | 3 | Crop/setclip ownership | Completed | runtime patch now accepts prepared metadata and prefers it for crop/setclip ownership |
 | 4 | Late mask cleanup | Completed | final correction is now narrower and task-aware |
-| 5 | Video-frame support | Pending | required for source-like `editing` / `tiv2v` |
+| 5 | Clip-vision mask ordering | Pending | `txt_in` still receives post-concat-length mask on the main `i2v` path |
+| 6 | Remaining attention-mask / setclip gaps | Pending | integrated mask still missing and setclip is still heuristic-heavy |
+| 7 | Video-frame support | Pending | required for source-like `editing` / `tiv2v` |
 
 ## Completed
 
@@ -61,13 +63,16 @@ Current focus:
 - [x] Restricted `txt_in` mask trimming to intentional all-ones prefix-expansion cases
 - [x] Added Stage 4 regression tests for narrowed final-mask behavior
 - [x] Targeted Stage 4 pytest run passed
+- [x] Added runtime diagnostics proving `forward_orig` currently receives a
+  post-concat-length `txt_mask` on the main `i2v` path
+- [x] Added `txt_in` prefix/suffix mask diagnostics to quantify the overhang
 
 ## Next Actions
 
-1. Decide whether any remaining image-embed fallback should also become spec-aware.
-2. Stage explicit `video_frames` support for `editing` / `tiv2v`.
-3. Reassess whether ByT5-related final prefix expansion can also move earlier.
-4. Choose whether to continue with Stage 5 or stop after the non-video parity lane.
+1. Remove clip-vision mask pre-expansion before `txt_in` on the main `i2v` path.
+2. Re-check real runtime logs for `txt_mask_len == expected_txt_in_len`.
+3. Then reduce `reconstructed_from_qwen_branch` reliance on the main path.
+4. Then reduce heuristic `setclip_start=3` reliance.
 
 ## Blockers
 
@@ -159,6 +164,14 @@ Expected implementation blockers:
   - leaving non-prefix mask mismatches untouched
 - Ran targeted pytest for Stage 4 and confirmed the selected regression set
   passed.
+- Added runtime debug around `forward_orig txt_mask` and `txt_in` mask
+  prefix/suffix statistics.
+- Real `i2v` runtime logs now show:
+  - `txt_mask_len == expected_post_concat_txt_len`
+  - `appears_preexpanded_for_clip=True`
+  - `expected_txt_in_len != txt_mask_len`
+- That confirms the next structural fix should target clip-vision mask ordering
+  before tackling the remaining integrated-mask and setclip gaps.
 
 ## Update Rule
 

@@ -1,6 +1,6 @@
 # Text Encode Refactor Spec
 
-Last updated: 2026-04-13
+Last updated: 2026-04-14
 
 ## Goal
 
@@ -163,6 +163,42 @@ current architecture still transports `clip_vision_output` outside the original
 source text encoder. The goal is to minimize late corrective logic and make any
 remaining prefix alignment explicit and narrow.
 
+### 5. Restore source-like clip-vision mask ordering
+
+The current runtime evidence now shows that `clip_vision`-related text-mask
+growth is happening before `txt_in`, even though the source ordering is:
+
+1. run `txt_in(txt, ..., txt_mask)` on text tokens
+2. append `txt_byt5` if present
+3. append `clip_fea` vision states
+4. build the larger `attn_mask`
+
+Current runtime logs show:
+
+- `forward_orig txt_mask_len == expected_post_concat_txt_len`
+- `forward_orig appears_preexpanded_for_clip=True`
+
+This means the custom node is currently carrying a post-concat-length mask too
+early. The next design target is:
+
+- keep `txt_mask` at text-token length before `txt_in`
+- if clip-vision-aware mask growth is still needed, move it to the stage where
+  `clip_fea` is actually concatenated
+
+This is now the highest-priority structural parity target for `i2v`.
+
+### 6. Resolve remaining main-path gaps
+
+After clip-vision mask ordering is corrected, the next open parity gaps remain:
+
+- integrated `attention_mask` still missing on the main path, forcing
+  `reconstructed_from_qwen_branch`
+- `setclip_start=3` is still chosen heuristically from token inspection
+
+Those should be treated as the next two source-parity targets after clip-vision
+mask ordering is corrected, because current diagnostics show they are still part
+of the main `i2v` path.
+
 ## Proposed Implementation Shape
 
 ### Nodes layer
@@ -234,6 +270,19 @@ sampling changes.
 - `editing` and `tiv2v` gain a source-like text-side video path
 - video-conditioned text assembly is explicit instead of implicit
 
+### Phase 4 acceptance
+
+- `forward_orig txt_mask_len == expected_txt_in_len` on the main `i2v` path
+- `appears_preexpanded_for_clip=False` on the main `i2v` path
+- no sampler regression after moving clip-vision mask growth later
+
+### Phase 5 acceptance
+
+- the main `i2v` path no longer needs `attention_mask_reason=reconstructed_from_qwen_branch`
+  or is demonstrably reduced to a narrower fallback-only case
+- `setclip` behavior is driven by prepared semantics first and token heuristics
+  second
+
 ## Verification Strategy
 
 - add regression tests before replacing current helpers
@@ -245,6 +294,9 @@ sampling changes.
   - setclip ownership
   - attention mask state
   - deepstack token length
+  - `forward_orig` mask dtype / branch selection
+  - `expected_txt_in_len` vs `expected_post_concat_txt_len`
+  - `txt_in` mask prefix and suffix statistics
 
 ## Risks
 
@@ -252,6 +304,8 @@ sampling changes.
   currently stable validated workflows
 - `clip_vision_output` prefix handling may still need a minimal final alignment
   layer even after source-like prepared input is introduced
+- changing clip-vision mask ordering without enough runtime evidence could
+  silently degrade `i2v` quality even if sampling still completes
 - `editing` and `tiv2v` require an explicit video-frames contract that does not
   exist yet in the current TextEncode node schema
 
@@ -259,5 +313,7 @@ sampling changes.
 
 The refactor should not chase better quality through more custom template
 tuning. It should centralize source-like multimodal task preparation into a
-local spec layer, keep the current single `safetensors` model path, and then
-move crop/setclip ownership closer to that prepared-input spec.
+local spec layer, keep the current single `safetensors` model path, move
+crop/setclip ownership closer to that prepared-input spec, then fix the
+clip-vision mask ordering so `txt_in` sees text-length masks again before
+solving the remaining integrated-mask and setclip heuristic gaps.

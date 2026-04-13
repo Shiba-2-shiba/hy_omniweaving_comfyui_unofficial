@@ -1,6 +1,6 @@
 # Text Encode Refactor Tasks
 
-Last updated: 2026-04-13
+Last updated: 2026-04-14
 
 ## Scope
 
@@ -96,7 +96,39 @@ Definition of done:
 
 - remaining late mask correction is intentional, minimal, and documented
 
-### Stage 5. Add explicit video-frames support
+### Stage 5. Fix clip-vision mask ordering
+
+- [ ] Remove `clip_vision` mask pre-expansion before `txt_in` on the main
+  `i2v` path.
+- [ ] Keep `txt_mask` at text-token length before `txt_in`.
+- [ ] If needed, move clip-vision-aware mask growth to the stage after
+  `clip_fea` is concatenated.
+- [ ] Add regression coverage for:
+  - [ ] `forward_orig txt_mask_len == expected_txt_in_len`
+  - [ ] `appears_preexpanded_for_clip=False`
+  - [ ] no sampler regression on the validated `i2v` path
+- [ ] Verify the fix on real runtime logs, not just unit tests.
+
+Definition of done:
+
+- main-path `i2v` no longer carries post-concat-length text masks into `txt_in`
+
+### Stage 6. Resolve remaining `attention_mask` / `setclip` gaps
+
+- [ ] Reduce or eliminate `attention_mask_reason=reconstructed_from_qwen_branch`
+  on the main `i2v` path.
+- [ ] Add diagnostics that compare integrated-mask output against reconstructed
+  mask output.
+- [ ] Move `setclip` ownership further toward prepared semantics.
+- [ ] Reduce dependence on heuristic `setclip_start=3` token inspection.
+- [ ] Add regression coverage for source-like setclip behavior.
+
+Definition of done:
+
+- main-path `i2v` is no longer primarily driven by runtime mask reconstruction
+  and heuristic setclip discovery
+
+### Stage 7. Add explicit video-frames support
 
 - [ ] Decide the text-side contract for `video_frames`.
 - [ ] Add `video_frames` input to `HYOmniWeavingTextEncode` if needed.
@@ -123,7 +155,7 @@ Important but later:
 
 - Stage 2 for `reference2v` and `interpolation`
 - Stage 4
-- Stage 5
+- Stage 7
 
 ## Task Ownership Hints
 
@@ -160,6 +192,9 @@ The refactor is ready for completion review when:
 
 - `i2v` and `t2v` both run through prepared-input ownership
 - crop/setclip ownership is spec-driven rather than mostly heuristic
+- `txt_in` receives text-length masks again on the main `i2v` path
+- `attention_mask` and `setclip` behavior are not primarily patch-reconstructed
+  heuristics on the main `i2v` path
 - current stable workflows still execute
 - regression tests cover the replaced internal behavior
 - remaining approximation is narrow, documented, and intentional
