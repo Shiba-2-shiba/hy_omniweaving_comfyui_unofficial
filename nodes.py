@@ -37,6 +37,9 @@ except ImportError:
 def _debug_enabled() -> bool:
     return os.getenv("HY_OMNIWEAVING_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
 
 def _debug_log(message: str, *args):
     if _debug_enabled():
@@ -2478,8 +2481,9 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
     def execute(cls, positive, negative, vae, task, width, height, length, batch_size, reference_images=None, condition_video=None, clip_vision_output=None) -> io.NodeOutput:
         latent_length = cls._latent_length(length)
         latent = torch.zeros([batch_size, 32, latent_length, height // 16, width // 16], device=comfy.model_management.intermediate_device())
+        disable_clip_fea = _env_flag("HY_OMNIWEAVING_DISABLE_CLIP_FEA")
         _debug_log(
-            "conditioning task=%s width=%s height=%s length=%s batch=%s reference_images=%s condition_video=%s clip_vision=%s",
+            "conditioning task=%s width=%s height=%s length=%s batch=%s reference_images=%s condition_video=%s clip_vision=%s disable_clip_fea=%s",
             task,
             width,
             height,
@@ -2488,6 +2492,7 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
             _shape_of(reference_images),
             _shape_of(condition_video),
             _clip_vision_shapes(clip_vision_output),
+            disable_clip_fea,
         )
 
         cond_latent = torch.zeros_like(latent[:1])
@@ -2557,9 +2562,19 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
             cond_values["guiding_frame_index"] = guiding_frame_index
         positive = node_helpers.conditioning_set_values(positive, cond_values)
         negative = node_helpers.conditioning_set_values(negative, cond_values)
-        if clip_vision_output is not None and task != "t2v":
+        if clip_vision_output is not None and task != "t2v" and not disable_clip_fea:
             positive = node_helpers.conditioning_set_values(positive, {"clip_vision_output": clip_vision_output})
             negative = node_helpers.conditioning_set_values(negative, {"clip_vision_output": clip_vision_output})
+            _debug_log(
+                "conditioning forwarded clip_vision_output task=%s clip_vision_shape=%s",
+                task,
+                _clip_vision_shapes(clip_vision_output),
+            )
+        elif clip_vision_output is not None and disable_clip_fea:
+            logging.warning(
+                "HYOmniWeavingConditioning disabled clip_vision_output for task '%s' because HY_OMNIWEAVING_DISABLE_CLIP_FEA is enabled.",
+                task,
+            )
         elif clip_vision_output is not None:
             logging.warning(
                 "HYOmniWeavingConditioning ignored clip_vision_output for task 't2v' to keep text-only generation isolated."

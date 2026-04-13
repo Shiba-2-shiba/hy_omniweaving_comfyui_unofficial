@@ -1,6 +1,6 @@
 # Text Encode Refactor Tasks
 
-Last updated: 2026-04-15
+Last updated: 2026-04-16
 
 ## Scope
 
@@ -98,16 +98,16 @@ Definition of done:
 
 ### Stage 5. Reduce dense reconstructed-mask transport
 
-- [ ] Detect when the main-path reconstructed mask is effectively dense /
+- [x] Detect when the main-path reconstructed mask is effectively dense /
   full-coverage.
-- [ ] Skip or remove dense no-op masks where they do not carry real token
+- [x] Skip or remove dense no-op masks where they do not carry real token
   selectivity.
-- [ ] Add runtime diagnostics for:
-  - [ ] mask nonzero count
-  - [ ] mask all-ones / full-coverage summary
-  - [ ] whether a dense mask was dropped on the main path
-- [ ] Add regression coverage for dense-mask omission on safe cases.
-- [ ] Verify on real `i2v` runtime logs that sampling remains stable.
+- [x] Add runtime diagnostics for:
+  - [x] mask nonzero count
+  - [x] mask all-ones / full-coverage summary
+  - [x] whether a dense mask was dropped on the main path
+- [x] Add regression coverage for dense-mask omission on safe cases.
+- [x] Verify on real `i2v` runtime logs that sampling remains stable.
 
 Definition of done:
 
@@ -116,15 +116,17 @@ Definition of done:
 
 ### Stage 6. Fix clip-vision mask ordering
 
-- [ ] Remove `clip_vision` mask pre-expansion before `txt_in` on the main
-  `i2v` path.
-- [ ] Keep `txt_mask` at text-token length before `txt_in`.
+- [ ] Confirm whether any selective-mask cases still reach `txt_in` with
+  pre-expanded clip-vision length.
+- [ ] Remove `clip_vision` mask pre-expansion before `txt_in` on those cases.
+- [ ] Keep `txt_mask` at text-token length before `txt_in` for those cases.
 - [ ] If needed, move clip-vision-aware mask growth to the stage after
   `clip_fea` is concatenated.
 - [ ] Add regression coverage for:
-  - [ ] `forward_orig txt_mask_len == expected_txt_in_len`
-  - [ ] `appears_preexpanded_for_clip=False`
-  - [ ] no sampler regression on the validated `i2v` path
+  - [ ] `forward_orig txt_mask_len == expected_txt_in_len` on selective-mask
+        cases
+  - [ ] `appears_preexpanded_for_clip=False` on selective-mask cases
+  - [ ] no sampler regression on the validated selective-mask paths
 - [ ] Verify the fix on real runtime logs, not just unit tests.
 
 Definition of done:
@@ -134,12 +136,14 @@ Definition of done:
 ### Stage 7. Resolve remaining `attention_mask` / `setclip` gaps
 
 - [ ] Reduce or eliminate `attention_mask_reason=reconstructed_from_qwen_branch`
-  on the main `i2v` path.
+  on sparse/selective paths.
 - [ ] Add diagnostics that compare integrated-mask output against reconstructed
   mask output.
-- [ ] Move `setclip` ownership further toward prepared semantics.
-- [ ] Reduce dependence on heuristic `setclip_start=3` token inspection.
-- [ ] Add regression coverage for source-like setclip behavior.
+- [ ] Move `setclip` ownership further toward prepared semantics on
+  multi-image/selective paths.
+- [ ] Reduce dependence on heuristic `setclip_start=3` token inspection where
+  runtime logs show ambiguity.
+- [ ] Add regression coverage for source-like setclip behavior on those paths.
 
 Definition of done:
 
@@ -211,9 +215,10 @@ The refactor is ready for completion review when:
 - `i2v` and `t2v` both run through prepared-input ownership
 - crop/setclip ownership is spec-driven rather than mostly heuristic
 - main-path dense no-op mask transport is reduced
-- `txt_in` receives text-length masks again on the main `i2v` path
+- selective-mask paths no longer send post-concat-length text masks into
+  `txt_in`
 - `attention_mask` and `setclip` behavior are not primarily patch-reconstructed
-  heuristics on the main `i2v` path
+  heuristics on the important selective paths
 - current stable workflows still execute
 - regression tests cover the replaced internal behavior
 - remaining approximation is narrow, documented, and intentional

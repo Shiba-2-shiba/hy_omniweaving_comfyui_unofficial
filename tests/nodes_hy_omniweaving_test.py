@@ -1577,6 +1577,35 @@ def test_hy_omniweaving_conditioning_i2v_keeps_clip_vision_output():
     assert negative[1]["clip_vision_output"] is clip_vision_output
 
 
+def test_hy_omniweaving_conditioning_i2v_can_disable_clip_vision_output_via_env(monkeypatch):
+    class _VAE:
+        def encode(self, image):
+            return torch.full((1, 32, 1, 2, 2), 1.0, dtype=image.dtype)
+
+        def decode(self, latent):
+            return torch.full((1, 8, 8, 3), 0.5, dtype=latent.dtype)
+
+    clip_vision_output = types.SimpleNamespace(mm_projected=torch.zeros((1, 16, 4096)))
+    monkeypatch.setenv("HY_OMNIWEAVING_DISABLE_CLIP_FEA", "1")
+
+    positive, negative, _ = nodes.HunyuanVideo15OmniConditioning.execute(
+        positive="pos",
+        negative="neg",
+        vae=_VAE(),
+        task="i2v",
+        width=32,
+        height=32,
+        length=5,
+        batch_size=1,
+        reference_images=torch.zeros((1, 8, 8, 3)),
+        condition_video=None,
+        clip_vision_output=clip_vision_output,
+    )
+
+    assert "clip_vision_output" not in positive[1]
+    assert "clip_vision_output" not in negative[1]
+
+
 def test_ensure_runtime_patches_is_idempotent(monkeypatch):
     calls = []
 

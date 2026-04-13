@@ -1,6 +1,6 @@
 # Text Encode Refactor Spec
 
-Last updated: 2026-04-15
+Last updated: 2026-04-16
 
 ## Goal
 
@@ -184,7 +184,7 @@ clip-vision mask growth first. The next safest target is:
 The design target is to stop transporting redundant full-coverage masks through
 the runtime when they are not providing real token-level selection.
 
-### 6. Restore source-like clip-vision mask ordering
+### 6. Restore source-like clip-vision mask ordering when selective masks still require it
 
 The current runtime evidence now shows that `clip_vision`-related text-mask
 growth is happening before `txt_in`, even though the source ordering is:
@@ -194,31 +194,49 @@ growth is happening before `txt_in`, even though the source ordering is:
 3. append `clip_fea` vision states
 4. build the larger `attn_mask`
 
-Current runtime logs show:
+Earlier runtime logs showed:
 
 - `forward_orig txt_mask_len == expected_post_concat_txt_len`
 - `forward_orig appears_preexpanded_for_clip=True`
 
-This means the custom node is currently carrying a post-concat-length mask too
-early. The next design target is:
+After dense-mask reduction on the main single-image `i2v` path, current logs now
+show:
+
+- `text encode final attention_mask dropped ... dropped_as_dense=True`
+- `forward_orig txt_mask=None`
+- `appears_preexpanded_for_clip=False`
+
+So clip-vision mask ordering is no longer the first fix for the dense main-path
+case. It remains the next structural target only for cases where a selective
+mask still survives after dense-mask reduction.
+
+The design target remains:
 
 - keep `txt_mask` at text-token length before `txt_in`
 - if clip-vision-aware mask growth is still needed, move it to the stage where
   `clip_fea` is actually concatenated
 
-This is now the highest-priority structural parity target for `i2v`.
+This is now a **selective-case** parity target rather than the first main-path
+fix.
 
 ### 7. Resolve remaining main-path gaps
 
-After clip-vision mask ordering is corrected, the next open parity gaps remain:
+After dense-mask reduction, the next open parity gaps remain:
 
 - integrated `attention_mask` still missing on the main path, forcing
   `reconstructed_from_qwen_branch`
 - `setclip_start=3` is still chosen heuristically from token inspection
 
-Those should be treated as the next two source-parity targets after clip-vision
-mask ordering is corrected, because current diagnostics show they are still part
-of the main `i2v` path.
+Current runtime evidence shows that on the main single-image `i2v` path the
+reconstructed mask is dense and is now dropped safely. That means the next
+investigation target is narrower:
+
+- characterize which cases still produce sparse/selective masks
+- reduce `reconstructed_from_qwen_branch` reliance there first
+- re-evaluate clip-vision ordering only if selective masks still arrive
+  pre-expanded
+- keep `setclip` heuristic work focused on tasks that are not already stable on
+  the main single-image path
 
 ## Proposed Implementation Shape
 
@@ -300,14 +318,23 @@ sampling changes.
 
 ### Phase 5 acceptance
 
-- `forward_orig txt_mask_len == expected_txt_in_len` on the main `i2v` path
-- `appears_preexpanded_for_clip=False` on the main `i2v` path
-- no sampler regression after moving clip-vision mask growth later
+- dense full-coverage reconstructed masks are dropped on the main single-image
+  `i2v` path
+- `forward_orig txt_mask=None` or no-op equivalent on that path
+- `appears_preexpanded_for_clip=False` on that path
+- no sampler regression after dropping dense no-op masks
 
 ### Phase 6 acceptance
 
-- the main `i2v` path no longer needs `attention_mask_reason=reconstructed_from_qwen_branch`
-  or is demonstrably reduced to a narrower fallback-only case
+- the remaining `reconstructed_from_qwen_branch` cases are characterized as
+  dense vs sparse/selective
+- main-path `i2v` reliance on reconstruction is demonstrably reduced to a
+  narrower subset
+
+### Phase 7 acceptance
+
+- selective-mask cases no longer carry post-concat-length text masks into
+  `txt_in`
 - `setclip` behavior is driven by prepared semantics first and token heuristics
   second
 
@@ -326,6 +353,7 @@ sampling changes.
   - `expected_txt_in_len` vs `expected_post_concat_txt_len`
   - `txt_in` mask prefix and suffix statistics
   - whether the reconstructed mask is dense / full-coverage
+  - whether a dense reconstructed mask was dropped
 
 ## Risks
 
@@ -344,6 +372,6 @@ The refactor should not chase better quality through more custom template
 tuning. It should centralize source-like multimodal task preparation into a
 local spec layer, keep the current single `safetensors` model path, move
 crop/setclip ownership closer to that prepared-input spec, reduce dense
-reconstructed-mask transport on the main path, then fix clip-vision mask
-ordering so `txt_in` sees text-length masks again before solving the remaining
-integrated-mask and setclip heuristic gaps.
+reconstructed-mask transport on the main path, then focus the next parity work
+on sparse/selective-mask cases and only then fix any remaining clip-vision mask
+ordering and setclip heuristic gaps.

@@ -1,6 +1,6 @@
 # Text Encode Refactor Progress
 
-Last updated: 2026-04-15
+Last updated: 2026-04-16
 
 ## Objective
 
@@ -10,7 +10,7 @@ finetuned `safetensors` model path.
 
 ## Current Status
 
-Status: replanning after runtime mask-density and mask-order diagnosis
+Status: main i2v dense-mask path stabilized; selective-case investigation pending
 
 Current focus:
 
@@ -35,9 +35,9 @@ Current focus:
 | 2 | Non-video task migration | Completed | `t2v` / `i2v` / `reference2v` / `interpolation` now tokenize through prepared-input ownership on the main path |
 | 3 | Crop/setclip ownership | Completed | runtime patch now accepts prepared metadata and prefers it for crop/setclip ownership |
 | 4 | Late mask cleanup | Completed | final correction is now narrower and task-aware |
-| 5 | Dense mask reduction | Pending | reconstructed mask appears full-coverage and may be redundant on the main path |
-| 6 | Clip-vision mask ordering | Pending | `txt_in` still receives post-concat-length mask on the main `i2v` path |
-| 7 | Remaining attention-mask / setclip gaps | Pending | integrated mask still missing and setclip is still heuristic-heavy |
+| 5 | Dense mask reduction | Completed | dense full-coverage reconstructed masks are now dropped on the main single-image `i2v` path |
+| 6 | Clip-vision mask ordering | Pending | now narrowed to selective-mask cases after dense-mask drop |
+| 7 | Remaining attention-mask / setclip gaps | Pending | integrated mask still missing and setclip is still heuristic-heavy on selective paths |
 | 8 | Video-frame support | Pending | required for source-like `editing` / `tiv2v` |
 
 ## Completed
@@ -69,13 +69,19 @@ Current focus:
 - [x] Added `txt_in` prefix/suffix mask diagnostics to quantify the overhang
 - [x] Added `setclip` token-position and token-alignment diagnostics for the
   main `i2v` path
+- [x] Added dense-vs-sparse mask comparison diagnostics
+- [x] Dropped dense full-coverage masks on the main single-image `i2v` path
+- [x] Verified from real runtime logs that `forward_orig txt_mask=None` on that
+  path after dense-mask dropping
 
 ## Next Actions
 
-1. Reduce or omit dense no-op reconstructed masks on the main `i2v` path.
-2. Then remove clip-vision mask pre-expansion before `txt_in`.
-3. Then reduce `reconstructed_from_qwen_branch` reliance on the main path.
-4. Then reduce heuristic `setclip_start=3` reliance.
+1. Find a selective-mask runtime case (`reference2v`, `interpolation`, or
+   ByT5-active text) and inspect whether reconstruction is still meaningful.
+2. Then fix clip-vision mask ordering on those selective cases if needed.
+3. Then reduce `reconstructed_from_qwen_branch` reliance on those paths.
+4. Then reduce heuristic `setclip_start=3` reliance where the new logs show
+   ambiguity.
 
 ## Blockers
 
@@ -188,6 +194,17 @@ Expected implementation blockers:
 - That shifts the next safest target from immediate clip-vision ordering
   changes to reducing dense no-op mask transport first, then fixing mask
   ordering.
+- Added dense-vs-sparse mask summaries for original, qwen-derived, and final
+  mask states.
+- Latest real runtime logs now show on the main single-image `i2v` path:
+  - `orig_mask` is missing
+  - `qwen_mask` is dense all-ones
+  - `final_mask` is dense all-ones before finalize
+  - the dense mask is dropped safely
+  - `forward_orig txt_mask=None`
+- That means the dense main-path problem is now largely stabilized, and the
+  next meaningful investigation target is selective-mask cases rather than the
+  already-dense main path.
 
 ## Update Rule
 
