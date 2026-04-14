@@ -37,11 +37,70 @@ def _shape_of(value):
         return tuple(value.shape)
     return None
 
+def _mask_summary(value):
+    if not torch.is_tensor(value):
+        return {
+            "shape": None,
+            "dtype": getattr(value, "dtype", None),
+            "nonzero": None,
+            "all_ones": None,
+            "min": None,
+            "max": None,
+        }
+    value_float = value.float()
+    return {
+        "shape": tuple(value.shape),
+        "dtype": value.dtype,
+        "nonzero": int(torch.count_nonzero(value).item()),
+        "all_ones": bool(torch.all(value == 1).item()),
+        "min": float(value_float.min().item()),
+        "max": float(value_float.max().item()),
+    }
+
 
 def _norm_of(value):
     if torch.is_tensor(value):
         return float(value.float().norm().item())
     return None
+
+
+def _rounded_temporal_list(value, digits: int = 4):
+    if value is None:
+        return None
+    return [round(float(item), digits) for item in value]
+
+
+def _active_temporal_indices(values, threshold: float = 0.5, invert: bool = False):
+    if values is None:
+        return None
+    out = []
+    for index, item in enumerate(values):
+        active = float(item) > threshold
+        if invert:
+            active = not active
+        if active:
+            out.append(index)
+    return out
+
+
+def _temporal_mask_vector(mask):
+    if not torch.is_tensor(mask) or mask.ndim < 5:
+        return None
+    return mask[0, 0, :, 0, 0].detach().float().cpu().tolist()
+
+
+def _temporal_latent_energy(latent):
+    if not torch.is_tensor(latent) or latent.ndim < 5:
+        return None
+    return latent[0].detach().float().abs().sum(dim=(0, 2, 3)).cpu().tolist()
+
+
+def _split_concat_tensor(c_concat):
+    if not torch.is_tensor(c_concat) or c_concat.ndim < 5 or c_concat.shape[1] < 1:
+        return None, None
+    if c_concat.shape[1] == 1:
+        return None, c_concat
+    return c_concat[:, :-1], c_concat[:, -1:]
 
 
 def _callable_debug_name(value):
@@ -125,15 +184,83 @@ def _ensure_hy_omniweaving_extra_conds_support(model):
         return False
 
     original_extra_conds = model.extra_conds
+    original_concat_cond = getattr(model, "concat_cond", None)
+    original_apply_model = getattr(model, "_apply_model", None)
 
     def patched_extra_conds(self, **kwargs):
+        concat_latent_image = kwargs.get("concat_latent_image", None)
+        concat_mask = kwargs.get("concat_mask", kwargs.get("denoise_mask", None))
+        guiding_frame_index = kwargs.get("guiding_frame_index", None)
+        concat_mask_vector = _temporal_mask_vector(concat_mask)
+        expected_model_mask_vector = None
+        if concat_mask_vector is not None:
+            expected_model_mask_vector = [1.0 - item for item in concat_mask_vector]
         out = original_extra_conds(**kwargs)
         all_stack_text_states = kwargs.get("all_stack_text_states", None)
         if all_stack_text_states is not None:
             out["all_stack_text_states"] = _CONDDeepstackTextStates(all_stack_text_states)
+        c_concat = out.get("c_concat", None)
+        c_concat_value = getattr(c_concat, "cond", None)
+        if any(value is not None for value in (concat_latent_image, concat_mask, guiding_frame_index, all_stack_text_states)):
+            _debug_log(
+                "extra_conds payload concat_latent_shape=%s concat_latent_active_frames=%s concat_mask_shape=%s concat_mask=%s concat_mask_zero_frames=%s expected_model_mask=%s expected_model_mask_active=%s guiding_frame_index=%s all_stack_text_states_shape=%s out_keys=%s c_concat_shape=%s",
+                _shape_of(concat_latent_image),
+                _active_temporal_indices(_temporal_latent_energy(concat_latent_image), threshold=1e-6),
+                _shape_of(concat_mask),
+                _rounded_temporal_list(concat_mask_vector),
+                _active_temporal_indices(concat_mask_vector, invert=True),
+                _rounded_temporal_list(expected_model_mask_vector),
+                _active_temporal_indices(expected_model_mask_vector),
+                guiding_frame_index,
+                _shape_of(all_stack_text_states),
+                sorted(out.keys()),
+                _shape_of(c_concat_value),
+            )
         return out
 
+    def patched_concat_cond(self, **kwargs):
+        c_concat = original_concat_cond(**kwargs)
+        image_part, mask_part = _split_concat_tensor(c_concat)
+        if torch.is_tensor(c_concat):
+            _debug_log(
+                "concat_cond output c_concat_shape=%s c_concat_norm=%s image_part_shape=%s image_frame_energy=%s image_active_frames=%s mask_part_shape=%s mask=%s mask_active_frames=%s",
+                _shape_of(c_concat),
+                _norm_of(c_concat),
+                _shape_of(image_part),
+                _rounded_temporal_list(_temporal_latent_energy(image_part)),
+                _active_temporal_indices(_temporal_latent_energy(image_part), threshold=1e-6),
+                _shape_of(mask_part),
+                _rounded_temporal_list(_temporal_mask_vector(mask_part)),
+                _active_temporal_indices(_temporal_mask_vector(mask_part)),
+            )
+        return c_concat
+
+    def patched_apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None, transformer_options={}, **kwargs):
+        image_part, mask_part = _split_concat_tensor(c_concat)
+        diffusion_model = getattr(self, "diffusion_model", None)
+        if diffusion_model is not None:
+            diffusion_model._hy_last_apply_model_c_concat_channels = int(c_concat.shape[1]) if torch.is_tensor(c_concat) and c_concat.ndim >= 2 else 0
+        if torch.is_tensor(c_concat):
+            _debug_log(
+                "apply_model inputs noise_shape=%s noise_norm=%s c_concat_shape=%s c_concat_norm=%s c_concat_image_shape=%s c_concat_image_frame_energy=%s c_concat_image_active_frames=%s c_concat_mask_shape=%s c_concat_mask=%s c_concat_mask_active_frames=%s",
+                _shape_of(x),
+                _norm_of(x),
+                _shape_of(c_concat),
+                _norm_of(c_concat),
+                _shape_of(image_part),
+                _rounded_temporal_list(_temporal_latent_energy(image_part)),
+                _active_temporal_indices(_temporal_latent_energy(image_part), threshold=1e-6),
+                _shape_of(mask_part),
+                _rounded_temporal_list(_temporal_mask_vector(mask_part)),
+                _active_temporal_indices(_temporal_mask_vector(mask_part)),
+            )
+        return original_apply_model(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
+
     model.extra_conds = types.MethodType(patched_extra_conds, model)
+    if original_concat_cond is not None:
+        model.concat_cond = types.MethodType(patched_concat_cond, model)
+    if original_apply_model is not None:
+        model._apply_model = types.MethodType(patched_apply_model, model)
     model._hy_omniweaving_extra_conds_patched = True
     logging.info("HY-OmniWeaving attached instance-local extra_conds support.")
     return True
@@ -147,6 +274,51 @@ def _ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model):
         return False
 
     original_forward = txt_in.forward
+
+    def _mask_prefix_debug_stats(mask, target_length: int):
+        if not torch.is_tensor(mask) or mask.ndim < 2:
+            return {
+                "extra_tokens": 0,
+                "prefix_shape": None,
+                "prefix_non_one_count": None,
+                "prefix_min": None,
+                "prefix_max": None,
+                "suffix_shape": None,
+                "suffix_nonzero_count": None,
+                "suffix_min": None,
+                "suffix_max": None,
+            }
+        extra_tokens = max(0, int(mask.shape[-1] - target_length))
+        if extra_tokens <= 0:
+            suffix = mask
+            suffix_float = suffix.float()
+            return {
+                "extra_tokens": 0,
+                "prefix_shape": None,
+                "prefix_non_one_count": 0,
+                "prefix_min": None,
+                "prefix_max": None,
+                "suffix_shape": _shape_of(suffix),
+                "suffix_nonzero_count": int(torch.count_nonzero(suffix).item()),
+                "suffix_min": float(suffix_float.min().item()),
+                "suffix_max": float(suffix_float.max().item()),
+            }
+        prefix = mask[..., :extra_tokens]
+        suffix = mask[..., -target_length:]
+        prefix_float = prefix.float()
+        suffix_float = suffix.float()
+        prefix_non_one_count = int(torch.count_nonzero(prefix != 1).item())
+        return {
+            "extra_tokens": extra_tokens,
+            "prefix_shape": _shape_of(prefix),
+            "prefix_non_one_count": prefix_non_one_count,
+            "prefix_min": float(prefix_float.min().item()),
+            "prefix_max": float(prefix_float.max().item()),
+            "suffix_shape": _shape_of(suffix),
+            "suffix_nonzero_count": int(torch.count_nonzero(suffix).item()),
+            "suffix_min": float(suffix_float.min().item()),
+            "suffix_max": float(suffix_float.max().item()),
+        }
 
     def patched_forward(self, x, *args, **kwargs):
         mask = None
@@ -163,12 +335,24 @@ def _ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model):
             and x.ndim >= 2
             and mask.shape[-1] > x.shape[1]
         ):
+            prefix_stats = _mask_prefix_debug_stats(mask, x.shape[1])
             effective_mask = mask[..., -x.shape[1]:]
             _debug_log(
-                "txt_in mask alignment x_shape=%s original_mask_shape=%s effective_mask_shape=%s",
+                "txt_in mask alignment x_shape=%s original_mask_shape=%s effective_mask_shape=%s extra_tokens=%s "
+                "prefix_shape=%s prefix_non_one_count=%s prefix_min=%s prefix_max=%s "
+                "suffix_shape=%s suffix_nonzero_count=%s suffix_min=%s suffix_max=%s",
                 _shape_of(x),
                 _shape_of(mask),
                 _shape_of(effective_mask),
+                prefix_stats["extra_tokens"],
+                prefix_stats["prefix_shape"],
+                prefix_stats["prefix_non_one_count"],
+                prefix_stats["prefix_min"],
+                prefix_stats["prefix_max"],
+                prefix_stats["suffix_shape"],
+                prefix_stats["suffix_nonzero_count"],
+                prefix_stats["suffix_min"],
+                prefix_stats["suffix_max"],
             )
 
         if len(args) >= 2:
@@ -184,6 +368,97 @@ def _ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model):
     txt_in.forward = types.MethodType(patched_forward, txt_in)
     txt_in._hy_omniweaving_mask_alignment_patched = True
     logging.info("HY-OmniWeaving attached instance-local txt_in mask alignment support.")
+    return True
+
+
+def _ensure_hy_omniweaving_forward_orig_txt_mask_debug_support(diffusion_model):
+    forward_orig = getattr(diffusion_model, "forward_orig", None)
+    if forward_orig is None:
+        return False
+    if getattr(diffusion_model, "_hy_omniweaving_forward_orig_txt_mask_debug_patched", False):
+        return False
+
+    def patched_forward_orig(self, *args, **kwargs):
+        img = args[0] if len(args) >= 1 else kwargs.get("img")
+        context = args[2] if len(args) >= 3 else kwargs.get("context")
+        txt_mask = None
+        if len(args) >= 5:
+            txt_mask = args[4]
+        elif "txt_mask" in kwargs:
+            txt_mask = kwargs.get("txt_mask")
+        txt_byt5 = args[7] if len(args) >= 8 else kwargs.get("txt_byt5")
+        clip_fea = args[8] if len(args) >= 9 else kwargs.get("clip_fea")
+
+        txt_mask_shape = _shape_of(txt_mask)
+        txt_mask_dtype = getattr(txt_mask, "dtype", None)
+        txt_mask_is_floating = bool(torch.is_floating_point(txt_mask)) if torch.is_tensor(txt_mask) else None
+        txt_mask_nonzero = int(torch.count_nonzero(txt_mask).item()) if torch.is_tensor(txt_mask) else None
+        txt_mask_min = float(txt_mask.float().min().item()) if torch.is_tensor(txt_mask) else None
+        txt_mask_max = float(txt_mask.float().max().item()) if torch.is_tensor(txt_mask) else None
+        context_shape = _shape_of(context)
+        clip_fea_shape = _shape_of(clip_fea)
+        txt_byt5_shape = _shape_of(txt_byt5)
+        context_len = int(context.shape[1]) if torch.is_tensor(context) and context.ndim >= 2 else None
+        clip_fea_len = int(clip_fea.shape[1]) if torch.is_tensor(clip_fea) and clip_fea.ndim >= 2 else 0
+        txt_byt5_len = int(txt_byt5.shape[1]) if torch.is_tensor(txt_byt5) and txt_byt5.ndim >= 2 else 0
+        expected_pre_clip_txt_in_len = context_len
+        expected_post_concat_txt_len = None if context_len is None else context_len + clip_fea_len + txt_byt5_len
+        txt_mask_len = int(txt_mask.shape[-1]) if torch.is_tensor(txt_mask) and txt_mask.ndim >= 2 else None
+        c_concat_channels = int(getattr(self, "_hy_last_apply_model_c_concat_channels", 0))
+        noise_part = img
+        c_concat_part = None
+        if torch.is_tensor(img) and img.ndim >= 2 and c_concat_channels > 0 and img.shape[1] >= c_concat_channels:
+            noise_part = img[:, :-c_concat_channels]
+            c_concat_part = img[:, -c_concat_channels:]
+        appears_preexpanded_for_clip = (
+            txt_mask_len is not None
+            and expected_pre_clip_txt_in_len is not None
+            and expected_post_concat_txt_len is not None
+            and txt_mask_len == expected_post_concat_txt_len
+            and clip_fea_len > 0
+        )
+        if (
+            _debug_enabled()
+            and torch.is_tensor(img)
+            and not getattr(self, "_hy_omniweaving_forward_orig_img_in_preview_logged", False)
+        ):
+            img_in_preview = self.img_in(img)
+            self._hy_omniweaving_forward_orig_img_in_preview_logged = True
+            _debug_log(
+                "forward_orig img_in preview img_shape=%s img_norm=%s noise_shape=%s noise_norm=%s c_concat_shape=%s c_concat_norm=%s post_img_in_shape=%s post_img_in_norm=%s",
+                _shape_of(img),
+                _norm_of(img),
+                _shape_of(noise_part),
+                _norm_of(noise_part),
+                _shape_of(c_concat_part),
+                _norm_of(c_concat_part),
+                _shape_of(img_in_preview),
+                _norm_of(img_in_preview),
+            )
+        _debug_log(
+            "forward_orig txt_mask shape=%s dtype=%s is_floating=%s will_apply_non_floating_conversion=%s nonzero=%s min=%s max=%s "
+            "context_shape=%s txt_byt5_shape=%s clip_fea_shape=%s expected_txt_in_len=%s expected_post_concat_txt_len=%s "
+            "txt_mask_len=%s appears_preexpanded_for_clip=%s",
+            txt_mask_shape,
+            txt_mask_dtype,
+            txt_mask_is_floating,
+            bool(torch.is_tensor(txt_mask) and not torch.is_floating_point(txt_mask)),
+            txt_mask_nonzero,
+            txt_mask_min,
+            txt_mask_max,
+            context_shape,
+            txt_byt5_shape,
+            clip_fea_shape,
+            expected_pre_clip_txt_in_len,
+            expected_post_concat_txt_len,
+            txt_mask_len,
+            appears_preexpanded_for_clip,
+        )
+        return forward_orig(*args, **kwargs)
+
+    diffusion_model.forward_orig = types.MethodType(patched_forward_orig, diffusion_model)
+    diffusion_model._hy_omniweaving_forward_orig_txt_mask_debug_patched = True
+    logging.info("HY-OmniWeaving attached instance-local forward_orig txt_mask debug support.")
     return True
 
 
@@ -204,6 +479,7 @@ def ensure_hy_omniweaving_deepstack_support(model_patcher, sd: dict | None = Non
     if diffusion_model is None:
         return False
     _ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model)
+    _ensure_hy_omniweaving_forward_orig_txt_mask_debug_support(diffusion_model)
     if getattr(diffusion_model, "mm_in", None) is not None:
         return True
 
@@ -372,7 +648,11 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
             return 1
         return 1
 
-    def _resolve_crop_start(tok_pairs, explicit_crop_start, template_end):
+    def _resolve_crop_start(tok_pairs, explicit_crop_start, template_end, prepared_meta=None):
+        if isinstance(prepared_meta, dict):
+            prepared_crop_start = prepared_meta.get("crop_start", None)
+            if prepared_crop_start is not None and int(prepared_crop_start) >= 0:
+                return max(0, int(prepared_crop_start)), "prepared_meta"
         crop_start = explicit_crop_start
         source = "explicit"
         if crop_start is None or int(crop_start) < 0:
@@ -397,25 +677,40 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
             return "missing"
         return type(value).__name__
 
-    def _find_setclip_start(tok_pairs, crop_start):
+    def _collect_setclip_token_positions(tok_pairs, crop_start):
         expanded_index = 0
-        last_vision_end = None
-        last_image_end = None
+        token_positions = []
+        image_metadata_positions = []
         for tok_pair in tok_pairs:
             elem = tok_pair[0]
             elem_size = _expanded_tok_pair_size(tok_pair)
             start = expanded_index
             end = start + elem_size
             if isinstance(elem, numbers.Integral) and int(elem) == 151653 and end > crop_start:
-                last_vision_end = end
+                token_positions.append(end)
             elif isinstance(elem, dict) and elem.get("original_type") == "image" and end > crop_start:
-                last_image_end = end
+                image_metadata_positions.append(end)
             expanded_index = end
+        return token_positions, image_metadata_positions
+
+    def _find_setclip_start(tok_pairs, crop_start, prepared_meta=None):
+        if isinstance(prepared_meta, dict) and bool(prepared_meta.get("used_fallback_text_only", False)):
+            return 0, "prepared_text_only"
+        token_positions, image_metadata_positions = _collect_setclip_token_positions(tok_pairs, crop_start)
+        last_vision_end = token_positions[-1] if len(token_positions) > 0 else None
+        last_image_end = image_metadata_positions[-1] if len(image_metadata_positions) > 0 else None
+        prepared_roles = prepared_meta.get("ordered_roles", None) if isinstance(prepared_meta, dict) else None
 
         if last_vision_end is not None:
-            return max(0, last_vision_end - crop_start), "vision_end_token"
+            source = "vision_end_token"
+            if prepared_roles:
+                source = f"prepared_roles+{source}"
+            return max(0, last_vision_end - crop_start), source
         if last_image_end is not None:
-            return max(0, last_image_end - crop_start), "image_metadata"
+            source = "image_metadata"
+            if prepared_roles:
+                source = f"prepared_roles+{source}"
+            return max(0, last_image_end - crop_start), source
         return 0, "none"
 
     def _encode_deepstack(self, token_weight_pairs_qwen, crop_start, template_end):
@@ -437,7 +732,9 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
             return None
 
         tok_pairs = token_weight_pairs_qwen[0]
-        effective_crop_start, crop_source = _resolve_crop_start(tok_pairs, crop_start, template_end)
+        prepared_meta = getattr(self, "_hy_prepared_input_meta", None)
+        effective_crop_start, crop_source = _resolve_crop_start(tok_pairs, crop_start, template_end, prepared_meta=prepared_meta)
+        setclip_token_positions, image_metadata_positions = _collect_setclip_token_positions(tok_pairs, effective_crop_start)
         attention_mask = qwen_extra.get("attention_mask", None)
         qwen_out, attention_mask = _slice_seq_and_mask(qwen_out, attention_mask, effective_crop_start)
         self._hy_last_qwen_attention_mask_state = _describe_attention_mask_state(attention_mask)
@@ -445,7 +742,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         setclip_start = 0
         setclip_source = "disabled"
         if getattr(self, "setclip_output", False):
-            setclip_start, setclip_source = _find_setclip_start(tok_pairs, effective_crop_start)
+            setclip_start, setclip_source = _find_setclip_start(tok_pairs, effective_crop_start, prepared_meta=prepared_meta)
             if setclip_start > 0:
                 qwen_out, attention_mask = _slice_seq_and_mask(qwen_out, attention_mask, setclip_start)
                 self._hy_last_qwen_attention_mask_state = _describe_attention_mask_state(attention_mask)
@@ -455,6 +752,16 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
             self._hy_last_qwen_attention_mask = attention_mask.clone()
         else:
             self._hy_last_qwen_attention_mask = None
+        _debug_log(
+            "setclip token positions task=%s crop_start=%s ordered_roles=%s token_positions=%s image_metadata_positions=%s chosen=%s chosen_source=%s",
+            getattr(self, "_hy_task_name", None),
+            effective_crop_start,
+            prepared_meta.get("ordered_roles", None) if isinstance(prepared_meta, dict) else None,
+            setclip_token_positions,
+            image_metadata_positions,
+            setclip_start,
+            setclip_source,
+        )
         _debug_log(
             "deepstack encode task=%s qwen_class=%s qwen_encode=%s qwen_extra_keys=%s crop_start=%s crop_source=%s "
             "setclip=%s setclip_start=%s setclip_source=%s qwen_out_shape=%s attention_mask_shape=%s attention_mask_state=%s",
@@ -487,9 +794,12 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         cond, p, extra = orig_encode(token_weight_pairs)
         orig_extra_keys = sorted(extra.keys()) if isinstance(extra, dict) else []
         template_end = _find_template_end(tok_pairs, template_end)
-        effective_crop_start, crop_source = _resolve_crop_start(tok_pairs, getattr(self, "crop_start_output", None), template_end)
+        prepared_meta = getattr(self, "_hy_prepared_input_meta", None)
+        effective_crop_start, crop_source = _resolve_crop_start(tok_pairs, getattr(self, "crop_start_output", None), template_end, prepared_meta=prepared_meta)
+        setclip_token_positions, image_metadata_positions = _collect_setclip_token_positions(tok_pairs, effective_crop_start)
         attention_mask = extra.get("attention_mask", None)
         original_attention_mask = attention_mask
+        original_mask_summary = _mask_summary(original_attention_mask)
         attention_mask_reason = "orig_encode_missing"
         if torch.is_tensor(attention_mask):
             attention_mask_reason = "orig_encode_tensor"
@@ -499,7 +809,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         setclip_start = 0
         setclip_source = "disabled"
         if self.setclip_output:
-            setclip_start, setclip_source = _find_setclip_start(tok_pairs, effective_crop_start)
+            setclip_start, setclip_source = _find_setclip_start(tok_pairs, effective_crop_start, prepared_meta=prepared_meta)
             if setclip_start > 0:
                 cond, attention_mask = _slice_seq_and_mask(cond, attention_mask, setclip_start)
                 if torch.is_tensor(attention_mask):
@@ -518,6 +828,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
 
         deepstack_hidden_states = _encode_deepstack(self, token_weight_pairs["qwen25_7b"], getattr(self, "crop_start_output", None), template_end)
         qwen_attention_mask = getattr(self, "_hy_last_qwen_attention_mask", None)
+        qwen_mask_summary = _mask_summary(qwen_attention_mask)
         if (
             getattr(self, "setclip_output", False)
             and
@@ -541,11 +852,29 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
                 _callable_debug_name(orig_encode),
                 getattr(self, "_hy_last_qwen_encode_source", "unset"),
             )
+            _debug_log(
+                "attention_mask reconstructed summary task=%s orig_mask=%s qwen_mask=%s reconstructed_mask=%s",
+                getattr(self, "_hy_task_name", None),
+                original_mask_summary,
+                qwen_mask_summary,
+                _mask_summary(attention_mask),
+            )
         if deepstack_hidden_states is not None:
             extra["all_stack_text_states"] = deepstack_hidden_states
             if torch.is_tensor(cond) and cond.ndim >= 2 and deepstack_hidden_states.ndim >= 3:
                 cond_tokens = cond.shape[1]
                 deepstack_tokens = deepstack_hidden_states.shape[2]
+                mask_tokens = attention_mask.shape[1] if torch.is_tensor(attention_mask) and attention_mask.ndim >= 2 else None
+                _debug_log(
+                    "token alignment task=%s cond_tokens=%s deepstack_tokens=%s mask_tokens=%s crop_start=%s setclip_start=%s ordered_roles=%s",
+                    getattr(self, "_hy_task_name", None),
+                    cond_tokens,
+                    deepstack_tokens,
+                    mask_tokens,
+                    effective_crop_start,
+                    setclip_start,
+                    prepared_meta.get("ordered_roles", None) if isinstance(prepared_meta, dict) else None,
+                )
                 if cond_tokens != deepstack_tokens:
                     logging.warning(
                         "HY-OmniWeaving token-length mismatch after crop/setclip: task=%s cond_tokens=%s deepstack_tokens=%s crop_start=%s setclip_start=%s",
@@ -569,6 +898,14 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
                 getattr(self, "_hy_last_qwen_extra_keys", []),
                 qwen_attention_mask_state,
             )
+        _debug_log(
+            "attention_mask summary task=%s reason=%s orig_mask=%s qwen_mask=%s final_mask=%s",
+            getattr(self, "_hy_task_name", None),
+            attention_mask_reason,
+            original_mask_summary,
+            qwen_mask_summary,
+            _mask_summary(extra.get("attention_mask")),
+        )
 
         self.crop_start_source = crop_source
         self.setclip_start_source = setclip_source
@@ -594,6 +931,15 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
             sorted(extra.keys()),
             _shape_of(extra.get("all_stack_text_states")),
         )
+        _debug_log(
+            "patched_encode setclip detail task=%s ordered_roles=%s token_positions=%s image_metadata_positions=%s chosen=%s chosen_source=%s",
+            getattr(self, "_hy_task_name", None),
+            prepared_meta.get("ordered_roles", None) if isinstance(prepared_meta, dict) else None,
+            setclip_token_positions,
+            image_metadata_positions,
+            setclip_start,
+            setclip_source,
+        )
         return cond, p, extra
 
     def patched_set(self, options):
@@ -608,7 +954,17 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         self.crop_start_source = "explicit" if crop_start is not None else "unset"
         self._hy_task_name = options.get("task_name", getattr(self, "_hy_task_name", None))
         self._hy_visual_input_count = options.get("visual_input_count", getattr(self, "_hy_visual_input_count", None))
+        prepared_meta = options.get("prepared_meta", getattr(self, "_hy_prepared_input_meta", None))
+        self._hy_prepared_input_meta = dict(prepared_meta) if isinstance(prepared_meta, dict) else None
         self.setclip_start_source = "pending" if self.setclip_output else "disabled"
+        _debug_log(
+            "patched_set task=%s crop_start=%s visual_inputs=%s setclip=%s prepared_meta=%s",
+            self._hy_task_name,
+            self.crop_start_output,
+            self._hy_visual_input_count,
+            self.setclip_output,
+            self._hy_prepared_input_meta,
+        )
 
     def patched_reset(self):
         orig_reset()
@@ -618,6 +974,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
         self.crop_start_source = "unset"
         self._hy_task_name = None
         self._hy_visual_input_count = None
+        self._hy_prepared_input_meta = None
         self.setclip_start_source = "unset"
         self._hy_last_qwen_attention_mask_state = "unset"
         self._hy_last_qwen_extra_keys = []
@@ -630,6 +987,7 @@ def ensure_hy_omniweaving_text_encoder_support(clip):
     cond_stage_model.crop_start_source = "unset"
     cond_stage_model._hy_task_name = None
     cond_stage_model._hy_visual_input_count = None
+    cond_stage_model._hy_prepared_input_meta = None
     cond_stage_model.setclip_start_source = "unset"
     cond_stage_model._hy_last_qwen_attention_mask_state = "unset"
     cond_stage_model._hy_last_qwen_extra_keys = []

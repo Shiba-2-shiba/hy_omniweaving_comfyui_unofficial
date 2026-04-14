@@ -230,6 +230,15 @@ class _ClipStub:
         return pooled_dict
 
 
+def _assert_clip_options_include(clip, expected):
+    for kind, options in clip.clip_options:
+        if kind != "set" or not isinstance(options, dict):
+            continue
+        if all(options.get(key) == value for key, value in expected.items()):
+            return
+    raise AssertionError(f"Expected clip options subset not found: {expected!r} in {clip.clip_options!r}")
+
+
 def test_hy_omniweaving_text_encode_requires_byt5_branch():
     clip = _ClipStub(has_byt5=False)
 
@@ -302,6 +311,121 @@ def test_hy_omniweaving_task_specs_match_original_prompt_modes():
     assert nodes.TextEncodeHunyuanVideo15Omni._task_crop_start("interpolation") == 109
     assert nodes.TextEncodeHunyuanVideo15Omni._task_crop_start("editing") == 90
     assert nodes.TextEncodeHunyuanVideo15Omni._task_crop_start("tiv2v") == 104
+
+
+def test_hy_omniweaving_local_prepared_input_spec_uses_t2v_text_defaults():
+    spec = nodes.TextEncodeHunyuanVideo15Omni._prepare_input_local_spec(
+        task="t2v",
+        prompt="A lighthouse in a storm",
+        use_visual_inputs=True,
+        max_visual_inputs=8,
+    )
+
+    assert isinstance(spec, nodes.LocalPreparedInputSpec)
+    assert spec.task == "t2v"
+    assert spec.prompt_mode == 1
+    assert spec.crop_start == 108
+    assert spec.visual_input_count == 0
+    assert spec.ordered_roles == []
+    assert spec.token_budget_extra == 0
+    assert spec.used_fallback_text_only is False
+    assert "Describe the video by detailing the following aspects" in spec.template
+    assert "<|vision_start|>" not in spec.template
+
+
+def test_hy_omniweaving_local_prepared_input_spec_prefers_semantic_images_for_i2v():
+    reference_images = torch.zeros((1, 640, 640, 3))
+    semantic_images = torch.ones((1, 640, 320, 3))
+
+    spec = nodes.TextEncodeHunyuanVideo15Omni._prepare_input_local_spec(
+        task="i2v",
+        prompt="A dancer starts moving",
+        reference_images=reference_images,
+        semantic_images=semantic_images,
+        use_visual_inputs=True,
+        max_visual_inputs=8,
+    )
+
+    assert spec.prompt_mode == 2
+    assert spec.crop_start == 92
+    assert spec.visual_input_count == 1
+    assert spec.ordered_roles == ["image"]
+    assert spec.meta["visual_source"] == "semantic_images"
+    assert tuple(spec.ordered_visuals[0].shape) == (1, 560, 280, 3)
+    assert torch.all(spec.ordered_visuals[0] == 1)
+    assert spec.token_budget_extra == 400
+    assert spec.used_fallback_text_only is False
+    assert spec.template.count("<|vision_start|><|image_pad|><|vision_end|>") == 1
+
+
+def test_hy_omniweaving_local_prepared_input_spec_falls_back_to_text_only_for_i2v_without_visuals():
+    spec = nodes.TextEncodeHunyuanVideo15Omni._prepare_input_local_spec(
+        task="i2v",
+        prompt="A dancer starts moving",
+        reference_images=None,
+        semantic_images=None,
+        use_visual_inputs=True,
+        max_visual_inputs=8,
+    )
+
+    assert spec.task == "i2v"
+    assert spec.prompt_mode == 1
+    assert spec.crop_start == 108
+    assert spec.visual_input_count == 0
+    assert spec.ordered_roles == []
+    assert spec.meta["effective_task"] == "t2v"
+    assert spec.meta["visual_source"] == "none"
+    assert spec.used_fallback_text_only is True
+    assert "<|vision_start|>" not in spec.template
+
+
+def test_hy_omniweaving_local_prepared_input_spec_orders_tiv2v_reference_before_video_frames():
+    reference_images = torch.zeros((1, 512, 512, 3))
+    video_frames = torch.zeros((2, 320, 480, 3))
+
+    spec = nodes.TextEncodeHunyuanVideo15Omni._prepare_input_local_spec(
+        task="tiv2v",
+        prompt="Apply the reference style to the motion",
+        reference_images=reference_images,
+        video_frames=video_frames,
+        use_visual_inputs=True,
+        max_visual_inputs=8,
+    )
+
+    assert spec.prompt_mode == 6
+    assert spec.crop_start == 104
+    assert spec.visual_input_count == 3
+    assert spec.ordered_roles == ["image", "video_frame", "video_frame"]
+    assert spec.meta["effective_task"] == "tiv2v"
+    assert spec.meta["image_visual_count"] == 1
+    assert spec.meta["video_frame_count"] == 2
+    assert spec.token_budget_extra == 832
+    assert "This is the reference image:" in spec.template
+    assert "This is the input video:" in spec.template
+    assert spec.template.count("<|vision_start|><|image_pad|><|vision_end|>") == 3
+
+
+def test_hy_omniweaving_local_prepared_input_spec_falls_back_to_editing_for_tiv2v_with_only_video_frames():
+    video_frames = torch.zeros((3, 320, 480, 3))
+
+    spec = nodes.TextEncodeHunyuanVideo15Omni._prepare_input_local_spec(
+        task="tiv2v",
+        prompt="Apply the reference style to the motion",
+        reference_images=None,
+        video_frames=video_frames,
+        use_visual_inputs=True,
+        max_visual_inputs=8,
+    )
+
+    assert spec.prompt_mode == 5
+    assert spec.crop_start == 90
+    assert spec.visual_input_count == 3
+    assert spec.ordered_roles == ["video_frame", "video_frame", "video_frame"]
+    assert spec.meta["effective_task"] == "editing"
+    assert spec.meta["visual_source"] == "video_frames"
+    assert spec.used_fallback_text_only is False
+    assert "This is the reference image:" not in spec.template
+    assert "This is the input video:" not in spec.template
 
 
 def test_hy_omniweaving_i2v_prompt_matches_original_wording():
@@ -511,6 +635,99 @@ def test_hy_omniweaving_text_encode_prefers_semantic_images_over_reference_image
     assert tuple(clip.tokenize_calls[0][1]["images"][0].shape) == (1, 320, 320, 3)
 
 
+def test_hy_omniweaving_text_encode_falls_back_to_reference_images_for_i2v():
+    clip = _ClipStub(has_byt5=True)
+    reference_images = torch.zeros((1, 640, 640, 3))
+    clip_vision_output = types.SimpleNamespace(
+        last_hidden_state=torch.zeros((1, 729, 1152)),
+        penultimate_hidden_states=torch.zeros((1, 729, 1152)),
+        image_embeds=torch.zeros((1, 729, 1152)),
+        mm_projected=None,
+    )
+
+    nodes.TextEncodeHunyuanVideo15Omni.execute(
+        clip=clip,
+        prompt="A dancer starts moving",
+        task="i2v",
+        use_visual_inputs=True,
+        max_visual_inputs=8,
+        think=False,
+        think_max_new_tokens=128,
+        deepstack_layers="8,16,24",
+        setclip=True,
+        reference_images=reference_images,
+        semantic_images=None,
+        clip_vision_output=clip_vision_output,
+    )
+
+    assert "images" in clip.tokenize_calls[0][1]
+    assert len(clip.tokenize_calls[0][1]["images"]) == 1
+    assert tuple(clip.tokenize_calls[0][1]["images"][0].shape) == (1, 560, 560, 3)
+
+
+def test_hy_omniweaving_encode_prompt_components_uses_prepared_spec_for_t2v():
+    clip = _ClipStub(has_byt5=True)
+
+    encoded = nodes.TextEncodeHunyuanVideo15Omni._encode_prompt_components(
+        clip=clip,
+        prompt="A lighthouse in a storm",
+        task="t2v",
+        deepstack_layers="8,16,24",
+        setclip=True,
+        image_embeds=[],
+        visual_images=[],
+        visual_source="none",
+    )
+
+    assert isinstance(encoded["prepared_spec"], nodes.LocalPreparedInputSpec)
+    assert encoded["prepared_spec"].prompt_mode == 1
+    assert encoded["crop_start"] == 108
+    assert encoded["visual_input_count"] == 0
+    assert "Describe the video by detailing the following aspects" in clip.tokenize_calls[0][1]["llama_template"]
+
+
+def test_hy_omniweaving_encode_prompt_components_uses_prepared_spec_for_i2v_visual_path():
+    clip = _ClipStub(has_byt5=True)
+    visual_images = [torch.zeros((1, 640, 640, 3))]
+
+    encoded = nodes.TextEncodeHunyuanVideo15Omni._encode_prompt_components(
+        clip=clip,
+        prompt="A dancer starts moving",
+        task="i2v",
+        deepstack_layers="8,16,24",
+        setclip=True,
+        image_embeds=[],
+        visual_images=visual_images,
+        visual_source="semantic_images",
+    )
+
+    assert isinstance(encoded["prepared_spec"], nodes.LocalPreparedInputSpec)
+    assert encoded["prepared_spec"].prompt_mode == 2
+    assert encoded["crop_start"] == 92
+    assert encoded["visual_input_count"] == 1
+    assert tuple(clip.tokenize_calls[0][1]["images"][0].shape) == (1, 640, 640, 3)
+
+
+def test_hy_omniweaving_encode_prompt_components_keeps_legacy_path_for_image_embed_fallback():
+    clip = _ClipStub(has_byt5=True)
+    image_embeds = [torch.zeros((16, 4096))]
+
+    encoded = nodes.TextEncodeHunyuanVideo15Omni._encode_prompt_components(
+        clip=clip,
+        prompt="A dancer starts moving",
+        task="i2v",
+        deepstack_layers="8,16,24",
+        setclip=True,
+        image_embeds=image_embeds,
+        visual_images=[],
+        visual_source="clip_vision_output.mm_projected",
+    )
+
+    assert encoded["prepared_spec"] is None
+    assert encoded["crop_start"] == 92
+    assert encoded["visual_input_count"] == 1
+
+
 def test_hy_omniweaving_text_encode_warns_when_i2v_has_no_usable_text_side_visual_input(caplog):
     clip = _ClipStub(has_byt5=True)
     clip_vision_output = types.SimpleNamespace(
@@ -558,23 +775,23 @@ def test_hy_omniweaving_text_encode_think_rewrites_prompt():
 
     assert len(clip.tokenize_calls) == 2
     assert "Please generate a more detailed description" in clip.tokenize_calls[0][0]
-    assert "Describe the key features of the input image" in clip.tokenize_calls[0][1]["llama_template"]
+    assert "Describe the video by detailing the following aspects" in clip.tokenize_calls[0][1]["llama_template"]
     assert clip.last_generate["do_sample"] is False
     assert clip.last_generate["max_length"] == 111
     assert "Here is a more detailed description. expanded prompt" in clip.tokenize_calls[1][0]
     assert "Here is a more detailed description. expanded prompt" in clip.last_encoded["tokens"]
-    assert "Describe the key features of the input image" in clip.tokenize_calls[1][1]["llama_template"]
-    assert (
-        "set",
+    assert "Describe the video by detailing the following aspects" in clip.tokenize_calls[1][1]["llama_template"]
+    _assert_clip_options_include(
+        clip,
         {
             "execution_device": "cpu",
             "deepstack": [8, 16, 24],
             "setclip": True,
-            "crop_start": 92,
+            "crop_start": 108,
             "task_name": "i2v",
             "visual_input_count": 0,
         },
-    ) in clip.clip_options
+    )
 
 
 def test_hy_omniweaving_text_encode_think_rejects_runaway_rewrite(monkeypatch):
@@ -799,6 +1016,66 @@ def test_hy_omniweaving_finalized_attention_mask_expands_for_clip_vision_prefix(
     assert tuple(finalized["extra"]["attention_mask"].shape) == (1, 1030)
     assert torch.equal(finalized["extra"]["attention_mask"][:, :1024], torch.ones((1, 1024)))
     assert torch.equal(finalized["extra"]["attention_mask"][:, 1024:], torch.ones((1, 6)))
+
+
+def test_hy_omniweaving_finalized_attention_mask_drops_dense_i2v_mask_before_clip_vision_expansion():
+    encoded = {
+        "task": "i2v",
+        "cond": torch.zeros((1, 6, 2)),
+        "extra": {
+            "attention_mask": torch.ones((1, 6)),
+            "pooled_output": torch.zeros((1, 1)),
+        },
+    }
+    clip_vision_output = types.SimpleNamespace(last_hidden_state=torch.zeros((1, 1024, 1152)))
+
+    finalized = nodes.TextEncodeHunyuanVideo15Omni._finalize_encoded_components(
+        encoded,
+        clip_vision_output=clip_vision_output,
+    )
+
+    assert "attention_mask" not in finalized["extra"]
+
+
+def test_hy_omniweaving_finalized_attention_mask_keeps_sparse_i2v_mask():
+    encoded = {
+        "task": "i2v",
+        "cond": torch.zeros((1, 4, 2)),
+        "extra": {
+            "attention_mask": torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
+            "pooled_output": torch.zeros((1, 1)),
+        },
+    }
+    clip_vision_output = types.SimpleNamespace(last_hidden_state=torch.zeros((1, 1024, 1152)))
+
+    finalized = nodes.TextEncodeHunyuanVideo15Omni._finalize_encoded_components(
+        encoded,
+        clip_vision_output=clip_vision_output,
+    )
+
+    assert tuple(finalized["extra"]["attention_mask"].shape) == (1, 1028)
+    assert torch.equal(finalized["extra"]["attention_mask"][:, :1024], torch.ones((1, 1024)))
+    assert torch.equal(finalized["extra"]["attention_mask"][:, 1024:], torch.tensor([[1.0, 1.0, 0.0, 0.0]]))
+
+
+def test_hy_omniweaving_finalized_attention_mask_skips_clip_vision_prefix_for_t2v():
+    encoded = {
+        "task": "t2v",
+        "cond": torch.zeros((1, 6, 2)),
+        "extra": {
+            "attention_mask": torch.ones((1, 6)),
+            "pooled_output": torch.zeros((1, 1)),
+        },
+    }
+    clip_vision_output = types.SimpleNamespace(last_hidden_state=torch.zeros((1, 1024, 1152)))
+
+    finalized = nodes.TextEncodeHunyuanVideo15Omni._finalize_encoded_components(
+        encoded,
+        clip_vision_output=clip_vision_output,
+    )
+
+    assert tuple(finalized["extra"]["attention_mask"].shape) == (1, 6)
+    assert torch.equal(finalized["extra"]["attention_mask"], torch.ones((1, 6)))
 
 
 def test_hy_omniweaving_finalized_attention_mask_expands_for_clip_vision_and_byt5_prefixes():
@@ -1027,8 +1304,8 @@ def test_hy_omniweaving_text_encode_passes_visual_input_metadata_into_clip_optio
         clip_vision_output=None,
     )
 
-    assert (
-        "set",
+    _assert_clip_options_include(
+        clip,
         {
             "execution_device": "cpu",
             "deepstack": [8, 16, 24],
@@ -1037,22 +1314,55 @@ def test_hy_omniweaving_text_encode_passes_visual_input_metadata_into_clip_optio
             "task_name": "i2v",
             "visual_input_count": 1,
         },
-    ) in clip.clip_options
+    )
+
+
+def test_hy_omniweaving_text_encode_passes_t2v_crop_and_setclip_into_clip_options():
+    clip = _ClipStub(has_byt5=True)
+
+    nodes.TextEncodeHunyuanVideo15Omni.execute(
+        clip=clip,
+        prompt="A lighthouse in a storm",
+        task="t2v",
+        use_visual_inputs=True,
+        max_visual_inputs=8,
+        think=False,
+        think_max_new_tokens=128,
+        deepstack_layers="8,16,24",
+        setclip=True,
+        reference_images=None,
+        semantic_images=None,
+        clip_vision_output=None,
+    )
+
+    _assert_clip_options_include(
+        clip,
+        {
+            "execution_device": "cpu",
+            "deepstack": [8, 16, 24],
+            "setclip": True,
+            "crop_start": 108,
+            "task_name": "t2v",
+            "visual_input_count": 0,
+        },
+    )
 
 
 def test_hy_omniweaving_text_encode_uses_reference_style_task_template():
     clip = _ClipStub(has_byt5=True)
+    reference_images = torch.zeros((1, 640, 640, 3))
 
     nodes.TextEncodeHunyuanVideo15Omni.execute(
         clip=clip,
         prompt="test",
         task="reference2v",
-        use_visual_inputs=False,
+        use_visual_inputs=True,
         max_visual_inputs=8,
         think=False,
         think_max_new_tokens=1000,
         deepstack_layers="8,16,24",
         setclip=True,
+        reference_images=reference_images,
         semantic_images=None,
         clip_vision_output=None,
     )
@@ -1265,6 +1575,141 @@ def test_hy_omniweaving_conditioning_i2v_keeps_clip_vision_output():
 
     assert positive[1]["clip_vision_output"] is clip_vision_output
     assert negative[1]["clip_vision_output"] is clip_vision_output
+
+
+def test_hy_omniweaving_conditioning_i2v_can_disable_clip_vision_output_via_env(monkeypatch):
+    class _VAE:
+        def encode(self, image):
+            return torch.full((1, 32, 1, 2, 2), 1.0, dtype=image.dtype)
+
+        def decode(self, latent):
+            return torch.full((1, 8, 8, 3), 0.5, dtype=latent.dtype)
+
+    clip_vision_output = types.SimpleNamespace(mm_projected=torch.zeros((1, 16, 4096)))
+    monkeypatch.setenv("HY_OMNIWEAVING_DISABLE_CLIP_FEA", "1")
+
+    positive, negative, _ = nodes.HunyuanVideo15OmniConditioning.execute(
+        positive="pos",
+        negative="neg",
+        vae=_VAE(),
+        task="i2v",
+        width=32,
+        height=32,
+        length=5,
+        batch_size=1,
+        reference_images=torch.zeros((1, 8, 8, 3)),
+        condition_video=None,
+        clip_vision_output=clip_vision_output,
+    )
+
+    assert "clip_vision_output" not in positive[1]
+    assert "clip_vision_output" not in negative[1]
+
+
+def test_hy_omniweaving_conditioning_i2v_can_expand_anchor_slots_via_env(monkeypatch):
+    class _VAE:
+        def encode(self, image):
+            return torch.full((1, 32, 1, 2, 2), 2.0, dtype=image.dtype)
+
+        def decode(self, latent):
+            return torch.full((1, 8, 8, 3), 0.5, dtype=latent.dtype)
+
+    monkeypatch.setenv("HY_OMNIWEAVING_I2V_ANCHOR_SLOTS", "2")
+
+    positive, negative, latent = nodes.HunyuanVideo15OmniConditioning.execute(
+        positive="pos",
+        negative="neg",
+        vae=_VAE(),
+        task="i2v",
+        width=32,
+        height=32,
+        length=9,
+        batch_size=1,
+        reference_images=torch.zeros((1, 8, 8, 3)),
+        condition_video=None,
+        clip_vision_output=None,
+    )
+
+    pos_values = positive[1]
+    neg_values = negative[1]
+    assert tuple(latent["samples"].shape) == (1, 32, 3, 2, 2)
+    assert torch.equal(pos_values["concat_latent_image"][:, :, 0], torch.full((1, 32, 2, 2), 2.0))
+    assert torch.equal(pos_values["concat_latent_image"][:, :, 1], torch.full((1, 32, 2, 2), 2.0))
+    assert torch.equal(pos_values["concat_latent_image"][:, :, 2], torch.zeros((1, 32, 2, 2)))
+    assert torch.equal(pos_values["concat_mask"][:, :, 0], torch.zeros((1, 1, 2, 2)))
+    assert torch.equal(pos_values["concat_mask"][:, :, 1], torch.zeros((1, 1, 2, 2)))
+    assert torch.equal(pos_values["concat_mask"][:, :, 2], torch.ones((1, 1, 2, 2)))
+    assert torch.equal(neg_values["concat_mask"], pos_values["concat_mask"])
+
+
+def test_hy_omniweaving_conditioning_i2v_can_use_first_latent_via_env(monkeypatch):
+    class _VAE:
+        def __init__(self):
+            self.encode_inputs = []
+
+        def encode(self, image):
+            self.encode_inputs.append(image.clone())
+            return torch.full((1, 32, 1, 2, 2), float(len(self.encode_inputs)), dtype=image.dtype)
+
+        def decode(self, latent):
+            return torch.full((1, 8, 8, 3), 0.5, dtype=latent.dtype)
+
+    monkeypatch.setenv("HY_OMNIWEAVING_I2V_USE_FIRST_LATENT", "1")
+
+    positive, negative, latent = nodes.HunyuanVideo15OmniConditioning.execute(
+        positive="pos",
+        negative="neg",
+        vae=_VAE(),
+        task="i2v",
+        width=32,
+        height=32,
+        length=5,
+        batch_size=1,
+        reference_images=torch.zeros((1, 8, 8, 3)),
+        condition_video=None,
+        clip_vision_output=None,
+    )
+
+    pos_values = positive[1]
+    neg_values = negative[1]
+    assert tuple(latent["samples"].shape) == (1, 32, 2, 2, 2)
+    assert torch.equal(pos_values["concat_latent_image"][:, :, 0], torch.full((1, 32, 2, 2), 1.0))
+    assert torch.equal(pos_values["concat_latent_image"][:, :, 1], torch.zeros((1, 32, 2, 2)))
+    assert torch.equal(pos_values["concat_mask"][:, :, 0], torch.zeros((1, 1, 2, 2)))
+    assert torch.equal(pos_values["concat_mask"][:, :, 1], torch.ones((1, 1, 2, 2)))
+    assert torch.equal(neg_values["concat_mask"], pos_values["concat_mask"])
+
+
+def test_hy_omniweaving_conditioning_logs_source_to_stock_mask_mapping(monkeypatch, caplog):
+    class _VAE:
+        def encode(self, image):
+            return torch.full((1, 32, 1, 2, 2), 1.0, dtype=image.dtype)
+
+        def decode(self, latent):
+            return torch.full((1, 8, 8, 3), 0.5, dtype=latent.dtype)
+
+    monkeypatch.setenv("HY_OMNIWEAVING_DEBUG", "1")
+
+    with caplog.at_level("INFO"):
+        nodes.HunyuanVideo15OmniConditioning.execute(
+            positive="pos",
+            negative="neg",
+            vae=_VAE(),
+            task="i2v",
+            width=32,
+            height=32,
+            length=5,
+            batch_size=1,
+            reference_images=torch.zeros((1, 8, 8, 3)),
+            condition_video=None,
+            clip_vision_output=None,
+        )
+
+    assert "conditioning source_to_stock task=i2v" in caplog.text
+    assert "source_mask=[1.0, 0.0]" in caplog.text
+    assert "stock_concat_mask=[0.0, 1.0]" in caplog.text
+    assert "expected_model_mask=[1.0, 0.0]" in caplog.text
+    assert "cond_active_frames=[0]" in caplog.text
 
 
 def test_ensure_runtime_patches_is_idempotent(monkeypatch):
@@ -1626,6 +2071,131 @@ def test_ensure_hy_omniweaving_deepstack_support_attaches_mm_in():
     assert torch.equal(out["all_stack_text_states"].cond, torch.tensor([1.0]))
 
 
+def test_ensure_hy_omniweaving_deepstack_support_logs_concat_mask_payload(monkeypatch, caplog):
+    diffusion_model = types.SimpleNamespace(mm_in=None)
+
+    class _Model:
+        def __init__(self):
+            self.diffusion_model = diffusion_model
+
+        def extra_conds(self, **kwargs):
+            return {"c_concat": types.SimpleNamespace(cond=torch.zeros((1, 33, 2, 2, 2)))}
+
+    model = _Model()
+    patcher = types.SimpleNamespace(model=model)
+    patcher.wrappers = []
+    patcher.add_wrapper_with_key = lambda wrapper_type, key, wrapper: patcher.wrappers.append((wrapper_type, key, wrapper))
+
+    monkeypatch.setenv("HY_OMNIWEAVING_DEBUG", "1")
+    runtime_patches.ensure_hy_omniweaving_deepstack_support(patcher, {"other.weight": torch.zeros((1,))})
+
+    concat_latent_image = torch.zeros((1, 32, 2, 2, 2))
+    concat_latent_image[:, :, 0] = 1.0
+    concat_mask = torch.ones((1, 1, 2, 2, 2))
+    concat_mask[:, :, 0] = 0.0
+
+    with caplog.at_level("INFO"):
+        model.extra_conds(
+            concat_latent_image=concat_latent_image,
+            concat_mask=concat_mask,
+            guiding_frame_index=0,
+        )
+
+    assert "extra_conds payload" in caplog.text
+    assert "concat_mask=[0.0, 1.0]" in caplog.text
+    assert "expected_model_mask=[1.0, 0.0]" in caplog.text
+    assert "concat_latent_active_frames=[0]" in caplog.text
+
+
+def test_ensure_hy_omniweaving_deepstack_support_logs_c_concat_into_forward(monkeypatch, caplog):
+    in_layer = torch.nn.Linear(3, 4, dtype=torch.float16)
+
+    class _ImgIn:
+        def __init__(self):
+            self.proj = types.SimpleNamespace(weight=torch.zeros((1, 65)))
+
+        def __call__(self, x):
+            return x * 2.0
+
+    diffusion_model = types.SimpleNamespace(
+        mm_in=None,
+        time_in=types.SimpleNamespace(in_layer=in_layer),
+        img_in=_ImgIn(),
+        double_blocks=[object()],
+        freeze_main=True,
+    )
+
+    def _forward_orig(img, *args, **kwargs):
+        return img
+
+    diffusion_model.forward_orig = _forward_orig
+
+    class _Model:
+        def __init__(self):
+            self.diffusion_model = diffusion_model
+
+        def extra_conds(self, **kwargs):
+            return {}
+
+        def concat_cond(self, **kwargs):
+            image = kwargs["concat_latent_image"]
+            mask = 1.0 - kwargs["concat_mask"]
+            return torch.cat((image, mask), dim=1)
+
+        def _apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None, transformer_options={}, **kwargs):
+            return x
+
+    model = _Model()
+    patcher = types.SimpleNamespace(model=model)
+    patcher.wrappers = []
+    patcher.add_wrapper_with_key = lambda wrapper_type, key, wrapper: patcher.wrappers.append((wrapper_type, key, wrapper))
+    sd = {
+        "mm_in.linear_1.weight": torch.zeros((4, 3)),
+        "mm_in.linear_1.bias": torch.zeros((4,)),
+        "mm_in.linear_2.weight": torch.zeros((4, 4)),
+        "mm_in.linear_2.bias": torch.zeros((4,)),
+    }
+
+    monkeypatch.setenv("HY_OMNIWEAVING_DEBUG", "1")
+    runtime_patches.ensure_hy_omniweaving_deepstack_support(patcher, sd)
+
+    concat_latent_image = torch.zeros((1, 32, 2, 2, 2))
+    concat_latent_image[:, :, 0] = 1.0
+    concat_mask = torch.ones((1, 1, 2, 2, 2))
+    concat_mask[:, :, 0] = 0.0
+    noise = torch.full((1, 32, 2, 2, 2), 0.25)
+
+    with caplog.at_level("INFO"):
+        c_concat = model.concat_cond(
+            noise=noise,
+            device="cpu",
+            concat_latent_image=concat_latent_image,
+            concat_mask=concat_mask,
+        )
+        model._apply_model(noise, torch.tensor([1.0]), c_concat=c_concat, c_crossattn=None, transformer_options={})
+        combined = torch.cat((noise, c_concat), dim=1)
+        model.diffusion_model.forward_orig(
+            combined,
+            torch.zeros((1, 1, 3)),
+            torch.zeros((1, 4, 3)),
+            torch.zeros((1, 4, 3)),
+            None,
+            torch.tensor([1.0]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            False,
+            None,
+            {},
+        )
+
+    assert "concat_cond output" in caplog.text
+    assert "apply_model inputs" in caplog.text
+    assert "forward_orig img_in preview" in caplog.text
+
+
 def test_ensure_hy_omniweaving_deepstack_support_returns_false_without_mm_in_weights():
     diffusion_model = types.SimpleNamespace(mm_in=None)
 
@@ -1663,6 +2233,7 @@ def test_ensure_hy_omniweaving_text_encoder_support_patches_clip_instance():
     assert clip.cond_stage_model.crop_start_source == "explicit"
     assert clip.cond_stage_model._hy_task_name == "i2v"
     assert clip.cond_stage_model._hy_visual_input_count == 1
+    assert clip.cond_stage_model._hy_prepared_input_meta is None
     cond, pooled, extra = clip.cond_stage_model.encode_token_weights({"qwen25_7b": [[(151644, 1.0), (151644, 1.0), (1, 1.0), (2, 1.0)]]})
     assert cond == "cond_tensor"
     assert pooled == "pooled_tensor"
@@ -1786,6 +2357,93 @@ def test_hy_omniweaving_text_encoder_support_logs_attention_mask_reconstruction(
     assert "attention_mask reconstructed task=i2v cond_stage_model_class=SimpleNamespace source=qwen_branch shape=(1, 4)" in caplog.text
 
 
+def test_hy_omniweaving_text_encoder_support_stores_prepared_meta_and_clears_on_reset():
+    clip = _ClipStub(has_byt5=True)
+
+    runtime_patches.ensure_hy_omniweaving_text_encoder_support(clip)
+    prepared_meta = {
+        "task": "i2v",
+        "prompt_mode": 2,
+        "crop_start": 92,
+        "visual_input_count": 1,
+        "used_fallback_text_only": False,
+    }
+    clip.cond_stage_model.set_clip_options(
+        {
+            "deepstack": [8, 16],
+            "setclip": True,
+            "crop_start": 92,
+            "task_name": "i2v",
+            "visual_input_count": 1,
+            "prepared_meta": prepared_meta,
+        }
+    )
+
+    assert clip.cond_stage_model._hy_prepared_input_meta == prepared_meta
+
+    clip.cond_stage_model.reset_clip_options()
+
+    assert clip.cond_stage_model._hy_prepared_input_meta is None
+
+
+def test_hy_omniweaving_text_encoder_support_prefers_prepared_meta_crop_source():
+    clip = _ClipStub(has_byt5=True)
+
+    def encode_token_weights(tokens):
+        return (
+            torch.arange(1 * 6 * 2, dtype=torch.float32).reshape(1, 6, 2),
+            torch.zeros((1, 2)),
+            {},
+        )
+
+    clip.cond_stage_model.encode_token_weights = encode_token_weights
+    runtime_patches.ensure_hy_omniweaving_text_encoder_support(clip)
+    clip.cond_stage_model.set_clip_options(
+        {
+            "deepstack": [],
+            "setclip": False,
+            "crop_start": 2,
+            "task_name": "t2v",
+            "prepared_meta": {"crop_start": 4, "used_fallback_text_only": False},
+        }
+    )
+
+    clip.cond_stage_model.encode_token_weights(
+        {"qwen25_7b": [[(151644, 1.0), (151644, 1.0), (11, 1.0), (12, 1.0), (13, 1.0), (14, 1.0)]]}
+    )
+
+    assert clip.cond_stage_model.crop_start_source == "prepared_meta"
+
+
+def test_hy_omniweaving_text_encoder_support_marks_prepared_text_only_setclip_source():
+    clip = _ClipStub(has_byt5=True)
+
+    def encode_token_weights(tokens):
+        return (
+            torch.arange(1 * 6 * 2, dtype=torch.float32).reshape(1, 6, 2),
+            torch.zeros((1, 2)),
+            {},
+        )
+
+    clip.cond_stage_model.encode_token_weights = encode_token_weights
+    runtime_patches.ensure_hy_omniweaving_text_encoder_support(clip)
+    clip.cond_stage_model.set_clip_options(
+        {
+            "deepstack": [],
+            "setclip": True,
+            "crop_start": 108,
+            "task_name": "i2v",
+            "prepared_meta": {"crop_start": 108, "used_fallback_text_only": True},
+        }
+    )
+
+    clip.cond_stage_model.encode_token_weights(
+        {"qwen25_7b": [[(151644, 1.0), (151644, 1.0), (11, 1.0), (12, 1.0), (13, 1.0), (14, 1.0)]]}
+    )
+
+    assert clip.cond_stage_model.setclip_start_source == "prepared_text_only"
+
+
 def test_ensure_hy_omniweaving_text_encoder_support_is_idempotent():
     clip = _ClipStub(has_byt5=True)
 
@@ -1809,13 +2467,76 @@ def test_ensure_hy_omniweaving_txt_mask_alignment_support_uses_trailing_text_mas
     assert patched is True
 
     x = torch.zeros((1, 1140, 3584))
-    mask = torch.arange(2164, dtype=torch.float32).reshape(1, 2164)
+    mask = torch.cat([torch.ones((1, 1024)), torch.arange(1140, dtype=torch.float32).reshape(1, 1140)], dim=1)
     out = diffusion_model.txt_in.forward(x, torch.tensor([1.0]), mask, transformer_options={})
 
     assert out is x
     assert recorded["x_shape"] == (1, 1140, 3584)
     assert recorded["mask_shape"] == (1, 1140)
     assert torch.equal(recorded["mask"], mask[:, -1140:])
+
+
+def test_ensure_hy_omniweaving_txt_mask_alignment_support_trims_non_prefix_mismatch_for_runtime_safety():
+    recorded = {}
+
+    class _TxtIn:
+        def forward(self, x, timesteps, mask, transformer_options=None):
+            recorded["mask_shape"] = tuple(mask.shape) if torch.is_tensor(mask) else None
+            recorded["mask"] = mask.clone() if torch.is_tensor(mask) else mask
+            return x
+
+    diffusion_model = types.SimpleNamespace(txt_in=_TxtIn())
+
+    patched = runtime_patches._ensure_hy_omniweaving_txt_mask_alignment_support(diffusion_model)
+    assert patched is True
+
+    x = torch.zeros((1, 4, 3584))
+    mask = torch.tensor([[0.0, 2.0, 3.0, 4.0, 5.0, 6.0]])
+    diffusion_model.txt_in.forward(x, torch.tensor([1.0]), mask, transformer_options={})
+
+    assert recorded["mask_shape"] == (1, 4)
+    assert torch.equal(recorded["mask"], mask[:, -4:])
+
+
+def test_ensure_hy_omniweaving_forward_orig_txt_mask_debug_support_preserves_call(monkeypatch, caplog):
+    recorded = {}
+
+    class _DiffusionModel:
+        def forward_orig(self, *args, **kwargs):
+            recorded["args"] = args
+            recorded["kwargs"] = kwargs
+            return "ok"
+
+    diffusion_model = _DiffusionModel()
+
+    patched = runtime_patches._ensure_hy_omniweaving_forward_orig_txt_mask_debug_support(diffusion_model)
+    assert patched is True
+
+    txt_mask = torch.tensor([[1, 1, 0, 0]], dtype=torch.int64)
+    context = torch.zeros((1, 4, 8))
+    txt_byt5 = torch.zeros((1, 2, 8))
+    clip_fea = torch.zeros((1, 3, 8))
+    monkeypatch.setenv("HY_OMNIWEAVING_DEBUG", "1")
+    with caplog.at_level("INFO"):
+        out = diffusion_model.forward_orig(
+            torch.zeros((1, 1)),
+            torch.zeros((1, 1)),
+            context,
+            torch.zeros((1, 1)),
+            txt_mask,
+            torch.tensor([1.0]),
+            torch.zeros((1, 1)),
+            txt_byt5,
+            clip_fea,
+        )
+
+    assert out == "ok"
+    assert recorded["args"][4] is txt_mask
+    assert "forward_orig txt_mask shape=(1, 4)" in caplog.text
+    assert "is_floating=False" in caplog.text
+    assert "will_apply_non_floating_conversion=True" in caplog.text
+    assert "expected_txt_in_len=4" in caplog.text
+    assert "expected_post_concat_txt_len=9" in caplog.text
 
 
 def test_hy_omniweaving_diffusion_wrapper_injects_dit_patch():
