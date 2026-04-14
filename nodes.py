@@ -41,6 +41,22 @@ def _env_flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if len(raw) == 0:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logging.warning(
+            "HY-OmniWeaving ignored invalid integer env %s=%r and kept default=%s.",
+            name,
+            raw,
+            default,
+        )
+        return default
+
+
 def _debug_log(message: str, *args):
     if _debug_enabled():
         logging.info("[HY-OmniWeaving:debug] " + message, *args)
@@ -2504,7 +2520,15 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
             if reference_images is None or reference_images.shape[0] < 1:
                 raise ValueError("Task i2v requires at least one reference image.")
             cond_latent = _derive_i2v_semantic_conditioning(vae, reference_images, width, height, latent_length)[0]
-            omni_mask[0] = 1.0
+            anchor_slots = max(1, min(latent_length, _env_int("HY_OMNIWEAVING_I2V_ANCHOR_SLOTS", 1)))
+            if anchor_slots > 1:
+                cond_latent[:, :, 1:anchor_slots] = cond_latent[:, :, 0:1].repeat(1, 1, anchor_slots - 1, 1, 1)
+            omni_mask[:anchor_slots] = 1.0
+            _debug_log(
+                "conditioning i2v anchor slots latent_length=%s anchor_slots=%s",
+                latent_length,
+                anchor_slots,
+            )
             guiding_frame_index = 0
         elif task == "interpolation":
             if reference_images is None or reference_images.shape[0] < 2:
