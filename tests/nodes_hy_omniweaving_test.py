@@ -1642,6 +1642,44 @@ def test_hy_omniweaving_conditioning_i2v_can_expand_anchor_slots_via_env(monkeyp
     assert torch.equal(neg_values["concat_mask"], pos_values["concat_mask"])
 
 
+def test_hy_omniweaving_conditioning_i2v_can_use_first_latent_via_env(monkeypatch):
+    class _VAE:
+        def __init__(self):
+            self.encode_inputs = []
+
+        def encode(self, image):
+            self.encode_inputs.append(image.clone())
+            return torch.full((1, 32, 1, 2, 2), float(len(self.encode_inputs)), dtype=image.dtype)
+
+        def decode(self, latent):
+            return torch.full((1, 8, 8, 3), 0.5, dtype=latent.dtype)
+
+    monkeypatch.setenv("HY_OMNIWEAVING_I2V_USE_FIRST_LATENT", "1")
+
+    positive, negative, latent = nodes.HunyuanVideo15OmniConditioning.execute(
+        positive="pos",
+        negative="neg",
+        vae=_VAE(),
+        task="i2v",
+        width=32,
+        height=32,
+        length=5,
+        batch_size=1,
+        reference_images=torch.zeros((1, 8, 8, 3)),
+        condition_video=None,
+        clip_vision_output=None,
+    )
+
+    pos_values = positive[1]
+    neg_values = negative[1]
+    assert tuple(latent["samples"].shape) == (1, 32, 2, 2, 2)
+    assert torch.equal(pos_values["concat_latent_image"][:, :, 0], torch.full((1, 32, 2, 2), 1.0))
+    assert torch.equal(pos_values["concat_latent_image"][:, :, 1], torch.zeros((1, 32, 2, 2)))
+    assert torch.equal(pos_values["concat_mask"][:, :, 0], torch.zeros((1, 1, 2, 2)))
+    assert torch.equal(pos_values["concat_mask"][:, :, 1], torch.ones((1, 1, 2, 2)))
+    assert torch.equal(neg_values["concat_mask"], pos_values["concat_mask"])
+
+
 def test_ensure_runtime_patches_is_idempotent(monkeypatch):
     calls = []
 

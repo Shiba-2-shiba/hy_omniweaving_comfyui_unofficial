@@ -693,13 +693,27 @@ def _derive_i2v_semantic_conditioning(vae, reference_images: torch.Tensor, width
     semantic_images = _unwrap_decoded_image_tensor(vae.decode(first_latent[:, :, :1]))
     semantic_images = semantic_images.to(device=prepared.device, dtype=prepared.dtype)
     semantic_latent = _ensure_video_latent_dims(vae.encode(semantic_images))
+    use_first_latent = _env_flag("HY_OMNIWEAVING_I2V_USE_FIRST_LATENT")
+    conditioning_source = first_latent if use_first_latent else semantic_latent
 
     cond_latent = torch.zeros(
-        (first_latent.shape[0], first_latent.shape[1], latent_length, first_latent.shape[-2], first_latent.shape[-1]),
-        dtype=semantic_latent.dtype,
-        device=semantic_latent.device,
+        (
+            conditioning_source.shape[0],
+            conditioning_source.shape[1],
+            latent_length,
+            conditioning_source.shape[-2],
+            conditioning_source.shape[-1],
+        ),
+        dtype=conditioning_source.dtype,
+        device=conditioning_source.device,
     )
-    cond_latent[:, :, 0:1] = semantic_latent[:, :, :1]
+    cond_latent[:, :, 0:1] = conditioning_source[:, :, :1]
+    _debug_log(
+        "i2v semantic conditioning latent_source=%s first_latent_norm=%s semantic_latent_norm=%s",
+        "first_latent" if use_first_latent else "semantic_latent",
+        _norm_of(first_latent),
+        _norm_of(semantic_latent),
+    )
     return cond_latent, semantic_images
 
 
