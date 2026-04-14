@@ -64,6 +64,37 @@ def _norm_of(value):
     return None
 
 
+def _rounded_temporal_list(value, digits: int = 4):
+    if value is None:
+        return None
+    return [round(float(item), digits) for item in value]
+
+
+def _active_temporal_indices(values, threshold: float = 0.5, invert: bool = False):
+    if values is None:
+        return None
+    out = []
+    for index, item in enumerate(values):
+        active = float(item) > threshold
+        if invert:
+            active = not active
+        if active:
+            out.append(index)
+    return out
+
+
+def _temporal_mask_vector(mask):
+    if not torch.is_tensor(mask) or mask.ndim < 5:
+        return None
+    return mask[0, 0, :, 0, 0].detach().float().cpu().tolist()
+
+
+def _temporal_latent_energy(latent):
+    if not torch.is_tensor(latent) or latent.ndim < 5:
+        return None
+    return latent[0].detach().float().abs().sum(dim=(0, 2, 3)).cpu().tolist()
+
+
 def _callable_debug_name(value):
     if value is None:
         return "None"
@@ -147,10 +178,34 @@ def _ensure_hy_omniweaving_extra_conds_support(model):
     original_extra_conds = model.extra_conds
 
     def patched_extra_conds(self, **kwargs):
+        concat_latent_image = kwargs.get("concat_latent_image", None)
+        concat_mask = kwargs.get("concat_mask", kwargs.get("denoise_mask", None))
+        guiding_frame_index = kwargs.get("guiding_frame_index", None)
+        concat_mask_vector = _temporal_mask_vector(concat_mask)
+        expected_model_mask_vector = None
+        if concat_mask_vector is not None:
+            expected_model_mask_vector = [1.0 - item for item in concat_mask_vector]
         out = original_extra_conds(**kwargs)
         all_stack_text_states = kwargs.get("all_stack_text_states", None)
         if all_stack_text_states is not None:
             out["all_stack_text_states"] = _CONDDeepstackTextStates(all_stack_text_states)
+        c_concat = out.get("c_concat", None)
+        c_concat_value = getattr(c_concat, "cond", None)
+        if any(value is not None for value in (concat_latent_image, concat_mask, guiding_frame_index, all_stack_text_states)):
+            _debug_log(
+                "extra_conds payload concat_latent_shape=%s concat_latent_active_frames=%s concat_mask_shape=%s concat_mask=%s concat_mask_zero_frames=%s expected_model_mask=%s expected_model_mask_active=%s guiding_frame_index=%s all_stack_text_states_shape=%s out_keys=%s c_concat_shape=%s",
+                _shape_of(concat_latent_image),
+                _active_temporal_indices(_temporal_latent_energy(concat_latent_image), threshold=1e-6),
+                _shape_of(concat_mask),
+                _rounded_temporal_list(concat_mask_vector),
+                _active_temporal_indices(concat_mask_vector, invert=True),
+                _rounded_temporal_list(expected_model_mask_vector),
+                _active_temporal_indices(expected_model_mask_vector),
+                guiding_frame_index,
+                _shape_of(all_stack_text_states),
+                sorted(out.keys()),
+                _shape_of(c_concat_value),
+            )
         return out
 
     model.extra_conds = types.MethodType(patched_extra_conds, model)

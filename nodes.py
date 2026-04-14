@@ -94,6 +94,37 @@ def _norm_of(value):
     return None
 
 
+def _rounded_temporal_list(value, digits: int = 4):
+    if value is None:
+        return None
+    return [round(float(item), digits) for item in value]
+
+
+def _active_temporal_indices(values, threshold: float = 0.5, invert: bool = False):
+    if values is None:
+        return None
+    out = []
+    for index, item in enumerate(values):
+        active = float(item) > threshold
+        if invert:
+            active = not active
+        if active:
+            out.append(index)
+    return out
+
+
+def _temporal_mask_vector(mask):
+    if not torch.is_tensor(mask) or mask.ndim < 5:
+        return None
+    return mask[0, 0, :, 0, 0].detach().float().cpu().tolist()
+
+
+def _temporal_latent_energy(latent):
+    if not torch.is_tensor(latent) or latent.ndim < 5:
+        return None
+    return latent[0].detach().float().abs().sum(dim=(0, 2, 3)).cpu().tolist()
+
+
 def _clip_vision_shapes(clip_vision_output):
     if clip_vision_output is None:
         return {
@@ -2594,6 +2625,25 @@ class HunyuanVideo15OmniConditioning(io.ComfyNode):
             _norm_of(cond_latent),
             _shape_of(concat_mask),
             float(concat_mask.sum().item()) if torch.is_tensor(concat_mask) else None,
+        )
+        source_mask_vector = omni_mask.detach().float().cpu().tolist()
+        stock_concat_mask_vector = _temporal_mask_vector(concat_mask)
+        expected_model_mask_vector = None
+        if stock_concat_mask_vector is not None:
+            expected_model_mask_vector = [1.0 - item for item in stock_concat_mask_vector]
+        cond_frame_energy = _temporal_latent_energy(cond_latent)
+        _debug_log(
+            "conditioning source_to_stock task=%s source_mask=%s source_mask_active=%s stock_concat_mask=%s stock_concat_mask_zero_frames=%s expected_model_mask=%s expected_model_mask_active=%s cond_frame_energy=%s cond_active_frames=%s guiding_frame_index=%s",
+            task,
+            _rounded_temporal_list(source_mask_vector),
+            _active_temporal_indices(source_mask_vector),
+            _rounded_temporal_list(stock_concat_mask_vector),
+            _active_temporal_indices(stock_concat_mask_vector, invert=True),
+            _rounded_temporal_list(expected_model_mask_vector),
+            _active_temporal_indices(expected_model_mask_vector),
+            _rounded_temporal_list(cond_frame_energy),
+            _active_temporal_indices(cond_frame_energy, threshold=1e-6),
+            guiding_frame_index,
         )
         cond_values = {"concat_latent_image": cond_latent, "concat_mask": concat_mask}
         if guiding_frame_index is not None:

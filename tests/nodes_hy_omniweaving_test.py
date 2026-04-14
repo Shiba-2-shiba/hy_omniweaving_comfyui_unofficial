@@ -1680,6 +1680,38 @@ def test_hy_omniweaving_conditioning_i2v_can_use_first_latent_via_env(monkeypatc
     assert torch.equal(neg_values["concat_mask"], pos_values["concat_mask"])
 
 
+def test_hy_omniweaving_conditioning_logs_source_to_stock_mask_mapping(monkeypatch, caplog):
+    class _VAE:
+        def encode(self, image):
+            return torch.full((1, 32, 1, 2, 2), 1.0, dtype=image.dtype)
+
+        def decode(self, latent):
+            return torch.full((1, 8, 8, 3), 0.5, dtype=latent.dtype)
+
+    monkeypatch.setenv("HY_OMNIWEAVING_DEBUG", "1")
+
+    with caplog.at_level("INFO"):
+        nodes.HunyuanVideo15OmniConditioning.execute(
+            positive="pos",
+            negative="neg",
+            vae=_VAE(),
+            task="i2v",
+            width=32,
+            height=32,
+            length=5,
+            batch_size=1,
+            reference_images=torch.zeros((1, 8, 8, 3)),
+            condition_video=None,
+            clip_vision_output=None,
+        )
+
+    assert "conditioning source_to_stock task=i2v" in caplog.text
+    assert "source_mask=[1.0, 0.0]" in caplog.text
+    assert "stock_concat_mask=[0.0, 1.0]" in caplog.text
+    assert "expected_model_mask=[1.0, 0.0]" in caplog.text
+    assert "cond_active_frames=[0]" in caplog.text
+
+
 def test_ensure_runtime_patches_is_idempotent(monkeypatch):
     calls = []
 
@@ -2037,6 +2069,42 @@ def test_ensure_hy_omniweaving_deepstack_support_attaches_mm_in():
     out = model.extra_conds(all_stack_text_states=torch.tensor([1.0]))
     assert out["base"] == 1
     assert torch.equal(out["all_stack_text_states"].cond, torch.tensor([1.0]))
+
+
+def test_ensure_hy_omniweaving_deepstack_support_logs_concat_mask_payload(monkeypatch, caplog):
+    diffusion_model = types.SimpleNamespace(mm_in=None)
+
+    class _Model:
+        def __init__(self):
+            self.diffusion_model = diffusion_model
+
+        def extra_conds(self, **kwargs):
+            return {"c_concat": types.SimpleNamespace(cond=torch.zeros((1, 33, 2, 2, 2)))}
+
+    model = _Model()
+    patcher = types.SimpleNamespace(model=model)
+    patcher.wrappers = []
+    patcher.add_wrapper_with_key = lambda wrapper_type, key, wrapper: patcher.wrappers.append((wrapper_type, key, wrapper))
+
+    monkeypatch.setenv("HY_OMNIWEAVING_DEBUG", "1")
+    runtime_patches.ensure_hy_omniweaving_deepstack_support(patcher, {"other.weight": torch.zeros((1,))})
+
+    concat_latent_image = torch.zeros((1, 32, 2, 2, 2))
+    concat_latent_image[:, :, 0] = 1.0
+    concat_mask = torch.ones((1, 1, 2, 2, 2))
+    concat_mask[:, :, 0] = 0.0
+
+    with caplog.at_level("INFO"):
+        model.extra_conds(
+            concat_latent_image=concat_latent_image,
+            concat_mask=concat_mask,
+            guiding_frame_index=0,
+        )
+
+    assert "extra_conds payload" in caplog.text
+    assert "concat_mask=[0.0, 1.0]" in caplog.text
+    assert "expected_model_mask=[1.0, 0.0]" in caplog.text
+    assert "concat_latent_active_frames=[0]" in caplog.text
 
 
 def test_ensure_hy_omniweaving_deepstack_support_returns_false_without_mm_in_weights():
