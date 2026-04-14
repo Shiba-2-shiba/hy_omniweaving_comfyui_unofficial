@@ -95,6 +95,14 @@ def _temporal_latent_energy(latent):
     return latent[0].detach().float().abs().sum(dim=(0, 2, 3)).cpu().tolist()
 
 
+def _split_concat_tensor(c_concat):
+    if not torch.is_tensor(c_concat) or c_concat.ndim < 5 or c_concat.shape[1] < 1:
+        return None, None
+    if c_concat.shape[1] == 1:
+        return None, c_concat
+    return c_concat[:, :-1], c_concat[:, -1:]
+
+
 def _callable_debug_name(value):
     if value is None:
         return "None"
@@ -176,6 +184,8 @@ def _ensure_hy_omniweaving_extra_conds_support(model):
         return False
 
     original_extra_conds = model.extra_conds
+    original_concat_cond = getattr(model, "concat_cond", None)
+    original_apply_model = getattr(model, "_apply_model", None)
 
     def patched_extra_conds(self, **kwargs):
         concat_latent_image = kwargs.get("concat_latent_image", None)
@@ -208,7 +218,49 @@ def _ensure_hy_omniweaving_extra_conds_support(model):
             )
         return out
 
+    def patched_concat_cond(self, **kwargs):
+        c_concat = original_concat_cond(**kwargs)
+        image_part, mask_part = _split_concat_tensor(c_concat)
+        if torch.is_tensor(c_concat):
+            _debug_log(
+                "concat_cond output c_concat_shape=%s c_concat_norm=%s image_part_shape=%s image_frame_energy=%s image_active_frames=%s mask_part_shape=%s mask=%s mask_active_frames=%s",
+                _shape_of(c_concat),
+                _norm_of(c_concat),
+                _shape_of(image_part),
+                _rounded_temporal_list(_temporal_latent_energy(image_part)),
+                _active_temporal_indices(_temporal_latent_energy(image_part), threshold=1e-6),
+                _shape_of(mask_part),
+                _rounded_temporal_list(_temporal_mask_vector(mask_part)),
+                _active_temporal_indices(_temporal_mask_vector(mask_part)),
+            )
+        return c_concat
+
+    def patched_apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None, transformer_options={}, **kwargs):
+        image_part, mask_part = _split_concat_tensor(c_concat)
+        diffusion_model = getattr(self, "diffusion_model", None)
+        if diffusion_model is not None:
+            diffusion_model._hy_last_apply_model_c_concat_channels = int(c_concat.shape[1]) if torch.is_tensor(c_concat) and c_concat.ndim >= 2 else 0
+        if torch.is_tensor(c_concat):
+            _debug_log(
+                "apply_model inputs noise_shape=%s noise_norm=%s c_concat_shape=%s c_concat_norm=%s c_concat_image_shape=%s c_concat_image_frame_energy=%s c_concat_image_active_frames=%s c_concat_mask_shape=%s c_concat_mask=%s c_concat_mask_active_frames=%s",
+                _shape_of(x),
+                _norm_of(x),
+                _shape_of(c_concat),
+                _norm_of(c_concat),
+                _shape_of(image_part),
+                _rounded_temporal_list(_temporal_latent_energy(image_part)),
+                _active_temporal_indices(_temporal_latent_energy(image_part), threshold=1e-6),
+                _shape_of(mask_part),
+                _rounded_temporal_list(_temporal_mask_vector(mask_part)),
+                _active_temporal_indices(_temporal_mask_vector(mask_part)),
+            )
+        return original_apply_model(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
+
     model.extra_conds = types.MethodType(patched_extra_conds, model)
+    if original_concat_cond is not None:
+        model.concat_cond = types.MethodType(patched_concat_cond, model)
+    if original_apply_model is not None:
+        model._apply_model = types.MethodType(patched_apply_model, model)
     model._hy_omniweaving_extra_conds_patched = True
     logging.info("HY-OmniWeaving attached instance-local extra_conds support.")
     return True
@@ -327,6 +379,7 @@ def _ensure_hy_omniweaving_forward_orig_txt_mask_debug_support(diffusion_model):
         return False
 
     def patched_forward_orig(self, *args, **kwargs):
+        img = args[0] if len(args) >= 1 else kwargs.get("img")
         context = args[2] if len(args) >= 3 else kwargs.get("context")
         txt_mask = None
         if len(args) >= 5:
@@ -351,6 +404,12 @@ def _ensure_hy_omniweaving_forward_orig_txt_mask_debug_support(diffusion_model):
         expected_pre_clip_txt_in_len = context_len
         expected_post_concat_txt_len = None if context_len is None else context_len + clip_fea_len + txt_byt5_len
         txt_mask_len = int(txt_mask.shape[-1]) if torch.is_tensor(txt_mask) and txt_mask.ndim >= 2 else None
+        c_concat_channels = int(getattr(self, "_hy_last_apply_model_c_concat_channels", 0))
+        noise_part = img
+        c_concat_part = None
+        if torch.is_tensor(img) and img.ndim >= 2 and c_concat_channels > 0 and img.shape[1] >= c_concat_channels:
+            noise_part = img[:, :-c_concat_channels]
+            c_concat_part = img[:, -c_concat_channels:]
         appears_preexpanded_for_clip = (
             txt_mask_len is not None
             and expected_pre_clip_txt_in_len is not None
@@ -358,6 +417,24 @@ def _ensure_hy_omniweaving_forward_orig_txt_mask_debug_support(diffusion_model):
             and txt_mask_len == expected_post_concat_txt_len
             and clip_fea_len > 0
         )
+        if (
+            _debug_enabled()
+            and torch.is_tensor(img)
+            and not getattr(self, "_hy_omniweaving_forward_orig_img_in_preview_logged", False)
+        ):
+            img_in_preview = self.img_in(img)
+            self._hy_omniweaving_forward_orig_img_in_preview_logged = True
+            _debug_log(
+                "forward_orig img_in preview img_shape=%s img_norm=%s noise_shape=%s noise_norm=%s c_concat_shape=%s c_concat_norm=%s post_img_in_shape=%s post_img_in_norm=%s",
+                _shape_of(img),
+                _norm_of(img),
+                _shape_of(noise_part),
+                _norm_of(noise_part),
+                _shape_of(c_concat_part),
+                _norm_of(c_concat_part),
+                _shape_of(img_in_preview),
+                _norm_of(img_in_preview),
+            )
         _debug_log(
             "forward_orig txt_mask shape=%s dtype=%s is_floating=%s will_apply_non_floating_conversion=%s nonzero=%s min=%s max=%s "
             "context_shape=%s txt_byt5_shape=%s clip_fea_shape=%s expected_txt_in_len=%s expected_post_concat_txt_len=%s "

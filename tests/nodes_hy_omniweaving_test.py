@@ -2107,6 +2107,95 @@ def test_ensure_hy_omniweaving_deepstack_support_logs_concat_mask_payload(monkey
     assert "concat_latent_active_frames=[0]" in caplog.text
 
 
+def test_ensure_hy_omniweaving_deepstack_support_logs_c_concat_into_forward(monkeypatch, caplog):
+    in_layer = torch.nn.Linear(3, 4, dtype=torch.float16)
+
+    class _ImgIn:
+        def __init__(self):
+            self.proj = types.SimpleNamespace(weight=torch.zeros((1, 65)))
+
+        def __call__(self, x):
+            return x * 2.0
+
+    diffusion_model = types.SimpleNamespace(
+        mm_in=None,
+        time_in=types.SimpleNamespace(in_layer=in_layer),
+        img_in=_ImgIn(),
+        double_blocks=[object()],
+        freeze_main=True,
+    )
+
+    def _forward_orig(img, *args, **kwargs):
+        return img
+
+    diffusion_model.forward_orig = _forward_orig
+
+    class _Model:
+        def __init__(self):
+            self.diffusion_model = diffusion_model
+
+        def extra_conds(self, **kwargs):
+            return {}
+
+        def concat_cond(self, **kwargs):
+            image = kwargs["concat_latent_image"]
+            mask = 1.0 - kwargs["concat_mask"]
+            return torch.cat((image, mask), dim=1)
+
+        def _apply_model(self, x, t, c_concat=None, c_crossattn=None, control=None, transformer_options={}, **kwargs):
+            return x
+
+    model = _Model()
+    patcher = types.SimpleNamespace(model=model)
+    patcher.wrappers = []
+    patcher.add_wrapper_with_key = lambda wrapper_type, key, wrapper: patcher.wrappers.append((wrapper_type, key, wrapper))
+    sd = {
+        "mm_in.linear_1.weight": torch.zeros((4, 3)),
+        "mm_in.linear_1.bias": torch.zeros((4,)),
+        "mm_in.linear_2.weight": torch.zeros((4, 4)),
+        "mm_in.linear_2.bias": torch.zeros((4,)),
+    }
+
+    monkeypatch.setenv("HY_OMNIWEAVING_DEBUG", "1")
+    runtime_patches.ensure_hy_omniweaving_deepstack_support(patcher, sd)
+
+    concat_latent_image = torch.zeros((1, 32, 2, 2, 2))
+    concat_latent_image[:, :, 0] = 1.0
+    concat_mask = torch.ones((1, 1, 2, 2, 2))
+    concat_mask[:, :, 0] = 0.0
+    noise = torch.full((1, 32, 2, 2, 2), 0.25)
+
+    with caplog.at_level("INFO"):
+        c_concat = model.concat_cond(
+            noise=noise,
+            device="cpu",
+            concat_latent_image=concat_latent_image,
+            concat_mask=concat_mask,
+        )
+        model._apply_model(noise, torch.tensor([1.0]), c_concat=c_concat, c_crossattn=None, transformer_options={})
+        combined = torch.cat((noise, c_concat), dim=1)
+        model.diffusion_model.forward_orig(
+            combined,
+            torch.zeros((1, 1, 3)),
+            torch.zeros((1, 4, 3)),
+            torch.zeros((1, 4, 3)),
+            None,
+            torch.tensor([1.0]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            False,
+            None,
+            {},
+        )
+
+    assert "concat_cond output" in caplog.text
+    assert "apply_model inputs" in caplog.text
+    assert "forward_orig img_in preview" in caplog.text
+
+
 def test_ensure_hy_omniweaving_deepstack_support_returns_false_without_mm_in_weights():
     diffusion_model = types.SimpleNamespace(mm_in=None)
 
