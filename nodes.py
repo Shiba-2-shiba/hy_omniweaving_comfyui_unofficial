@@ -975,6 +975,20 @@ class HYOmniWeavingUNetLoader(io.ComfyNode):
 
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
         sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
+        if isinstance(metadata, dict) and metadata.get("fp16_profile"):
+            if weight_dtype == "default":
+                logging.info(
+                    "HYOmniWeavingUNetLoader preserving mixed checkpoint layout for %s (fp16_profile=%s).",
+                    unet_name,
+                    metadata.get("fp16_profile"),
+                )
+            else:
+                logging.warning(
+                    "HYOmniWeavingUNetLoader loaded mixed checkpoint %s with weight_dtype=%s. "
+                    "This overrides the saved fp16/fp8 layout; use weight_dtype=default to preserve fp16keep tensors.",
+                    unet_name,
+                    weight_dtype,
+                )
         sd, converted, partial = _convert_split_hy_omniweaving_attention_qkv(sd, strict_mode=strict_mode)
         mm_in_sd = extract_hy_omniweaving_mm_in_state_dict(sd)
         if len(mm_in_sd) > 0:

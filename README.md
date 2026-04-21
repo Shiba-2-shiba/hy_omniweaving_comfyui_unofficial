@@ -52,6 +52,7 @@ The exact ComfyUI root directory differs by environment, so the paths below use
 Expected local layout:
 
 - `<ComfyUI root>/models/diffusion_models/hy_omniweaving_hunyuanvideo15_transformer_fp8_e4m3fn_patched.safetensors`
+- `<ComfyUI root>/models/diffusion_models/hy_omniweaving_hunyuanvideo15_transformer_fp8_e4m3fn_patched_fixed_balanced.safetensors` (optional corrected mixed-precision rebuild)
 - `<ComfyUI root>/models/text_encoders/qwen_2.5_vl_7b_finetuned_model.safetensors`
 - `<ComfyUI root>/models/text_encoders/byt5_small_glyphxl_fp16.safetensors`
 - `<ComfyUI root>/models/clip_vision/image_encoder.safetensors`
@@ -89,6 +90,11 @@ Notes:
   `image_embedder.safetensors` under `models/clip_vision`.
 - If your local filenames differ, ComfyUI can still list them, but the
   validated workflow and project notes assume the filenames shown above.
+- `HY OmniWeaving UNet Loader` does not hardcode the diffusion model filename.
+  It lists whatever is present under `models/diffusion_models`.
+- If you use a corrected mixed-precision checkpoint with saved `fp16keep`
+  tensors, keep `weight_dtype=default`. Choosing an explicit `fp8_*` option
+  re-casts the whole model and discards the saved fp16/fp8 split.
 
 ## Runtime patch status
 
