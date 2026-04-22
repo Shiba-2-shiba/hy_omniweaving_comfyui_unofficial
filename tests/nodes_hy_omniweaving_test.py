@@ -1806,6 +1806,27 @@ def test_convert_split_hy_omniweaving_attention_qkv_weight_and_bias():
     )
 
 
+def test_convert_split_hy_omniweaving_attention_qkv_casts_mixed_fp8_and_fp16_to_concatable_dtype():
+    q = torch.tensor([[1.0], [2.0]], dtype=torch.float16)
+    k = torch.tensor([[3.0], [4.0]], dtype=torch.float16)
+    v = torch.tensor([[5.0], [6.0]], dtype=torch.float16).to(torch.float8_e4m3fn)
+    sd = {
+        "double_blocks.0.img_attn_q.weight": q,
+        "double_blocks.0.img_attn_k.weight": k,
+        "double_blocks.0.img_attn_v.weight": v,
+    }
+
+    converted_sd, converted, partial = nodes._convert_split_hy_omniweaving_attention_qkv(sd, strict_mode=True)
+
+    assert converted == 1
+    assert partial == []
+    assert converted_sd["double_blocks.0.img_attn.qkv.weight"].dtype == torch.float16
+    assert torch.equal(
+        converted_sd["double_blocks.0.img_attn.qkv.weight"],
+        torch.cat((q, k, v.to(torch.float16)), dim=0),
+    )
+
+
 def test_convert_split_hy_omniweaving_attention_qkv_strict_mode_rejects_partial():
     sd = {
         "double_blocks.0.img_attn_q.weight": torch.tensor([[1.0]]),

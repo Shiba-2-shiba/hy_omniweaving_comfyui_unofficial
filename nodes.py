@@ -67,6 +67,36 @@ def _shape_of(value):
         return tuple(value.shape)
     return None
 
+
+def _resolve_concat_dtype(tensors):
+    if len(tensors) == 0:
+        raise ValueError("Expected at least one tensor to resolve concat dtype.")
+
+    dtypes = [tensor.dtype for tensor in tensors]
+    unique_dtypes = list(dict.fromkeys(dtypes))
+    if len(unique_dtypes) == 1:
+        return unique_dtypes[0]
+
+    fp8_dtypes = {torch.float8_e4m3fn, torch.float8_e5m2}
+    non_fp8_dtypes = [dtype for dtype in unique_dtypes if dtype not in fp8_dtypes]
+
+    if len(non_fp8_dtypes) == 0:
+        return torch.float16
+
+    target_dtype = non_fp8_dtypes[0]
+    for dtype in non_fp8_dtypes[1:]:
+        target_dtype = torch.promote_types(target_dtype, dtype)
+    return target_dtype
+
+
+def _concat_with_compatible_dtype(tensors, dim=0):
+    target_dtype = _resolve_concat_dtype(tensors)
+    cast_tensors = tuple(
+        tensor if tensor.dtype == target_dtype else tensor.to(dtype=target_dtype) for tensor in tensors
+    )
+    return torch.cat(cast_tensors, dim=dim)
+
+
 def _mask_summary(value):
     if not torch.is_tensor(value):
         return {
@@ -280,7 +310,10 @@ def _convert_split_hy_omniweaving_attention_qkv(sd: dict, strict_mode: bool = Tr
                     seen_partial.append((idx, attn_prefix, end, tuple(present)))
                     continue
 
-                sd[qkv_key] = torch.cat((sd.pop(q_key), sd.pop(k_key), sd.pop(v_key)), dim=0)
+                sd[qkv_key] = _concat_with_compatible_dtype(
+                    (sd.pop(q_key), sd.pop(k_key), sd.pop(v_key)),
+                    dim=0,
+                )
                 converted += 1
 
     if strict_mode and len(seen_partial) > 0:
